@@ -43,6 +43,17 @@ def setup_proc(root: Path, cgroup: str, mountinfo: str) -> None:
     write(root, "/proc/self/mountinfo", mountinfo)
 
 
+def write_verified_assignment(root: Path, capacity_bytes: int) -> Path:
+    receipt = write(
+        root,
+        pr.VERIFIED_MEMORY_RECEIPT,
+        f"{capacity_bytes}\n",
+    )
+    receipt.parent.chmod(0o755)
+    receipt.chmod(0o444)
+    return receipt
+
+
 V2_MOUNT = (
     "29 23 0:26 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime "
     "- cgroup2 cgroup rw\n"
@@ -284,6 +295,216 @@ class PodResourcesTests(unittest.TestCase):
                 any("cannot read current memory usage" in item for item in result.warnings)
             )
 
+    def test_runpod_assignment_with_scoped_leaf_supplies_capacity(self) -> None:
+        with self.fixture_root() as raw_root:
+            root = Path(raw_root)
+            leaf = setup_v2_leaf(root, "/pods/p1/container")
+            (leaf / "memory.max").write_text("max\n", encoding="ascii")
+            (leaf / "memory.current").write_text(str(gib(4)), encoding="ascii")
+            (leaf / "memory.stat").write_text(
+                f"inactive_file {gib(1)}\n", encoding="ascii"
+            )
+            (leaf / "memory.peak").write_text(str(gib(5)), encoding="ascii")
+            write_verified_assignment(root, gib(32))
+
+            result = pr.collect_resources(
+                filesystem_root=root,
+                env={
+                    "RUNPOD_ASSIGNED_MEMORY_BYTES": str(gib(32)),
+                    "POD_BUILD_MAX_JOBS": "2",
+                },
+                affinity_count=8,
+                host_cpu_count=8,
+            )
+
+            self.assertFalse(result.memory.limited)
+            self.assertEqual(result.memory.limit_source, "host")
+            self.assertEqual(result.memory.limit_bytes, gib(64))
+            self.assertEqual(result.memory.capacity_bytes, gib(32))
+            self.assertEqual(
+                result.memory.capacity_source, "runpod-api-assignment"
+            )
+            self.assertFalse(result.memory.capacity_is_hard_limit)
+            self.assertEqual(result.memory.assigned_capacity_bytes, gib(32))
+            self.assertEqual(result.memory.usage_current_bytes, gib(4))
+            self.assertEqual(result.memory.current_bytes, gib(4))
+            self.assertEqual(result.memory.available_bytes, gib(29))
+            self.assertTrue(result.memory.usage_trustworthy)
+            self.assertTrue(result.memory.usage_peak_eligible)
+            self.assertEqual(result.memory.usage_scope, "pod-cgroup")
+            self.assertTrue(
+                result.memory.usage_source.endswith(
+                    "/sys/fs/cgroup/pods/p1/container"
+                )
+            )
+            self.assertFalse(result.build.forced_single_job)
+            self.assertEqual(result.build.suggested_jobs, 2)
+
+    def test_runpod_assignment_accepts_ambiguous_namespaced_root_for_peak_only(
+        self,
+    ) -> None:
+        with self.fixture_root() as raw_root:
+            root = Path(raw_root)
+            leaf = setup_v2_leaf(root, "/")
+            (leaf / "memory.max").write_text("max\n", encoding="ascii")
+            (leaf / "memory.current").write_text(str(gib(4)), encoding="ascii")
+            (leaf / "memory.stat").write_text(
+                f"inactive_file {gib(1)}\n", encoding="ascii"
+            )
+            (leaf / "memory.peak").write_text(str(gib(5)), encoding="ascii")
+            write_verified_assignment(root, gib(32))
+
+            result = pr.collect_resources(
+                filesystem_root=root,
+                env={
+                    "RUNPOD_ASSIGNED_MEMORY_BYTES": str(gib(32)),
+                    "MAX_JOBS": "4",
+                },
+                affinity_count=8,
+                host_cpu_count=8,
+            )
+
+            self.assertEqual(result.cgroup_path, "/")
+            self.assertEqual(
+                result.memory.capacity_source, "runpod-api-assignment"
+            )
+            self.assertFalse(result.memory.capacity_is_hard_limit)
+            self.assertFalse(result.memory.usage_trustworthy)
+            self.assertTrue(result.memory.usage_peak_eligible)
+            self.assertEqual(result.memory.usage_scope, "ambiguous-cgroup-root")
+            self.assertEqual(
+                result.memory.usage_source, "cgroup-v2:/sys/fs/cgroup"
+            )
+            self.assertEqual(result.memory.usage_current_bytes, gib(4))
+            self.assertEqual(result.memory.available_bytes, gib(28))
+            self.assertTrue(result.build.forced_single_job)
+            self.assertEqual(result.build.suggested_jobs, 1)
+            self.assertEqual(result.build.max_jobs_cap, 1)
+            self.assertTrue(
+                any("both '/'" in warning for warning in result.warnings)
+            )
+
+    def test_ambiguous_root_still_exposes_insufficient_one_job_headroom(
+        self,
+    ) -> None:
+        with self.fixture_root() as raw_root:
+            root = Path(raw_root)
+            leaf = setup_v2_leaf(root, "/")
+            (leaf / "memory.max").write_text("max\n", encoding="ascii")
+            (leaf / "memory.current").write_text(str(gib(31)), encoding="ascii")
+            (leaf / "memory.stat").write_text("inactive_file 0\n", encoding="ascii")
+            (leaf / "memory.peak").write_text(str(gib(31)), encoding="ascii")
+            write_verified_assignment(root, gib(32))
+
+            result = pr.collect_resources(
+                filesystem_root=root,
+                env={"RUNPOD_ASSIGNED_MEMORY_BYTES": str(gib(32))},
+                affinity_count=8,
+                host_cpu_count=8,
+            )
+
+            self.assertTrue(result.memory.usage_peak_eligible)
+            self.assertFalse(result.memory.usage_trustworthy)
+            self.assertEqual(result.memory.available_bytes, gib(1))
+            required_headroom = (
+                result.build.reserve_bytes + result.build.memory_per_job_bytes
+            )
+            self.assertLess(result.memory.available_bytes, required_headroom)
+            self.assertTrue(result.build.forced_single_job)
+            self.assertEqual(result.build.suggested_jobs, 1)
+
+    def test_smaller_finite_cgroup_limit_wins_over_assignment(self) -> None:
+        with self.fixture_root() as raw_root:
+            root = Path(raw_root)
+            leaf = setup_v2_leaf(root, "/pod")
+            (leaf / "memory.max").write_text(str(gib(16)), encoding="ascii")
+            (leaf / "memory.current").write_text(str(gib(2)), encoding="ascii")
+            (leaf / "memory.stat").write_text("inactive_file 0\n", encoding="ascii")
+            write_verified_assignment(root, gib(32))
+
+            result = pr.collect_resources(
+                filesystem_root=root,
+                env={"RUNPOD_ASSIGNED_MEMORY_BYTES": str(gib(32))},
+                affinity_count=8,
+                host_cpu_count=8,
+            )
+
+            self.assertEqual(result.memory.capacity_bytes, gib(16))
+            self.assertTrue(result.memory.capacity_is_hard_limit)
+            self.assertTrue(result.memory.capacity_source.startswith("cgroup-v2:"))
+            self.assertEqual(result.memory.assigned_capacity_bytes, gib(32))
+            self.assertTrue(result.memory.usage_trustworthy)
+
+    def test_assignment_smaller_than_cgroup_uses_assignment_and_leaf_usage(
+        self,
+    ) -> None:
+        with self.fixture_root() as raw_root:
+            root = Path(raw_root)
+            leaf = setup_v2_leaf(root, "/pod")
+            (leaf / "memory.max").write_text(str(gib(48)), encoding="ascii")
+            (leaf / "memory.current").write_text(str(gib(4)), encoding="ascii")
+            (leaf / "memory.stat").write_text(
+                f"inactive_file {gib(1)}\n", encoding="ascii"
+            )
+            write_verified_assignment(root, gib(32))
+
+            result = pr.collect_resources(
+                filesystem_root=root,
+                env={"RUNPOD_ASSIGNED_MEMORY_BYTES": str(gib(32))},
+                affinity_count=8,
+                host_cpu_count=8,
+            )
+
+            self.assertTrue(result.memory.limited)
+            self.assertEqual(result.memory.limit_bytes, gib(48))
+            self.assertEqual(
+                result.memory.capacity_source, "runpod-api-assignment"
+            )
+            self.assertEqual(result.memory.capacity_bytes, gib(32))
+            self.assertTrue(result.memory.usage_trustworthy)
+            self.assertEqual(result.memory.available_bytes, gib(29))
+
+    def test_invalid_runpod_assignment_is_rejected(self) -> None:
+        invalid_values = ("0", "-1", "01", " 34359738368", "32GiB", str(gib(65)))
+        for value in invalid_values:
+            with self.subTest(value=value), self.fixture_root() as raw_root:
+                root = Path(raw_root)
+                leaf = setup_v2_leaf(root, "/pod")
+                (leaf / "memory.max").write_text("max\n", encoding="ascii")
+                (leaf / "memory.current").write_text("1\n", encoding="ascii")
+                with self.assertRaises(ValueError):
+                    pr.collect_resources(
+                        filesystem_root=root,
+                        env={"RUNPOD_ASSIGNED_MEMORY_BYTES": value},
+                        affinity_count=4,
+                        host_cpu_count=4,
+                    )
+
+    def test_assignment_requires_an_exact_verified_receipt(self) -> None:
+        with self.fixture_root() as raw_root:
+            root = Path(raw_root)
+            leaf = setup_v2_leaf(root, "/pod")
+            (leaf / "memory.max").write_text("max\n", encoding="ascii")
+            (leaf / "memory.current").write_text("1\n", encoding="ascii")
+            assignment = str(gib(32))
+
+            with self.assertRaisesRegex(ValueError, "receipt"):
+                pr.collect_resources(
+                    filesystem_root=root,
+                    env={"RUNPOD_ASSIGNED_MEMORY_BYTES": assignment},
+                    affinity_count=4,
+                    host_cpu_count=4,
+                )
+
+            write_verified_assignment(root, gib(31))
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                pr.collect_resources(
+                    filesystem_root=root,
+                    env={"RUNPOD_ASSIGNED_MEMORY_BYTES": assignment},
+                    affinity_count=4,
+                    host_cpu_count=4,
+                )
+
     def test_conservative_sage_build_job_recommendation(self) -> None:
         cases = [
             (16, 16, 1),
@@ -308,6 +529,9 @@ class PodResourcesTests(unittest.TestCase):
                     limit_source="fixture",
                     swap_limit_bytes=0,
                     swap_current_bytes=0,
+                    usage_trustworthy=True,
+                    usage_peak_eligible=True,
+                    usage_scope="cgroup-capacity",
                 )
                 cpu = pr.CpuSnapshot(
                     host_count=32,
@@ -342,6 +566,9 @@ class PodResourcesTests(unittest.TestCase):
             limit_source="fixture",
             swap_limit_bytes=0,
             swap_current_bytes=0,
+            usage_trustworthy=True,
+            usage_peak_eligible=True,
+            usage_scope="cgroup-capacity",
         )
         cpu = pr.CpuSnapshot(32, 32, 32, None, None, 32, 32, ("host",))
         recommendation = pr.recommend_build_jobs(
@@ -383,8 +610,10 @@ class PodResourcesTests(unittest.TestCase):
                     pr.main(["--filesystem-root", str(root), "--json"]), 0
                 )
             payload = json.loads(output.getvalue())
-            self.assertEqual(payload["schema_version"], 1)
+            self.assertEqual(payload["schema_version"], 2)
             self.assertEqual(payload["memory"]["limit_bytes"], gib(16))
+            self.assertEqual(payload["memory"]["capacity_bytes"], gib(16))
+            self.assertTrue(payload["memory"]["capacity_is_hard_limit"])
 
             output = io.StringIO()
             with redirect_stdout(output):
@@ -393,6 +622,8 @@ class PodResourcesTests(unittest.TestCase):
                 )
             shell = output.getvalue()
             self.assertIn("POD_MEMORY_LIMIT_BYTES=17179869184", shell)
+            self.assertIn("POD_MEMORY_CAPACITY_BYTES=17179869184", shell)
+            self.assertIn("POD_MEMORY_USAGE_PEAK_ELIGIBLE=1", shell)
             self.assertIn("POD_BUILD_JOBS=", shell)
 
             output = io.StringIO()

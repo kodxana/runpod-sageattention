@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 import json
 import os
 import shlex
@@ -218,6 +219,14 @@ class JobResult:
     endpoint: Endpoint
     artifact_output: Path
     selected_gpu_id: str | None = None
+
+
+@dataclass(frozen=True)
+class VerifiedBuildAssignment:
+    """Trusted build resources read back from the selected Runpod Pod."""
+
+    vcpu_count: int
+    assigned_memory_bytes: int
 
 
 Executor = Callable[..., subprocess.CompletedProcess[str]]
@@ -890,12 +899,32 @@ def _assignment_payload(details: Mapping[str, object]) -> Mapping[str, object]:
     return nested if isinstance(nested, Mapping) else details
 
 
-def _number(details: Mapping[str, object], name: str) -> float | None:
+def _finite_decimal(details: Mapping[str, object], name: str) -> Decimal | None:
     value = details.get(name)
-    try:
-        return float(value) if value is not None else None
-    except (TypeError, ValueError):
+    if value is None or isinstance(value, bool):
         return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return parsed if parsed.is_finite() else None
+
+
+def _integer(details: Mapping[str, object], name: str) -> int | None:
+    parsed = _finite_decimal(details, name)
+    if parsed is None or parsed != parsed.to_integral_value():
+        return None
+    return int(parsed)
+
+
+def _memory_bytes(details: Mapping[str, object], name: str) -> tuple[Decimal, int] | None:
+    memory_gb = _finite_decimal(details, name)
+    if memory_gb is None or memory_gb <= 0:
+        return None
+    memory_bytes = memory_gb * Decimal(1_000_000_000)
+    if memory_bytes != memory_bytes.to_integral_value():
+        return None
+    return memory_gb, int(memory_bytes)
 
 
 def _gpu_type_ids(details: Mapping[str, object]) -> tuple[str, ...]:
@@ -925,7 +954,7 @@ def verify_pod_assignment(
     pod_id: str,
     request: PodRequest,
     deadline: Deadline,
-) -> None:
+) -> VerifiedBuildAssignment | None:
     """Refuse image, placement, or build-resource drift before source upload."""
 
     details = _assignment_payload(
@@ -951,29 +980,30 @@ def verify_pod_assignment(
                 f"Pod {pod_id}: verified image and gpu_id={gpu_type_id}",
                 flush=True,
             )
-            return
+            return None
 
-        vcpus = _number(details, "vcpuCount")
+        vcpus = _integer(details, "vcpuCount")
         if vcpus is None or vcpus < request.gpu_min_vcpu_count:
             raise GpuPlacementError(
                 f"GPU build CPU count mismatch: required at least "
                 f"{request.gpu_min_vcpu_count}, got {details.get('vcpuCount')!r}"
             )
-        memory = _number(details, "memoryInGb")
-        if memory is None or memory < request.gpu_min_memory_gb:
+        memory = _memory_bytes(details, "memoryInGb")
+        if memory is None or memory[0] < request.gpu_min_memory_gb:
             raise GpuPlacementError(
                 f"GPU build memory mismatch: required at least "
                 f"{request.gpu_min_memory_gb} GB, "
                 f"got {details.get('memoryInGb')!r}"
             )
-        container_disk = _number(details, "containerDiskInGb")
+        memory_gb, assigned_memory_bytes = memory
+        container_disk = _integer(details, "containerDiskInGb")
         if container_disk is None or container_disk < request.container_disk_gb:
             raise GpuPlacementError(
                 f"container disk mismatch: requested at least "
                 f"{request.container_disk_gb} GB, "
                 f"got {details.get('containerDiskInGb')!r}"
             )
-        pod_volume = _number(details, "volumeInGb")
+        pod_volume = _integer(details, "volumeInGb")
         if pod_volume != 0:
             raise GpuPlacementError(
                 "unexpected paid Pod volume: requested 0 GB, "
@@ -981,11 +1011,11 @@ def verify_pod_assignment(
             )
         print(
             f"Pod {pod_id}: verified image, gpu_id={gpu_type_id}, "
-            f"vcpus={vcpus:g}, memory={memory:g} GB, "
-            f"container_disk={container_disk:g} GB, pod_volume=0 GB",
+            f"vcpus={vcpus}, memory={memory_gb:g} GB, "
+            f"container_disk={container_disk} GB, pod_volume=0 GB",
             flush=True,
         )
-        return
+        return VerifiedBuildAssignment(vcpus, assigned_memory_bytes)
 
     flavor = details.get("cpuFlavorId")
     if flavor not in request.cpu_flavor_ids:
@@ -993,26 +1023,27 @@ def verify_pod_assignment(
             "CPU flavor mismatch: expected one of "
             f"{request.cpu_flavor_ids!r}, got {flavor!r}"
         )
-    vcpus = _number(details, "vcpuCount")
+    vcpus = _integer(details, "vcpuCount")
     if vcpus is None or vcpus < request.cpu_vcpu_count:
         raise JobError(
             f"CPU count mismatch: requested at least {request.cpu_vcpu_count}, "
             f"got {details.get('vcpuCount')!r}"
         )
-    memory = _number(details, "memoryInGb")
-    if memory is None or memory < request.cpu_min_memory_gb:
+    memory = _memory_bytes(details, "memoryInGb")
+    if memory is None or memory[0] < request.cpu_min_memory_gb:
         raise JobError(
             f"memory mismatch: required at least {request.cpu_min_memory_gb} GB, "
             f"got {details.get('memoryInGb')!r}"
         )
-    container_disk = _number(details, "containerDiskInGb")
+    memory_gb, assigned_memory_bytes = memory
+    container_disk = _integer(details, "containerDiskInGb")
     if container_disk is None or container_disk < request.container_disk_gb:
         raise JobError(
             f"container disk mismatch: requested at least "
             f"{request.container_disk_gb} GB, "
             f"got {details.get('containerDiskInGb')!r}"
         )
-    pod_volume = _number(details, "volumeInGb")
+    pod_volume = _integer(details, "volumeInGb")
     if pod_volume != 0:
         raise JobError(
             "unexpected paid Pod volume: requested 0 GB, "
@@ -1020,10 +1051,11 @@ def verify_pod_assignment(
         )
     print(
         f"Pod {pod_id}: verified image, flavor={flavor}, "
-        f"vcpus={vcpus:g}, memory={memory:g} GB, "
-        f"container_disk={container_disk:g} GB, pod_volume=0 GB",
+        f"vcpus={vcpus}, memory={memory_gb:g} GB, "
+        f"container_disk={container_disk} GB, pod_volume=0 GB",
         flush=True,
     )
+    return VerifiedBuildAssignment(vcpus, assigned_memory_bytes)
 
 
 def _terminate_strictly(ctl: Runpodctl, pod_id: str) -> Exception | None:
@@ -1067,6 +1099,23 @@ def _rfc3339_after(
 
 GPU_PLACEMENT_ROUNDS = 2
 GPU_PLACEMENT_BACKOFF_SECONDS = 5.0
+RESOURCE_RECEIPT_PATH = "/run/sageattention/verified-memory-bytes-v1"
+
+
+def _resource_receipt_prefix(assigned_memory_bytes: int) -> str:
+    """Atomically publish the verified presentation budget inside one Pod."""
+
+    if assigned_memory_bytes <= 0:
+        raise ValueError("assigned_memory_bytes must be positive")
+    return (
+        "install -d -m 0755 /run/sageattention; "
+        "resource_receipt=$(mktemp "
+        "/run/sageattention/.verified-memory-bytes-v1.XXXXXX); "
+        f"printf '%s\\n' {assigned_memory_bytes} > \"$resource_receipt\"; "
+        "chmod 0444 \"$resource_receipt\"; "
+        f"mv -f -- \"$resource_receipt\" {RESOURCE_RECEIPT_PATH}; "
+        "unset resource_receipt; "
+    )
 
 
 def _gpu_candidates(spec: JobSpec) -> tuple[str, ...]:
@@ -1085,12 +1134,14 @@ def run_job(
     """Run a job and make Pod deletion mandatory on every post-create path."""
 
     spec.validate()
+    is_build_job = spec.pod.compute_type.upper() == "CPU" or spec.pod.is_gpu_build
     deadline = Deadline(spec.hard_timeout_seconds)
     ctl = ctl or Runpodctl()
     transport = transport or SSHTransport(spec.ssh_private_key)
     pod_id: str | None = None
     endpoint: Endpoint | None = None
     selected_gpu_id: str | None = None
+    verified_build_assignment: VerifiedBuildAssignment | None = None
     repo_uploaded = False
     primary_error: Exception | None = None
     artifact_error: Exception | None = None
@@ -1125,7 +1176,12 @@ def run_job(
                 deadline,
                 poll_seconds=spec.poll_seconds,
             )
-            verify_pod_assignment(ctl, pod_id, spec.pod, deadline)
+            verified_build_assignment = verify_pod_assignment(
+                ctl,
+                pod_id,
+                spec.pod,
+                deadline,
+            )
         else:
             candidates = _gpu_candidates(spec)
             placement_failures: list[str] = []
@@ -1182,7 +1238,7 @@ def run_job(
                         poll_seconds=spec.poll_seconds,
                     )
                     try:
-                        verify_pod_assignment(
+                        candidate_assignment = verify_pod_assignment(
                             ctl,
                             pod_id,
                             candidate_request,
@@ -1211,6 +1267,7 @@ def run_job(
                         continue
 
                     selected_gpu_id = candidate
+                    verified_build_assignment = candidate_assignment
                     print(
                         f"Selected GPU candidate {candidate!r} for Pod {pod_id} "
                         f"(round {round_number})",
@@ -1230,6 +1287,8 @@ def run_job(
                 )
 
         assert pod_id is not None and endpoint is not None
+        if is_build_job and verified_build_assignment is None:
+            raise JobError("build Pod assignment did not provide verified CPU/RAM")
         transport.upload_repo(
             endpoint,
             spec.repo_root,
@@ -1238,12 +1297,34 @@ def run_job(
         )
         repo_uploaded = True
         for command in spec.commands:
-            remote_command = command
-            if selected_gpu_id is not None:
-                remote_command = (
-                    "export RUNPOD_SELECTED_GPU_ID="
-                    f"{shlex.quote(selected_gpu_id)}; {command}"
+            remote_exports: list[tuple[str, str]] = []
+            receipt_prefix = ""
+            if is_build_job:
+                assert verified_build_assignment is not None
+                receipt_prefix = _resource_receipt_prefix(
+                    verified_build_assignment.assigned_memory_bytes
                 )
+                remote_exports.extend(
+                    (
+                        (
+                            "RUNPOD_CPU_COUNT",
+                            str(verified_build_assignment.vcpu_count),
+                        ),
+                        (
+                            "RUNPOD_ASSIGNED_MEMORY_BYTES",
+                            str(verified_build_assignment.assigned_memory_bytes),
+                        ),
+                    )
+                )
+            if selected_gpu_id is not None:
+                remote_exports.append(("RUNPOD_SELECTED_GPU_ID", selected_gpu_id))
+            remote_command = command
+            if remote_exports:
+                export_prefix = "; ".join(
+                    f"export {name}={shlex.quote(value)}"
+                    for name, value in remote_exports
+                )
+                remote_command = f"{receipt_prefix}{export_prefix}; {command}"
             transport.run_script(
                 endpoint,
                 spec.remote_dir,

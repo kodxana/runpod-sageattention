@@ -229,6 +229,7 @@ jobs:
     timeout-minutes: 10
     outputs:
       builds: ${{ steps.plan.outputs.builds }}
+      gpu_max_parallel: ${{ steps.plan.outputs.gpu_max_parallel }}
       gpu-tests: ${{ steps.plan.outputs.gpu-tests }}
       source_sha: ${{ steps.source.outputs.source_sha }}
     steps:
@@ -485,6 +486,7 @@ jobs:
           output = Path(os.environ["GITHUB_OUTPUT"])
           with output.open("a", encoding="utf-8") as handle:
               handle.write("builds=" + json.dumps({"include": builds}, separators=(",", ":")) + "\n")
+              handle.write("gpu_max_parallel=" + json.dumps(max_parallel) + "\n")
               handle.write("gpu-tests=" + json.dumps({"include": tests}, separators=(",", ":")) + "\n")
           PY
 
@@ -640,7 +642,7 @@ jobs:
     timeout-minutes: 270
     strategy:
       fail-fast: false
-      max-parallel: ${{ inputs.gpu_max_parallel }}
+      max-parallel: ${{ fromJSON(needs.plan.outputs.gpu_max_parallel) }}
       matrix: ${{ fromJSON(needs.plan.outputs.gpu-tests) }}
     steps:
       - name: Check out requested source

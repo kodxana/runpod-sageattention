@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import ast
 import io
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timezone
 import json
 import subprocess
@@ -23,6 +23,7 @@ from tools.runpod_job import (
     PodRequest,
     Runpodctl,
     SSHTransport,
+    VerifiedBuildAssignment,
     _extract_ssh_endpoint,
     _http_json,
     _make_repo_archive,
@@ -432,7 +433,7 @@ class AssignmentTests(unittest.TestCase):
                     "volumeInGb": 0,
                 }
 
-        verify_pod_assignment(
+        assignment = verify_pod_assignment(
             FakeCtl(),  # type: ignore[arg-type]
             "pod-1",
             PodRequest(
@@ -443,6 +444,16 @@ class AssignmentTests(unittest.TestCase):
             ),
             Deadline(10),
         )
+        self.assertEqual(
+            assignment,
+            VerifiedBuildAssignment(
+                vcpu_count=16,
+                assigned_memory_bytes=62_000_000_000,
+            ),
+        )
+        assert assignment is not None
+        with self.assertRaises(FrozenInstanceError):
+            assignment.vcpu_count = 32  # type: ignore[misc]
 
     def test_cpu_assignment_rejects_service_drift(self) -> None:
         class FakeCtl:
@@ -509,7 +520,7 @@ class AssignmentTests(unittest.TestCase):
                     "gpu": {"id": "NVIDIA RTX 4090"},
                 }
 
-        verify_pod_assignment(
+        assignment = verify_pod_assignment(
             FakeCtl(),  # type: ignore[arg-type]
             "pod-validation",
             PodRequest(
@@ -521,6 +532,7 @@ class AssignmentTests(unittest.TestCase):
             ),
             Deadline(10),
         )
+        self.assertIsNone(assignment)
 
     def test_gpu_validation_assignment_requires_exact_gpu_id(self) -> None:
         class FakeCtl:
@@ -604,11 +616,15 @@ class AssignmentTests(unittest.TestCase):
             },
         ):
             with self.subTest(gpu_fields=gpu_fields):
-                verify_pod_assignment(
+                assignment = verify_pod_assignment(
                     FakeCtl({**base, **gpu_fields}),  # type: ignore[arg-type]
                     "pod-gpu-build",
                     request,
                     Deadline(10),
+                )
+                self.assertEqual(
+                    assignment,
+                    VerifiedBuildAssignment(4, 32_000_000_000),
                 )
 
     def test_gpu_build_assignment_fails_closed_on_resource_drift(self) -> None:
@@ -644,16 +660,22 @@ class AssignmentTests(unittest.TestCase):
                 "GPU type mismatch",
             ),
             ({**base, "vcpuCount": 3}, "GPU build CPU count mismatch"),
+            ({**base, "vcpuCount": 4.5}, "GPU build CPU count mismatch"),
+            ({**base, "vcpuCount": float("nan")}, "GPU build CPU count mismatch"),
+            ({**base, "vcpuCount": float("inf")}, "GPU build CPU count mismatch"),
             (
                 {key: value for key, value in base.items() if key != "vcpuCount"},
                 "GPU build CPU count mismatch",
             ),
             ({**base, "memoryInGb": 31}, "GPU build memory mismatch"),
+            ({**base, "memoryInGb": float("nan")}, "GPU build memory mismatch"),
+            ({**base, "memoryInGb": float("inf")}, "GPU build memory mismatch"),
             (
                 {key: value for key, value in base.items() if key != "memoryInGb"},
                 "GPU build memory mismatch",
             ),
             ({**base, "containerDiskInGb": 79}, "container disk mismatch"),
+            ({**base, "containerDiskInGb": 80.5}, "container disk mismatch"),
             (
                 {
                     key: value
@@ -663,6 +685,7 @@ class AssignmentTests(unittest.TestCase):
                 "container disk mismatch",
             ),
             ({**base, "volumeInGb": 20}, "unexpected paid Pod volume"),
+            ({**base, "volumeInGb": 0.5}, "unexpected paid Pod volume"),
             (
                 {key: value for key, value in base.items() if key != "volumeInGb"},
                 "unexpected paid Pod volume",
@@ -908,6 +931,80 @@ class RunJobCleanupTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "directory below /work"):
                 spec.validate()
 
+    def test_cpu_build_exports_verified_resources_for_every_command(self) -> None:
+        class FakeCtl:
+            def check_auth(self, timeout):
+                return None
+
+            def create_pod(
+                self, request, terminate_after, self_terminate_seconds, timeout
+            ):
+                return "pod-cpu-build"
+
+            def assignment_details(self, pod_id, timeout):
+                return {
+                    "pod": {
+                        "imageName": "registry.invalid/builder@sha256:" + "c" * 64,
+                        "cpuFlavorId": "cpu3g",
+                        "vcpuCount": "16.0",
+                        "memoryInGb": "62.5",
+                        "containerDiskInGb": "80",
+                        "volumeInGb": "0",
+                    }
+                }
+
+            def terminate_pod(self, pod_id, timeout):
+                return None
+
+        class FakeTransport:
+            def __init__(self):
+                self.scripts: list[str] = []
+
+            def upload_repo(self, *args):
+                return None
+
+            def run_script(self, endpoint, remote_dir, script, deadline):
+                self.scripts.append(script)
+
+            def download_artifacts(self, *args):
+                return None
+
+        with tempfile.TemporaryDirectory() as temp:
+            transport = FakeTransport()
+            run_job(
+                replace(
+                    self._spec(Path(temp)),
+                    commands=("first-build-step", "second-build-step"),
+                ),
+                ctl=FakeCtl(),  # type: ignore[arg-type]
+                transport=transport,  # type: ignore[arg-type]
+                wait_fn=lambda *args, **kwargs: Endpoint("host", 2200),
+            )
+
+        receipt_prefix = (
+            "install -d -m 0755 /run/sageattention; "
+            "resource_receipt=$(mktemp "
+            "/run/sageattention/.verified-memory-bytes-v1.XXXXXX); "
+            "printf '%s\\n' 62500000000 > \"$resource_receipt\"; "
+            "chmod 0444 \"$resource_receipt\"; "
+            "mv -f -- \"$resource_receipt\" "
+            "/run/sageattention/verified-memory-bytes-v1; "
+            "unset resource_receipt; "
+        )
+        export_prefix = (
+            "export RUNPOD_CPU_COUNT=16; "
+            "export RUNPOD_ASSIGNED_MEMORY_BYTES=62500000000; "
+        )
+        self.assertEqual(
+            transport.scripts,
+            [
+                receipt_prefix + export_prefix + "first-build-step",
+                receipt_prefix + export_prefix + "second-build-step",
+            ],
+        )
+        self.assertIn("chmod 0444", transport.scripts[0])
+        self.assertNotIn("RUNPOD_SELECTED_GPU_ID", " ".join(transport.scripts))
+
     def test_gpu_build_assignment_failure_terminates_before_upload(self) -> None:
         class FakeCtl:
             def __init__(self):
@@ -986,7 +1083,7 @@ class RunJobCleanupTests(unittest.TestCase):
                     "imageName": "registry.invalid/builder@sha256:" + "e" * 64,
                     "gpuTypeId": gpu_id,
                     "vcpuCount": 3 if pod_id == "pod-first" else 4,
-                    "memoryInGb": 32,
+                    "memoryInGb": 48 if pod_id == "pod-first" else 64,
                     "containerDiskInGb": 80,
                     "volumeInGb": 0,
                 }
@@ -1035,6 +1132,12 @@ class RunJobCleanupTests(unittest.TestCase):
             "export RUNPOD_SELECTED_GPU_ID='NVIDIA H100 PCIe';",
             transport.scripts[0],
         )
+        self.assertIn("export RUNPOD_CPU_COUNT=4;", transport.scripts[0])
+        self.assertIn(
+            "export RUNPOD_ASSIGNED_MEMORY_BYTES=64000000000;",
+            transport.scripts[0],
+        )
+        self.assertNotIn("48000000000", transport.scripts[0])
 
     def test_gpu_validation_exact_assignment_mismatch_uses_next_candidate(self) -> None:
         first = "NVIDIA GeForce RTX 4090"
@@ -1064,11 +1167,14 @@ class RunJobCleanupTests(unittest.TestCase):
                 self.terminated.append(pod_id)
 
         class FakeTransport:
+            def __init__(self):
+                self.scripts: list[str] = []
+
             def upload_repo(self, *args):
                 return None
 
-            def run_script(self, *args):
-                return None
+            def run_script(self, endpoint, remote_dir, script, deadline):
+                self.scripts.append(script)
 
             def download_artifacts(self, *args):
                 return None
@@ -1089,16 +1195,24 @@ class RunJobCleanupTests(unittest.TestCase):
                 remote_dir="/workspace",
             )
             ctl = FakeCtl()
+            transport = FakeTransport()
             result = run_job(
                 spec,
                 ctl=ctl,  # type: ignore[arg-type]
-                transport=FakeTransport(),  # type: ignore[arg-type]
+                transport=transport,  # type: ignore[arg-type]
                 wait_fn=lambda *args, **kwargs: Endpoint("host", 2200),
             )
 
         self.assertEqual(ctl.candidates, [first, second])
         self.assertEqual(ctl.terminated, ["pod-1", "pod-2"])
         self.assertEqual(result.selected_gpu_id, second)
+        self.assertIn(
+            "export RUNPOD_SELECTED_GPU_ID='NVIDIA L40S';",
+            transport.scripts[0],
+        )
+        self.assertNotIn("RUNPOD_CPU_COUNT", transport.scripts[0])
+        self.assertNotIn("RUNPOD_ASSIGNED_MEMORY_BYTES", transport.scripts[0])
+        self.assertNotIn("verified-memory-bytes-v1", transport.scripts[0])
 
     def test_gpu_capacity_fallback_uses_two_bounded_ordered_rounds(self) -> None:
         first = "NVIDIA A100 80GB PCIe"

@@ -8,17 +8,19 @@ misleading display does not grant the pod extra memory.
 SageAttention builders are GPU-backed, but the build hides the accelerator with
 `CUDA_VISIBLE_DEVICES=""`. Resource policy therefore concerns the Pod's
 host-system vCPU, system RAM, and container disk—not GPU utilization or VRAM.
-The attached GPU type is a scheduling choice and cannot substitute for a finite
-system-memory cgroup limit. Ordered builder fallbacks may therefore span GPU
-architectures, but every selected candidate is still subject to the same
-assignment and cgroup checks; candidate ordering must never be based on VRAM as
-a proxy for system RAM.
+The attached GPU type is a scheduling choice and cannot substitute for assigned
+system RAM. Ordered builder fallbacks may therefore span GPU architectures, but
+every selected candidate is still subject to the same API-assignment, cgroup,
+CPU, and disk checks; candidate ordering must never be based on VRAM as a proxy
+for system RAM.
 
 This repository handles the problem in two layers:
 
-1. `/usr/local/bin/pod-resources` is the authoritative source for automation.
-   It resolves cgroups directly and reports machine-readable memory, CPU, and
-   safe compiler parallelism data.
+1. `tools/pod_resources.py` is the authoritative source for build automation.
+   The build prefers this uploaded repository copy so the policy can be fixed
+   without rebuilding an older builder image; `/usr/local/bin/pod-resources`
+   remains its installed fallback. It resolves cgroups directly and reports
+   machine-readable memory, CPU, and safe compiler parallelism data.
 2. `/usr/local/bin/free`, `htop`, and `top` are optional presentation wrappers.
    They load a narrow compatibility library only for that one process so an
    operator sees the pod memory total. They must not drive build policy.
@@ -40,12 +42,12 @@ eval "$(pod-resources --shell)"
 jobs=$(pod-resources --suggested-jobs)
 ```
 
-The JSON schema is versioned. Schema version 1 has this shape (values below are
+The JSON schema is versioned. Schema version 2 has this shape (values below are
 illustrative):
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "cgroup": {
     "version": 2,
     "path": "/pod/container",
@@ -63,7 +65,16 @@ illustrative):
     "high_bytes": null,
     "limit_source": "cgroup-v2:/sys/fs/cgroup/pod",
     "swap_limit_bytes": 0,
-    "swap_current_bytes": 0
+    "swap_current_bytes": 0,
+    "capacity_bytes": 34359738368,
+    "capacity_source": "cgroup-v2:/sys/fs/cgroup/pod",
+    "capacity_is_hard_limit": true,
+    "assigned_capacity_bytes": 68719476736,
+    "usage_source": "cgroup-v2:/sys/fs/cgroup/pod",
+    "usage_current_bytes": 7516192768,
+    "usage_trustworthy": true,
+    "usage_peak_eligible": true,
+    "usage_scope": "cgroup-capacity"
   },
   "cpu": {
     "host_count": 64,
@@ -82,7 +93,8 @@ illustrative):
     "memory_per_job_bytes": 8589934592,
     "reserve_bytes": 5153960756,
     "usable_memory_bytes": 22763326668,
-    "max_jobs_cap": 4
+    "max_jobs_cap": 4,
+    "forced_single_job": false
   },
   "warnings": []
 }
@@ -91,27 +103,50 @@ illustrative):
 Automation should require all of the following before starting a SageAttention
 build:
 
-- `schema_version == 1`
+- `schema_version == 2`
 - `cgroup.version` is `1` or `2`
-- `memory.limited == true`
-- `memory.limit_bytes > 0`
+- `memory.capacity_bytes > 0`
+- `memory.assigned_capacity_bytes > 0`, authorized by the exact receipt and
+  command-scoped environment pair for every Runpod release build
+- capacity comes either from a consistent finite cgroup hard limit or from
+  `memory.capacity_source == "runpod-api-assignment"`
+- `memory.usage_peak_eligible == true` and `memory.usage_source` names the
+  resolved cgroup membership used for peak evidence
 - `build.suggested_jobs >= 1`
 
-If that validation fails, stop the remote build unless a deliberate operator
-override selects one job. `limit_bytes` falls back to the host total when
-`memory.limited` is false, so checking only that number is not sufficient.
-Warnings are diagnostic; a missing current-usage counter is handled
-conservatively as zero available headroom.
+`RUNPOD_ASSIGNED_MEMORY_BYTES` is reserved for the orchestrator: it must be
+copied from the verified Runpod Pod API response, never entered as an operator
+guess. The helper rejects non-canonical, non-positive, and over-host values. It
+records the assignment separately and never labels it a kernel-enforced hard
+limit. If a real cgroup hard limit is no larger than the assignment, that
+smaller limit wins. Raw `limit_bytes`, `limit_source`, and `limited` fields are
+preserved so the distinction remains auditable.
+
+For assignment-backed capacity, memory usage comes from the process's resolved
+cgroup membership. An explicitly scoped leaf is usable for headroom sizing. A
+`/` membership on a `/` mount can also be a private cgroup namespace, as on
+some Runpod Pods, but it is not distinguishable from a host controller root
+from inside the container. When its readable counter does not exceed the
+verified assignment it is eligible for conservative headroom and peak checks;
+inactive cache receives no reclaimability credit. The helper marks the scope
+`ambiguous-cgroup-root` and forces both `MAX_JOBS=1` and `EXT_PARALLEL=1`. A
+missing, malformed, or over-assignment counter is not accepted even for peak
+evidence, and the build stops before compilation.
 
 Default GPU-backed release policy requires an assignment with at least 4
-effective vCPUs, 32 GB system RAM, and an 80 GB container disk before source
+assigned vCPUs, 32 GB system RAM, and an 80 GB container disk before source
 upload; 16 vCPUs and 64 GB system RAM are recommended. The backend-neutral
-helper and build script then independently require a finite 32 GiB cgroup
-limit, at least one safe compiler job, and 20 GiB currently free on both work
-and output filesystems. Disk is checked by `build-wheel.sh`, not by the
-resource-reporting helper.
+helper and build script then independently require at least 4 effective vCPUs,
+a verified API assignment for every release build, and at least 32 GiB
+established by the smaller of that assignment and a finite cgroup limit. They
+also require one safe compiler job, measurable cgroup peak usage, and 20 GiB
+currently free on both work and output filesystems. CPU, minimum capacity, and
+actual disk checks cannot be bypassed with `ALLOW_LOW_RESOURCES`; disk is
+checked by `build-wheel.sh`, not by the resource-reporting helper.
 
-The shell form exports `POD_MEMORY_LIMIT_BYTES`,
+The shell form exports `POD_MEMORY_LIMIT_BYTES`, `POD_MEMORY_CAPACITY_BYTES`,
+`POD_MEMORY_CAPACITY_SOURCE`, `POD_MEMORY_USAGE_SOURCE`,
+`POD_MEMORY_USAGE_PEAK_ELIGIBLE`,
 `POD_MEMORY_CURRENT_BYTES`, `POD_MEMORY_WORKING_SET_BYTES`,
 `POD_MEMORY_AVAILABLE_BYTES`, `POD_CPU_COUNT`, `POD_BUILD_JOBS`, and the
 assumptions used for the recommendation, among other `POD_*` values. Values are
@@ -137,12 +172,13 @@ and memory statistics are read from the same ancestor so sibling usage inside
 the constrained subtree is not missed. `max`, `-1`, and the conventional huge
 v1 sentinel are unlimited; zero remains a real finite value.
 
-Memory values use these definitions:
+Memory values use these definitions, where capacity is the smaller applicable
+cgroup hard limit or verified Runpod assignment:
 
 ```text
 working_set = max(0, current - inactive_file)
-free        = max(0, hard_limit - current)
-available   = max(0, hard_limit - working_set)
+free        = max(0, capacity - current)
+available   = max(0, capacity - working_set)
 ```
 
 The working set is a practical container metric, not a promise that every byte
@@ -165,11 +201,11 @@ compute capability, and VRAM never increase the suggested job count.
 The defaults reflect observed SageAttention NVCC builds: a two-by-two parallel
 build peaked near 30 GiB in a container with roughly a 7 GiB baseline, while a
 serialized build peaked near 9.2 GiB total. The helper therefore assumes 8 GiB
-per concurrent compiler job, reserves the larger of 4 GiB or 15% of the hard
-limit, and caps the recommendation at four jobs:
+per concurrent compiler job, reserves the larger of 4 GiB or 15% of effective
+capacity, and caps the recommendation at four jobs:
 
 ```text
-reserve        = max(4 GiB, ceil(hard_limit * 0.15))
+reserve        = max(4 GiB, ceil(capacity * 0.15))
 usable         = max(0, available - reserve)
 jobs_by_memory = max(1, floor(usable / 8 GiB))
 suggested_jobs = max(1, min(jobs_by_memory, effective_cpus, 4))
@@ -177,7 +213,7 @@ suggested_jobs = max(1, min(jobs_by_memory, effective_cpus, 4))
 
 With otherwise idle memory and ample CPU, the defaults produce:
 
-| Hard limit | Available now | Suggested jobs |
+| Capacity | Available now | Suggested jobs |
 | ---: | ---: | ---: |
 | 16 GiB | 16 GiB | 1 |
 | 32 GiB | 32 GiB | 3 |
@@ -200,6 +236,12 @@ The explicit CLI flags `--memory-per-job-mib` and `--reserve-mib` take
 precedence over environment values. Lowering these safeguards should be backed
 by peak-RSS evidence from the same source, CUDA, compiler, and architecture
 matrix.
+
+Even when a local diagnostic environment has a finite cgroup limit, invoking
+the release build entrypoint requires both `RUNPOD_ASSIGNED_MEMORY_BYTES` and a
+matching fixed-path receipt. This prevents a locally acceptable cgroup-only
+build from compiling for hours and then failing promotion's resource-evidence
+gate.
 
 ## Scoped display shim
 
@@ -232,6 +274,35 @@ htop: `MemTotal`, `MemFree`, `MemAvailable`, `Buffers`, `Cached`,
 `SReclaimable`, `Shmem`, and swap totals. If cgroup membership, mount mapping,
 hard limit, or usage cannot be resolved confidently, it opens the original
 file unchanged.
+
+When Runpod reports an assigned memory capacity but exposes an unlimited
+memory cgroup, the orchestrator also writes the verified decimal-byte value to
+`/run/sageattention/verified-memory-bytes-v1`. The receipt is an exact positive
+decimal followed by one newline, owned by `root:root`, mode `0444`, and written
+atomically only after the REST assignment has passed the image, GPU/CPU, disk,
+and memory checks. The shim rejects symlinks or multiply-linked receipts, any
+other owner or mode, malformed content, missing cgroup usage, and a current
+usage greater than the selected capacity. In those cases it exposes the real
+`/proc/meminfo` unchanged.
+
+`RUNPOD_ASSIGNED_MEMORY_BYTES` supplies the same presentation ceiling to
+commands descended from the orchestrated build shell. It is command-scoped, so
+the receipt is what makes later `free`, `top`, and `htop` sessions consistent.
+When more than one ceiling is available, the shim displays the smallest of the
+host total, a real finite cgroup limit, the verified receipt, and the
+command-scoped value. Assignment-only presentation reports no swap because the
+Runpod RAM assignment does not establish a swap allowance.
+
+Neither input turns a scheduler assignment into kernel isolation. The shim uses
+them only for presentation. For build authorization, the uploaded
+`pod-resources` helper requires the command-scoped value and the fixed receipt
+to be present, independently well formed, and exactly equal; an environment
+value alone is never authoritative. It then applies cgroup/assignment minimum,
+usage, peak, CPU, disk, and parallelism policy, and the result is retained in
+build evidence. Images built before the receipt consumer was added must be
+rebuilt and pinned to a new digest before their interactive wrappers can use
+it; the uploaded helper allows existing builder images to use the build policy
+without an image rebuild.
 
 Set `PODPROC_DISABLE=1` to escape the shim for a command:
 

@@ -19,8 +19,9 @@ import os
 import posixpath
 import re
 import shlex
+import stat
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
@@ -32,7 +33,8 @@ DEFAULT_MEMORY_PER_JOB_MIB = 8192
 DEFAULT_RESERVE_BYTES = 4 * GIB
 DEFAULT_MAX_JOBS = 4
 UNLIMITED_THRESHOLD = 1 << 60
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+VERIFIED_MEMORY_RECEIPT = "/run/sageattention/verified-memory-bytes-v1"
 
 
 @dataclass(frozen=True)
@@ -55,6 +57,7 @@ class CgroupEntry:
 class CgroupLocation:
     version: int
     membership_path: str
+    mount_root: str
     mount_point: str
     current_dir: Path
     mount_dir: Path
@@ -74,6 +77,15 @@ class MemorySnapshot:
     limit_source: str
     swap_limit_bytes: int
     swap_current_bytes: int
+    capacity_bytes: int = 0
+    capacity_source: str = ""
+    capacity_is_hard_limit: bool = False
+    assigned_capacity_bytes: int | None = None
+    usage_source: str = ""
+    usage_current_bytes: int | None = None
+    usage_trustworthy: bool = False
+    usage_peak_eligible: bool = False
+    usage_scope: str = "unavailable"
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -89,6 +101,15 @@ class MemorySnapshot:
             "limit_source": self.limit_source,
             "swap_limit_bytes": self.swap_limit_bytes,
             "swap_current_bytes": self.swap_current_bytes,
+            "capacity_bytes": self.capacity_bytes,
+            "capacity_source": self.capacity_source,
+            "capacity_is_hard_limit": self.capacity_is_hard_limit,
+            "assigned_capacity_bytes": self.assigned_capacity_bytes,
+            "usage_source": self.usage_source,
+            "usage_current_bytes": self.usage_current_bytes,
+            "usage_trustworthy": self.usage_trustworthy,
+            "usage_peak_eligible": self.usage_peak_eligible,
+            "usage_scope": self.usage_scope,
         }
 
 
@@ -125,6 +146,7 @@ class BuildRecommendation:
     reserve_bytes: int
     usable_memory_bytes: int
     max_jobs_cap: int
+    forced_single_job: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -135,6 +157,7 @@ class BuildRecommendation:
             "reserve_bytes": self.reserve_bytes,
             "usable_memory_bytes": self.usable_memory_bytes,
             "max_jobs_cap": self.max_jobs_cap,
+            "forced_single_job": self.forced_single_job,
         }
 
 
@@ -178,6 +201,25 @@ class ResourceSnapshot:
             "POD_MEMORY_HIGH_BYTES": self.memory.high_bytes or 0,
             "POD_MEMORY_SWAP_LIMIT_BYTES": self.memory.swap_limit_bytes,
             "POD_MEMORY_SWAP_CURRENT_BYTES": self.memory.swap_current_bytes,
+            "POD_MEMORY_CAPACITY_BYTES": self.memory.capacity_bytes,
+            "POD_MEMORY_CAPACITY_SOURCE": self.memory.capacity_source,
+            "POD_MEMORY_CAPACITY_IS_HARD_LIMIT": int(
+                self.memory.capacity_is_hard_limit
+            ),
+            "POD_MEMORY_ASSIGNED_CAPACITY_BYTES": (
+                self.memory.assigned_capacity_bytes or 0
+            ),
+            "POD_MEMORY_USAGE_SOURCE": self.memory.usage_source,
+            "POD_MEMORY_USAGE_CURRENT_BYTES": (
+                ""
+                if self.memory.usage_current_bytes is None
+                else self.memory.usage_current_bytes
+            ),
+            "POD_MEMORY_USAGE_TRUSTWORTHY": int(self.memory.usage_trustworthy),
+            "POD_MEMORY_USAGE_PEAK_ELIGIBLE": int(
+                self.memory.usage_peak_eligible
+            ),
+            "POD_MEMORY_USAGE_SCOPE": self.memory.usage_scope,
             "POD_CPU_COUNT": self.cpu.effective_count,
             "POD_CPU_HOST_COUNT": self.cpu.host_count,
             "POD_CPU_AFFINITY_COUNT": self.cpu.affinity_count or 0,
@@ -195,6 +237,7 @@ class ResourceSnapshot:
             "POD_BUILD_RESERVE_BYTES": self.build.reserve_bytes,
             "POD_BUILD_USABLE_MEMORY_BYTES": self.build.usable_memory_bytes,
             "POD_BUILD_MAX_JOBS_CAP": self.build.max_jobs_cap,
+            "POD_BUILD_FORCED_SINGLE_JOB": int(self.build.forced_single_job),
         }
 
 
@@ -324,6 +367,7 @@ def locate_cgroup(
                     return CgroupLocation(
                         version=2,
                         membership_path=entry.path,
+                        mount_root=mount.root,
                         mount_point=mount.mount_point,
                         current_dir=physical,
                         mount_dir=probe.path(mount.mount_point),
@@ -345,6 +389,7 @@ def locate_cgroup(
                     return CgroupLocation(
                         version=1,
                         membership_path=entry.path,
+                        mount_root=mount.root,
                         mount_point=mount.mount_point,
                         current_dir=physical,
                         mount_dir=probe.path(mount.mount_point),
@@ -481,6 +526,232 @@ def _logical_source(location: CgroupLocation, source: Path | None) -> str:
     return f"cgroup-v{location.version}:{logical}"
 
 
+def _memory_filenames(version: int) -> tuple[str, str, str]:
+    if version == 2:
+        return "memory.current", "memory.stat", "inactive_file"
+    return "memory.usage_in_bytes", "memory.stat", "total_inactive_file"
+
+
+def _leaf_is_pod_scoped(location: CgroupLocation) -> bool:
+    """Reject the host controller root as pod accounting.
+
+    A process membership below ``/`` is scoped.  A ``/`` membership is also
+    scoped when the cgroup mount itself has a non-root mount root, which is the
+    normal private-cgroup-namespace representation of a container cgroup.
+    """
+
+    membership = posixpath.normpath("/" + location.membership_path.lstrip("/"))
+    mount_root = posixpath.normpath("/" + location.mount_root.lstrip("/"))
+    return membership != "/" or mount_root != "/"
+
+
+def _read_leaf_usage(
+    location: CgroupLocation,
+) -> tuple[int | None, int, str, bool, bool]:
+    usage_name, stat_name, inactive_key = _memory_filenames(location.version)
+    current = _read_integer(location.current_dir / usage_name)
+    if current is None or current < 0:
+        return None, 0, "", False, _leaf_is_pod_scoped(location)
+    stats = _parse_key_values(location.current_dir / stat_name)
+    inactive = stats.get(inactive_key)
+    if inactive is None and location.version == 1:
+        inactive = stats.get("inactive_file", 0)
+    inactive = min(max(0, inactive or 0), current)
+    return (
+        current,
+        inactive,
+        _logical_source(location, location.current_dir),
+        True,
+        _leaf_is_pod_scoped(location),
+    )
+
+
+def _read_verified_memory_receipt(probe: Probe) -> int:
+    path = probe.path(VERIFIED_MEMORY_RECEIPT)
+    parent = path.parent
+    live_filesystem = probe.filesystem_root == Path("/")
+    try:
+        parent_stat = parent.lstat()
+    except OSError as error:
+        raise ValueError("verified Runpod memory receipt directory is missing") from error
+    if not stat.S_ISDIR(parent_stat.st_mode) or parent.is_symlink():
+        raise ValueError("verified Runpod memory receipt directory is not a directory")
+    if os.name != "nt" and stat.S_IMODE(parent_stat.st_mode) != 0o755:
+        raise ValueError("verified Runpod memory receipt directory must be mode 0755")
+    if live_filesystem and (
+        parent_stat.st_uid != 0 or parent_stat.st_gid != 0
+    ):
+        raise ValueError(
+            "verified Runpod memory receipt directory must be owned by root:root"
+        )
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ValueError("verified Runpod memory receipt is missing or unsafe") from error
+    try:
+        receipt_stat = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(receipt_stat.st_mode)
+            or receipt_stat.st_nlink != 1
+            or (os.name != "nt" and stat.S_IMODE(receipt_stat.st_mode) != 0o444)
+        ):
+            raise ValueError(
+                "verified Runpod memory receipt must be a 0444 regular file"
+            )
+        if live_filesystem and (
+            receipt_stat.st_uid != 0 or receipt_stat.st_gid != 0
+        ):
+            raise ValueError(
+                "verified Runpod memory receipt must be owned by root:root"
+            )
+        content = os.read(descriptor, 128)
+        if os.read(descriptor, 1):
+            raise ValueError("verified Runpod memory receipt is too large")
+    finally:
+        os.close(descriptor)
+
+    try:
+        text = content.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise ValueError("verified Runpod memory receipt is not ASCII") from error
+    if not re.fullmatch(r"[1-9][0-9]*\n", text):
+        raise ValueError(
+            "verified Runpod memory receipt must contain one canonical positive integer"
+        )
+    return int(text[:-1], 10)
+
+
+def _assigned_memory_capacity(
+    probe: Probe, env: Mapping[str, str], host_total_bytes: int
+) -> int | None:
+    raw = env.get("RUNPOD_ASSIGNED_MEMORY_BYTES")
+    if raw is None or raw == "":
+        return None
+    if not re.fullmatch(r"[1-9][0-9]*", raw):
+        raise ValueError(
+            "RUNPOD_ASSIGNED_MEMORY_BYTES must be a canonical positive integer"
+        )
+    assigned = int(raw, 10)
+    if assigned > (1 << 63) - 1:
+        raise ValueError("RUNPOD_ASSIGNED_MEMORY_BYTES exceeds signed 64-bit range")
+    if host_total_bytes > 0 and assigned > host_total_bytes:
+        raise ValueError(
+            "RUNPOD_ASSIGNED_MEMORY_BYTES exceeds host memory reported by /proc/meminfo"
+        )
+    receipt = _read_verified_memory_receipt(probe)
+    if receipt != assigned:
+        raise ValueError(
+            "RUNPOD_ASSIGNED_MEMORY_BYTES does not match the verified memory receipt"
+        )
+    return assigned
+
+
+def apply_assigned_memory_capacity(
+    memory: MemorySnapshot,
+    location: CgroupLocation | None,
+    probe: Probe,
+    env: Mapping[str, str],
+    warnings: list[str],
+) -> MemorySnapshot:
+    """Apply the orchestrator-verified Runpod assignment as a capacity bound.
+
+    The assignment is not a kernel-enforced limit.  Raw cgroup limit fields are
+    deliberately preserved, and an equal or smaller finite cgroup constraint
+    remains authoritative.  The environment value is only meaningful when it
+    was injected from the verified Runpod API response by the orchestrator and
+    exactly matches the fixed root-owned receipt written in the same session.
+    """
+
+    assigned = _assigned_memory_capacity(probe, env, memory.host_total_bytes)
+    if assigned is None:
+        return memory
+
+    if memory.limited and memory.limit_bytes <= assigned:
+        return replace(memory, assigned_capacity_bytes=assigned)
+
+    warnings.append(
+        "memory capacity comes from the verified Runpod API assignment, not a "
+        "kernel-enforced cgroup hard limit"
+    )
+    current: int | None = None
+    inactive = 0
+    usage_source = ""
+    usage_trustworthy = False
+    if location is not None:
+        current, inactive, usage_source, usage_readable, usage_scoped = (
+            _read_leaf_usage(location)
+        )
+        usage_within_assignment = (
+            usage_readable and current is not None and current <= assigned
+        )
+        usage_trustworthy = usage_within_assignment and usage_scoped
+        usage_peak_eligible = usage_within_assignment
+        if not usage_readable:
+            if usage_scoped:
+                warnings.append("cannot read pod-scoped leaf memory usage")
+            else:
+                warnings.append(
+                    "cannot read memory usage from the resolved cgroup root"
+                )
+        elif not usage_within_assignment:
+            warnings.append(
+                "resolved cgroup usage exceeds the verified Runpod assignment; "
+                "it is not accepted as build or peak evidence"
+            )
+        elif not usage_scoped:
+            # Do not grant reclaimable-cache credit to an ambiguous root.
+            inactive = 0
+            warnings.append(
+                "cgroup membership and mount root are both '/'; usage may be a "
+                "private Pod root but is ambiguous, so compiler parallelism is "
+                "forced to one job"
+            )
+    else:
+        usage_peak_eligible = False
+        usage_scoped = False
+        warnings.append("cannot locate a pod-scoped memory cgroup for usage evidence")
+
+    if usage_peak_eligible and current is not None:
+        working = max(0, current - inactive)
+        free = max(0, assigned - current)
+        available = max(0, assigned - working)
+        selected_current = current
+    else:
+        # Never turn unknown Pod usage into apparent assignment headroom.
+        selected_current = assigned
+        working = assigned
+        inactive = 0
+        free = 0
+        available = 0
+
+    return replace(
+        memory,
+        current_bytes=selected_current,
+        working_set_bytes=working,
+        inactive_file_bytes=inactive,
+        free_bytes=free,
+        available_bytes=available,
+        high_bytes=None,
+        capacity_bytes=assigned,
+        capacity_source="runpod-api-assignment",
+        capacity_is_hard_limit=False,
+        assigned_capacity_bytes=assigned,
+        usage_source=usage_source,
+        usage_current_bytes=current,
+        usage_trustworthy=usage_trustworthy,
+        usage_peak_eligible=usage_peak_eligible,
+        usage_scope=(
+            "pod-cgroup"
+            if usage_trustworthy
+            else "ambiguous-cgroup-root"
+            if usage_peak_eligible
+            else "unavailable"
+        ),
+    )
+
+
 def collect_memory(
     probe: Probe,
     mounts: Sequence[MountInfo],
@@ -511,6 +782,14 @@ def collect_memory(
                 limit_source="host",
                 swap_limit_bytes=host_swap_total,
                 swap_current_bytes=host_swap_current,
+                capacity_bytes=host_total,
+                capacity_source="host",
+                capacity_is_hard_limit=False,
+                usage_source="",
+                usage_current_bytes=None,
+                usage_trustworthy=False,
+                usage_peak_eligible=False,
+                usage_scope="unavailable",
             ),
             None,
         )
@@ -536,6 +815,9 @@ def collect_memory(
 
     limited = source is not None
     if not limited:
+        leaf_current, _, leaf_source, leaf_readable, leaf_scoped = _read_leaf_usage(
+            location
+        )
         return (
             MemorySnapshot(
                 limited=False,
@@ -550,6 +832,20 @@ def collect_memory(
                 limit_source="host",
                 swap_limit_bytes=host_swap_total,
                 swap_current_bytes=host_swap_current,
+                capacity_bytes=host_total,
+                capacity_source="host",
+                capacity_is_hard_limit=False,
+                usage_source=leaf_source,
+                usage_current_bytes=leaf_current,
+                usage_trustworthy=leaf_readable and leaf_scoped,
+                usage_peak_eligible=leaf_readable,
+                usage_scope=(
+                    "pod-cgroup"
+                    if leaf_readable and leaf_scoped
+                    else "ambiguous-cgroup-root"
+                    if leaf_readable
+                    else "unavailable"
+                ),
             ),
             location,
         )
@@ -616,6 +912,16 @@ def collect_memory(
             limit_source=_logical_source(location, source),
             swap_limit_bytes=max(0, swap_limit),
             swap_current_bytes=swap_current,
+            capacity_bytes=effective,
+            capacity_source=_logical_source(location, source),
+            capacity_is_hard_limit=True,
+            usage_source=(
+                _logical_source(location, source) if current_known else ""
+            ),
+            usage_current_bytes=current if current_known else None,
+            usage_trustworthy=current_known,
+            usage_peak_eligible=current_known,
+            usage_scope="cgroup-capacity" if current_known else "unavailable",
         ),
         location,
     )
@@ -780,6 +1086,9 @@ def recommend_build_jobs(
     memory_per_job_mib: int | None = None,
     reserve_mib: int | None = None,
 ) -> BuildRecommendation:
+    capacity = (
+        memory.capacity_bytes if memory.capacity_source else memory.limit_bytes
+    )
     configured_per_job = memory_per_job_mib
     if configured_per_job is None:
         configured_per_job = _positive_int(env.get("POD_BUILD_MEMORY_PER_JOB_MIB"))
@@ -795,12 +1104,13 @@ def recommend_build_jobs(
         # process, linker, filesystem cache, and non-build services.
         configured_reserve_bytes = max(
             DEFAULT_RESERVE_BYTES,
-            (memory.limit_bytes * 15 + 99) // 100,
+            (capacity * 15 + 99) // 100,
         )
     else:
         configured_reserve_bytes = configured_reserve * MIB
 
-    usable = max(0, memory.available_bytes - configured_reserve_bytes)
+    available = memory.available_bytes if memory.usage_peak_eligible else 0
+    usable = max(0, available - configured_reserve_bytes)
     jobs_by_memory = max(1, usable // memory_per_job)
     jobs_by_cpu = max(1, cpu.effective_count)
 
@@ -809,6 +1119,12 @@ def recommend_build_jobs(
         max_jobs_cap = _positive_int(env.get("MAX_JOBS"))
     if max_jobs_cap is None:
         max_jobs_cap = DEFAULT_MAX_JOBS
+    forced_single_job = (
+        memory.assigned_capacity_bytes is not None
+        and not memory.usage_trustworthy
+    )
+    if forced_single_job:
+        max_jobs_cap = 1
     candidates = [jobs_by_cpu, jobs_by_memory, max_jobs_cap]
     suggested = max(1, min(candidates))
 
@@ -820,6 +1136,7 @@ def recommend_build_jobs(
         reserve_bytes=configured_reserve_bytes,
         usable_memory_bytes=usable,
         max_jobs_cap=max_jobs_cap,
+        forced_single_job=forced_single_job,
     )
 
 
@@ -848,6 +1165,9 @@ def collect_resources(
     memory, memory_location = collect_memory(
         probe, mounts, memberships, warnings
     )
+    memory = apply_assigned_memory_capacity(
+        memory, memory_location, probe, effective_env, warnings
+    )
     cpu = collect_cpu(
         probe,
         mounts,
@@ -863,6 +1183,11 @@ def collect_resources(
         memory_per_job_mib=memory_per_job_mib,
         reserve_mib=reserve_mib,
     )
+    if build.forced_single_job:
+        warnings.append(
+            "pod-scoped memory usage is unavailable; compiler parallelism is "
+            "forced to one job"
+        )
 
     location = memory_location
     if location is None:
@@ -945,4 +1270,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except (OSError, ValueError) as error:
+        raise SystemExit(f"pod-resources failed: {error}") from error

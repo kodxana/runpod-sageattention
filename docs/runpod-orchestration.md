@@ -175,11 +175,14 @@ release workflow.
    does not require a persistent/network volume.
 3. Runpod GPU placement attaches host-system CPU and RAM independently of GPU
    VRAM. Before upload, orchestration re-reads the assignment and requires the
-   exact GPU type, at least 4 effective vCPUs, 32 GB system RAM, and the
-   requested 80 GB container disk. `build-wheel.sh` then reads the assigned
-   cgroup and requires 20 GiB currently free on both work and output
-   filesystems. A 16-vCPU/64-GB system assignment is recommended. Passing the
-   selected `gpuId` alone does not prove these host resources.
+   exact GPU type, at least 4 assigned vCPUs, 32 GB system RAM, and the
+   requested 80 GB container disk. It exports those verified values and writes
+   a root-owned receipt before the build. `build-wheel.sh` uses the smaller of
+   that assignment and a finite cgroup hard limit, still requires at least 4
+   effective vCPUs, measurable cgroup usage/peak evidence, and 20 GiB currently
+   free on both work and output filesystems. A 16-vCPU/64-GB system assignment
+   is recommended. Passing the selected `gpuId` alone does not prove these host
+   resources.
 
    The assignment read explicitly requests REST machine metadata with
    `includeMachine=true`. Exact identity may be reported as `gpu.id`,
@@ -349,9 +352,12 @@ compute capability.
 - The accelerator is attached but unused during compilation. Select a GPU offer
   with adequate host-system resources: 4 effective vCPUs and 32 GiB system RAM
   are hard minimums, while 16 vCPUs and 64 GiB system RAM are recommended.
-- Every builder must expose finite cgroup limits and satisfy the resource
-  preflight. Host-wide `/proc/meminfo`, GPU VRAM, and GPU utilization are not
-  used to choose compilation parallelism.
+- Every builder must expose a readable cgroup membership counter and satisfy
+  the receipt-backed assignment/resource preflight. A finite cgroup hard limit
+  is preferred and wins when smaller, but an unlimited private cgroup may use
+  the verified Runpod assignment as its capacity ceiling. Ambiguous roots are
+  serialized, and host-wide `/proc/meminfo`, GPU VRAM, and GPU utilization are
+  never used to increase compilation parallelism.
 - Do not add `LD_PRELOAD` to workflows. Resource-reporting wrappers are scoped
   inside the builder image.
 - Keep CUDA 12.8 and CUDA 13.0 wheel assets distinguishable by their downstream

@@ -7,8 +7,10 @@
  *
  * The library is loaded only by the free/htop/top wrappers installed beside
  * it.  It never belongs in /etc/ld.so.preload or a global LD_PRELOAD.  When a
- * finite memory cgroup cannot be resolved with confidence, every hook opens
- * the real /proc/meminfo unchanged (fail-open).
+ * finite memory cgroup cannot be resolved, a root-owned assignment receipt (or
+ * its command-scoped environment equivalent) may provide a presentation-only
+ * capacity.  If the capacity or current cgroup usage cannot be resolved with
+ * confidence, every hook opens the real /proc/meminfo unchanged (fail-open).
  */
 
 #include <ctype.h>
@@ -35,6 +37,30 @@
 
 #define READ_BUFFER_SIZE (256U * 1024U)
 #define UNLIMITED_THRESHOLD (1ULL << 60)
+
+#ifndef PODPROC_RECEIPT_PATH
+#define PODPROC_RECEIPT_PATH "/run/sageattention/verified-memory-bytes-v1"
+#endif
+
+#ifndef PODPROC_HOST_MEMINFO_PATH
+#define PODPROC_HOST_MEMINFO_PATH "/proc/meminfo"
+#endif
+
+#ifndef PODPROC_SELF_CGROUP_PATH
+#define PODPROC_SELF_CGROUP_PATH "/proc/self/cgroup"
+#endif
+
+#ifndef PODPROC_SELF_MOUNTINFO_PATH
+#define PODPROC_SELF_MOUNTINFO_PATH "/proc/self/mountinfo"
+#endif
+
+#ifndef PODPROC_RECEIPT_OWNER_UID
+#define PODPROC_RECEIPT_OWNER_UID 0
+#endif
+
+#ifndef PODPROC_RECEIPT_OWNER_GID
+#define PODPROC_RECEIPT_OWNER_GID 0
+#endif
 
 typedef FILE *(*fopen_function)(const char *, const char *);
 typedef int (*open_function)(const char *, int, ...);
@@ -69,6 +95,12 @@ struct memory_snapshot {
     unsigned long long inactive_file;
     unsigned long long swap_limit;
     unsigned long long swap_current;
+};
+
+enum optional_capacity_state {
+    CAPACITY_ABSENT = 0,
+    CAPACITY_VALID = 1,
+    CAPACITY_INVALID = 2,
 };
 
 static void resolve_symbols(void) {
@@ -199,7 +231,7 @@ static bool find_membership(int version, char *output, size_t size) {
     char *buffer = malloc(READ_BUFFER_SIZE);
     if (!buffer)
         return false;
-    if (raw_read_file("/proc/self/cgroup", buffer, READ_BUFFER_SIZE) < 0) {
+    if (raw_read_file(PODPROC_SELF_CGROUP_PATH, buffer, READ_BUFFER_SIZE) < 0) {
         free(buffer);
         return false;
     }
@@ -234,7 +266,7 @@ static bool find_mount(int version, char *root, size_t root_size, char *point,
     char *buffer = malloc(READ_BUFFER_SIZE);
     if (!buffer)
         return false;
-    if (raw_read_file("/proc/self/mountinfo", buffer, READ_BUFFER_SIZE) < 0) {
+    if (raw_read_file(PODPROC_SELF_MOUNTINFO_PATH, buffer, READ_BUFFER_SIZE) < 0) {
         free(buffer);
         return false;
     }
@@ -357,6 +389,110 @@ static bool parse_unsigned(const char *text, unsigned long long *value,
     return true;
 }
 
+static bool parse_exact_capacity(const char *text, size_t length,
+                                 bool trailing_newline,
+                                 unsigned long long *value) {
+    if (!text || !value)
+        return false;
+    if (trailing_newline) {
+        if (length < 2 || text[length - 1] != '\n')
+            return false;
+        length--;
+    }
+    if (length == 0 || length > 20 || (length > 1 && text[0] == '0'))
+        return false;
+
+    unsigned long long parsed = 0;
+    for (size_t i = 0; i < length; i++) {
+        unsigned char character = (unsigned char)text[i];
+        if (character < '0' || character > '9')
+            return false;
+        unsigned int digit = (unsigned int)(character - '0');
+        if (parsed > (ULLONG_MAX - digit) / 10ULL)
+            return false;
+        parsed = parsed * 10ULL + digit;
+    }
+    if (parsed == 0 || parsed >= UNLIMITED_THRESHOLD)
+        return false;
+    *value = parsed;
+    return true;
+}
+
+static enum optional_capacity_state
+read_receipt_capacity(unsigned long long *value) {
+    int fd = (int)syscall(SYS_openat, AT_FDCWD, PODPROC_RECEIPT_PATH,
+                          O_RDONLY | O_CLOEXEC | O_NOFOLLOW, 0);
+    if (fd < 0)
+        return errno == ENOENT ? CAPACITY_ABSENT : CAPACITY_INVALID;
+
+    struct stat metadata;
+    if (fstat(fd, &metadata) < 0 || !S_ISREG(metadata.st_mode) ||
+        metadata.st_nlink != 1 ||
+        metadata.st_uid != (uid_t)PODPROC_RECEIPT_OWNER_UID ||
+        metadata.st_gid != (gid_t)PODPROC_RECEIPT_OWNER_GID ||
+        (metadata.st_mode & 07777) != 0444 || metadata.st_size < 2 ||
+        metadata.st_size > 21) {
+        close(fd);
+        return CAPACITY_INVALID;
+    }
+
+    char buffer[21];
+    size_t used = 0;
+    while (used < (size_t)metadata.st_size) {
+        ssize_t count = read(fd, buffer + used, (size_t)metadata.st_size - used);
+        if (count > 0) {
+            used += (size_t)count;
+            continue;
+        }
+        if (count < 0 && errno == EINTR)
+            continue;
+        close(fd);
+        return CAPACITY_INVALID;
+    }
+    char extra;
+    ssize_t extra_count;
+    do {
+        extra_count = read(fd, &extra, 1);
+    } while (extra_count < 0 && errno == EINTR);
+    close(fd);
+    if (extra_count != 0 ||
+        !parse_exact_capacity(buffer, used, true, value))
+        return CAPACITY_INVALID;
+    return CAPACITY_VALID;
+}
+
+static enum optional_capacity_state
+read_environment_capacity(unsigned long long *value) {
+    const char *text = getenv("RUNPOD_ASSIGNED_MEMORY_BYTES");
+    if (!text)
+        return CAPACITY_ABSENT;
+    return parse_exact_capacity(text, strlen(text), false, value)
+               ? CAPACITY_VALID
+               : CAPACITY_INVALID;
+}
+
+static bool assignment_capacity(unsigned long long *value, bool *present) {
+    unsigned long long receipt = 0;
+    unsigned long long environment = 0;
+    enum optional_capacity_state receipt_state =
+        read_receipt_capacity(&receipt);
+    enum optional_capacity_state environment_state =
+        read_environment_capacity(&environment);
+    if (receipt_state == CAPACITY_INVALID ||
+        environment_state == CAPACITY_INVALID)
+        return false;
+
+    *present = receipt_state == CAPACITY_VALID ||
+               environment_state == CAPACITY_VALID;
+    if (!*present)
+        return true;
+    if (receipt_state == CAPACITY_VALID && environment_state == CAPACITY_VALID)
+        *value = receipt < environment ? receipt : environment;
+    else
+        *value = receipt_state == CAPACITY_VALID ? receipt : environment;
+    return true;
+}
+
 static bool read_number(const char *directory, const char *filename,
                         unsigned long long *value, bool limit_value) {
     char path[PATH_MAX];
@@ -472,7 +608,8 @@ static bool collect_snapshot(struct memory_snapshot *snapshot) {
     char *host_meminfo = malloc(READ_BUFFER_SIZE);
     if (!host_meminfo)
         return false;
-    if (raw_read_file("/proc/meminfo", host_meminfo, READ_BUFFER_SIZE) < 0) {
+    if (raw_read_file(PODPROC_HOST_MEMINFO_PATH, host_meminfo,
+                      READ_BUFFER_SIZE) < 0) {
         free(host_meminfo);
         return false;
     }
@@ -495,10 +632,10 @@ static bool collect_snapshot(struct memory_snapshot *snapshot) {
                                                     : "memory.limit_in_bytes";
     const char *usage_name = location.version == 2 ? "memory.current"
                                                     : "memory.usage_in_bytes";
-    unsigned long long limit = host_total;
+    unsigned long long cgroup_limit = host_total;
     char limit_source[PATH_MAX] = {0};
     bool cgroup_source = effective_limit(&location, limit_name, host_total,
-                                         &limit, limit_source,
+                                         &cgroup_limit, limit_source,
                                          sizeof(limit_source));
 
     if (location.version == 1) {
@@ -506,30 +643,60 @@ static bool collect_snapshot(struct memory_snapshot *snapshot) {
         if (read_stat(location.current, "hierarchical_memory_limit",
                       &hierarchical) &&
             hierarchical > 0 && hierarchical < UNLIMITED_THRESHOLD &&
-            hierarchical <= limit) {
-            limit = hierarchical;
+            hierarchical <= cgroup_limit) {
+            cgroup_limit = hierarchical;
             snprintf(limit_source, sizeof(limit_source), "%s", location.current);
             cgroup_source = true;
         }
     }
-    if (!cgroup_source)
+
+    unsigned long long assigned_limit = 0;
+    bool assignment_source = false;
+    if (!assignment_capacity(&assigned_limit, &assignment_source))
+        return false;
+    if (!cgroup_source && !assignment_source)
         return false;
 
+    unsigned long long limit = host_total;
+    const char *usage_source = NULL;
+    bool assignment_selected = false;
+    if (cgroup_source && cgroup_limit < limit) {
+        limit = cgroup_limit;
+        usage_source = limit_source;
+    }
+    if (assignment_source && assigned_limit < limit) {
+        limit = assigned_limit;
+        usage_source = location.current;
+        assignment_selected = true;
+    }
+    if (!usage_source) {
+        if (cgroup_source)
+            usage_source = limit_source;
+        else {
+            usage_source = location.current;
+            assignment_selected = true;
+        }
+    }
+
     unsigned long long current;
-    if (!read_number(limit_source, usage_name, &current, false))
+    if (!read_number(usage_source, usage_name, &current, false) ||
+        current > limit)
         return false;
     unsigned long long inactive = 0;
     const char *inactive_key =
         location.version == 2 ? "inactive_file" : "total_inactive_file";
-    if (!read_stat(limit_source, inactive_key, &inactive) && location.version == 1)
-        (void)read_stat(limit_source, "inactive_file", &inactive);
+    if (!read_stat(usage_source, inactive_key, &inactive) && location.version == 1)
+        (void)read_stat(usage_source, "inactive_file", &inactive);
     if (inactive > current)
         inactive = current;
 
-    unsigned long long swap_limit = host_swap_total;
-    unsigned long long swap_current =
-        host_swap_total > host_swap_free ? host_swap_total - host_swap_free : 0;
-    if (location.version == 2 && host_swap_total > 0) {
+    unsigned long long swap_limit = assignment_selected ? 0 : host_swap_total;
+    unsigned long long swap_current = assignment_selected
+                                          ? 0
+                                          : (host_swap_total > host_swap_free
+                                                 ? host_swap_total - host_swap_free
+                                                 : 0);
+    if (!assignment_selected && location.version == 2 && host_swap_total > 0) {
         char swap_source[PATH_MAX] = {0};
         unsigned long long candidate = host_swap_total;
         if (effective_limit(&location, "memory.swap.max", host_swap_total,
@@ -540,7 +707,8 @@ static bool collect_snapshot(struct memory_snapshot *snapshot) {
                              false))
                 swap_current = 0;
         }
-    } else if (location.version == 1 && host_swap_total > 0) {
+    } else if (!assignment_selected && location.version == 1 &&
+               host_swap_total > 0) {
         char memsw_source[PATH_MAX] = {0};
         unsigned long long memsw_limit = 0;
         if (effective_limit(&location, "memory.memsw.limit_in_bytes", 0,
@@ -617,7 +785,7 @@ static char *synthetic_meminfo(size_t *output_length) {
     if (!original)
         return NULL;
     ssize_t original_length =
-        raw_read_file("/proc/meminfo", original, READ_BUFFER_SIZE);
+        raw_read_file(PODPROC_HOST_MEMINFO_PATH, original, READ_BUFFER_SIZE);
     if (original_length < 0) {
         free(original);
         return NULL;

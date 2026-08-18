@@ -10,7 +10,8 @@
 
 ## Wheel builds
 
-- [ ] The `cu128` build starts on the selected backend with a finite cgroup limit.
+- [ ] The `cu128` build records the verified Runpod CPU/RAM assignment, matching
+      root-owned receipt, selected capacity source, and bounded cgroup peak.
 - [ ] The `cu130` build starts only after the `cu128` builder has finished.
 - [ ] GPU-backed builds record the exact requested build GPU and use an absolute
       platform termination deadline; CPU fallback builds arm the in-Pod watchdog.

@@ -90,8 +90,10 @@ Recommended GPU-backed builder assignment:
 
 The cu128 and cu130 builders run sequentially, and each keeps extension
 parallelism at one. Smaller assignments can use serialized compiler jobs. The
-build entrypoint obtains system limits from cgroups and lowers concurrency
-rather than trusting host-wide `/proc/meminfo`, host CPU counts, or GPU VRAM.
+build entrypoint uses the smaller of a finite cgroup limit and the exact,
+receipt-backed Runpod API assignment. It lowers concurrency—and forces one
+Ninja job and one extension at a time for an ambiguous cgroup root—rather than
+trusting host-wide `/proc/meminfo`, host CPU counts, or GPU VRAM.
 
 ## Safety properties
 

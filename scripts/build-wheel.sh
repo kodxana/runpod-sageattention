@@ -171,10 +171,10 @@ if [[ "${TORCH_CUDA_ARCH_LIST}" == *"+PTX"* || "${TORCH_CUDA_ARCH_LIST}" == *" "
     exit 65
 fi
 
-if command -v pod-resources >/dev/null 2>&1; then
-    RESOURCE_HELPER=(pod-resources)
-elif [[ -f "${REPO_ROOT}/tools/pod_resources.py" ]]; then
+if [[ -f "${REPO_ROOT}/tools/pod_resources.py" ]]; then
     RESOURCE_HELPER=(python3.12 "${REPO_ROOT}/tools/pod_resources.py")
+elif command -v pod-resources >/dev/null 2>&1; then
+    RESOURCE_HELPER=(pod-resources)
 else
     echo "pod-resources is required for cgroup-aware build preflight" >&2
     exit 69
@@ -212,7 +212,14 @@ snapshot = json.loads(os.environ["RESOURCE_SNAPSHOT_JSON"])
 memory = snapshot["memory"]
 cpu = snapshot["cpu"]
 build = snapshot["build"]
-limit = memory.get("limit_bytes")
+capacity = memory.get("capacity_bytes")
+capacity_source = memory.get("capacity_source")
+capacity_is_hard_limit = memory.get("capacity_is_hard_limit")
+assigned_capacity = memory.get("assigned_capacity_bytes")
+usage_source = memory.get("usage_source")
+usage_trustworthy = memory.get("usage_trustworthy")
+usage_peak_eligible = memory.get("usage_peak_eligible")
+usage_scope = memory.get("usage_scope")
 available = memory.get("available_bytes")
 minimum_cpus = int(os.environ["MIN_CPUS"])
 minimum_limit = float(os.environ["MIN_MEMORY_GIB"]) * 1024 ** 3
@@ -222,53 +229,115 @@ disk_free_gib = {
     "output": shutil.disk_usage(os.environ["OUTPUT_DIR"]).free / 1024 ** 3,
     "work": shutil.disk_usage(os.environ["WORK_PARENT"]).free / 1024 ** 3,
 }
-failures = []
+hard_failures = []
+diagnostic_memory_failures = []
 
-if (snapshot.get("cgroup", {}).get("version") not in {1, 2}
-        or not memory.get("limited") or not isinstance(limit, int) or limit <= 0):
-    failures.append("no finite cgroup memory hard limit was detected")
-elif limit < minimum_limit:
-    failures.append(
-        f"cgroup memory hard limit {limit / 1024 ** 3:.1f} GiB "
+def positive_integer(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+if snapshot.get("schema_version") != 2:
+    hard_failures.append("pod-resources schema version 2 is required")
+if not positive_integer(capacity):
+    hard_failures.append("memory capacity is missing or invalid")
+elif capacity < minimum_limit:
+    hard_failures.append(
+        f"memory capacity {capacity / 1024 ** 3:.1f} GiB "
         f"< {minimum_limit / 1024 ** 3:.1f} GiB")
-if cpu["effective_count"] < minimum_cpus:
-    failures.append(f"effective CPU {cpu['effective_count']} < {minimum_cpus}")
-if available is None:
-    failures.append("cgroup memory headroom is unknown")
+if not positive_integer(assigned_capacity):
+    hard_failures.append(
+        "a positive receipt-backed Runpod API memory assignment is required")
+
+cgroup_version = snapshot.get("cgroup", {}).get("version")
+is_cgroup_capacity = (
+    cgroup_version in {1, 2}
+    and isinstance(capacity_source, str)
+    and capacity_source.startswith(f"cgroup-v{cgroup_version}:")
+)
+if capacity_source == "runpod-api-assignment":
+    if (not positive_integer(assigned_capacity)
+            or assigned_capacity != capacity
+            or capacity_is_hard_limit is not False):
+        hard_failures.append("Runpod assignment capacity evidence is inconsistent")
+elif is_cgroup_capacity:
+    if (capacity_is_hard_limit is not True
+            or memory.get("limited") is not True
+            or memory.get("limit_bytes") != capacity):
+        hard_failures.append("cgroup hard-limit capacity evidence is inconsistent")
+    if positive_integer(assigned_capacity) and capacity > assigned_capacity:
+        hard_failures.append("cgroup capacity does not honor the Runpod assignment")
 else:
-    required_headroom = build["reserve_bytes"] + build["memory_per_job_bytes"]
-    if available < required_headroom:
-        failures.append(
-            f"memory headroom {available / 1024 ** 3:.1f} GiB cannot cover "
-            f"reserve plus one compiler ({required_headroom / 1024 ** 3:.1f} GiB)")
+    hard_failures.append(
+        "neither a finite cgroup hard limit nor a verified Runpod API assignment "
+        "establishes memory capacity")
+
+if cpu["effective_count"] < minimum_cpus:
+    hard_failures.append(f"effective CPU {cpu['effective_count']} < {minimum_cpus}")
+if usage_peak_eligible is True and positive_integer(capacity):
+    if not isinstance(available, int) or isinstance(available, bool):
+        diagnostic_memory_failures.append("pod-scoped memory headroom is unknown")
+    else:
+        required_headroom = build["reserve_bytes"] + build["memory_per_job_bytes"]
+        if available < required_headroom:
+            diagnostic_memory_failures.append(
+                f"memory headroom {available / 1024 ** 3:.1f} GiB cannot cover "
+                f"reserve plus one compiler ({required_headroom / 1024 ** 3:.1f} GiB)")
+elif not (build.get("forced_single_job") is True
+          and build.get("suggested_jobs") == 1):
+    hard_failures.append(
+        "untrusted memory usage must force a one-job build recommendation")
+
+if usage_peak_eligible is not True:
+    hard_failures.append("no cgroup membership counter is eligible for peak evidence")
+elif not isinstance(usage_source, str) or not usage_source.startswith("cgroup-v"):
+    hard_failures.append("peak-eligible memory usage has no cgroup source")
+
 for label, free_gib in disk_free_gib.items():
     if free_gib < minimum_disk:
-        failures.append(
+        hard_failures.append(
             f"{label} filesystem free disk {free_gib:.1f} GiB "
             f"< {minimum_disk:.1f} GiB")
 
-limit_text = "unknown" if limit is None else f"{limit / 1024 ** 3:.1f} GiB"
+capacity_text = (
+    "unknown" if not positive_integer(capacity)
+    else f"{capacity / 1024 ** 3:.1f} GiB"
+)
 available_text = "unknown" if available is None else f"{available / 1024 ** 3:.1f} GiB"
 print(
-    f"CPU-bound preflight: cpus={cpu['effective_count']}, memory_limit={limit_text}, "
+    f"CPU-bound preflight: cpus={cpu['effective_count']}, "
+    f"memory_capacity={capacity_text}, capacity_source={capacity_source}, "
+    f"hard_limit={capacity_is_hard_limit}, usage_trustworthy={usage_trustworthy}, "
+    f"usage_scope={usage_scope}, "
     f"memory_headroom={available_text}, "
     f"output_free_disk={disk_free_gib['output']:.1f} GiB, "
     f"work_free_disk={disk_free_gib['work']:.1f} GiB, "
     f"recommended_limit={recommended_limit / 1024 ** 3:.1f} GiB"
 )
-if failures:
-    message = "resource preflight failed: " + "; ".join(failures)
+if hard_failures:
+    raise SystemExit("resource preflight failed: " + "; ".join(hard_failures))
+if diagnostic_memory_failures:
+    message = "resource preflight failed: " + "; ".join(diagnostic_memory_failures)
     if os.environ.get("ALLOW_LOW_RESOURCES") == "1":
         print("WARNING: " + message)
     else:
         raise SystemExit(message + "; set ALLOW_LOW_RESOURCES=1 only intentionally")
 PY
 
-if [[ -z "${MAX_JOBS:-}" ]]; then
+FORCED_SINGLE_JOB="$(RESOURCE_SNAPSHOT_JSON="${RESOURCE_SNAPSHOT_JSON}" python3.12 -c \
+    'import json,os; print("1" if json.loads(os.environ["RESOURCE_SNAPSHOT_JSON"])["build"].get("forced_single_job") is True else "0")')"
+if [[ "${FORCED_SINGLE_JOB}" == "1" ]]; then
+    if [[ "${MAX_JOBS:-1}" != "1" ]]; then
+        echo "WARNING: ignoring MAX_JOBS=${MAX_JOBS}; untrusted Pod memory usage forces MAX_JOBS=1" >&2
+    fi
+    MAX_JOBS=1
+elif [[ -z "${MAX_JOBS:-}" ]]; then
     MAX_JOBS="$(RESOURCE_SNAPSHOT_JSON="${RESOURCE_SNAPSHOT_JSON}" python3.12 -c \
         'import json,os; print(json.loads(os.environ["RESOURCE_SNAPSHOT_JSON"])["build"]["suggested_jobs"])')"
 fi
 EXT_PARALLEL="${EXT_PARALLEL:-${DEFAULT_EXT_PARALLEL}}"
+if [[ "${FORCED_SINGLE_JOB}" == "1" && "${EXT_PARALLEL}" != "1" ]]; then
+    echo "WARNING: ignoring EXT_PARALLEL=${EXT_PARALLEL}; untrusted Pod memory usage forces EXT_PARALLEL=1" >&2
+    EXT_PARALLEL=1
+fi
 [[ "${MAX_JOBS}" =~ ^[1-9][0-9]*$ ]] || { echo "MAX_JOBS must be a positive integer" >&2; exit 65; }
 [[ "${EXT_PARALLEL}" =~ ^[1-9][0-9]*$ ]] || { echo "EXT_PARALLEL must be a positive integer" >&2; exit 65; }
 if (( EXT_PARALLEL > DEFAULT_EXT_PARALLEL )) && [[ "${ALLOW_UNSAFE_PARALLELISM:-0}" != "1" ]]; then
@@ -284,9 +353,11 @@ from pathlib import Path
 
 snapshot = json.loads(os.environ["RESOURCE_SNAPSHOT_JSON"])
 version = snapshot.get("cgroup", {}).get("version")
-source = str(snapshot.get("memory", {}).get("limit_source") or "")
+memory = snapshot.get("memory", {})
+source = str(memory.get("usage_source") or "")
 prefix = f"cgroup-v{version}:"
-if version not in {1, 2} or not source.startswith(prefix):
+if (version not in {1, 2} or memory.get("usage_peak_eligible") is not True
+        or not source.startswith(prefix)):
     print("")
     raise SystemExit(0)
 directory = Path(source[len(prefix):])
@@ -300,6 +371,17 @@ PY
 
 BUILD_STARTED_SECONDS="$(date +%s)"
 CGROUP_PEAK_START="$(cgroup_peak_from_snapshot "${RESOURCE_SNAPSHOT_JSON}")"
+MEMORY_CAPACITY_BYTES="$(RESOURCE_SNAPSHOT_JSON="${RESOURCE_SNAPSHOT_JSON}" python3.12 -c \
+    'import json,os; print(json.loads(os.environ["RESOURCE_SNAPSHOT_JSON"])["memory"]["capacity_bytes"])')"
+if [[ ! "${CGROUP_PEAK_START}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "A positive cgroup-membership memory peak is required before compilation" >&2
+    exit 70
+fi
+if [[ ! "${MEMORY_CAPACITY_BYTES}" =~ ^[1-9][0-9]*$ ]] \
+        || (( CGROUP_PEAK_START > MEMORY_CAPACITY_BYTES )); then
+    echo "Initial cgroup memory peak exceeds the selected memory capacity" >&2
+    exit 70
+fi
 
 if [[ -n "${BUILDER_CUDA_VERSION:-}" && "${BUILDER_CUDA_VERSION}" != "${CUDA_VERSION}" ]]; then
     echo "Builder CUDA mismatch: image=${BUILDER_CUDA_VERSION}, matrix=${CUDA_VERSION}" >&2
@@ -431,7 +513,39 @@ RESOURCE_END_JSON="$("${RESOURCE_HELPER[@]}" --json)" || {
     echo "pod-resources failed after build; build evidence would be incomplete" >&2
     exit 70
 }
+RESOURCE_START_JSON="${RESOURCE_SNAPSHOT_JSON}" RESOURCE_END_JSON="${RESOURCE_END_JSON}" \
+python3.12 - <<'PY'
+import json
+import os
+
+start = json.loads(os.environ["RESOURCE_START_JSON"])
+end = json.loads(os.environ["RESOURCE_END_JSON"])
+memory_fields = (
+    "assigned_capacity_bytes",
+    "capacity_bytes",
+    "capacity_source",
+    "capacity_is_hard_limit",
+    "usage_source",
+    "usage_scope",
+    "usage_peak_eligible",
+    "usage_trustworthy",
+)
+for field in memory_fields:
+    if end["memory"].get(field) != start["memory"].get(field):
+        raise SystemExit(f"resource assignment changed during build: {field}")
+if end["build"].get("forced_single_job") != start["build"].get("forced_single_job"):
+    raise SystemExit("forced-single-job policy changed during build")
+PY
 CGROUP_PEAK_END="$(cgroup_peak_from_snapshot "${RESOURCE_END_JSON}")"
+if [[ ! "${CGROUP_PEAK_END}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "A positive cgroup-membership memory peak is required after compilation" >&2
+    exit 70
+fi
+if (( CGROUP_PEAK_END < CGROUP_PEAK_START \
+        || CGROUP_PEAK_END > MEMORY_CAPACITY_BYTES )); then
+    echo "Final cgroup memory peak is non-monotonic or exceeds selected capacity" >&2
+    exit 70
+fi
 BUILD_FINISHED_SECONDS="$(date +%s)"
 BUILD_ELAPSED_SECONDS="$((BUILD_FINISHED_SECONDS - BUILD_STARTED_SECONDS))"
 EVIDENCE_FILE="${WHEEL_STAGE}/build-evidence.json"
@@ -479,6 +593,9 @@ if selected_gpu_id is not None and (
     or "," in selected_gpu_id
 ):
     raise SystemExit("RUNPOD_SELECTED_GPU_ID must be one exact Runpod gpuId")
+resource_start = json.loads(os.environ["RESOURCE_START_JSON"])
+resource_end = json.loads(os.environ["RESOURCE_END_JSON"])
+start_memory = resource_start["memory"]
 evidence = {
     "builder_image": {
         "digest": builder_digest,
@@ -488,13 +605,33 @@ evidence = {
     "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
     "cgroup_peak": {
         "end_bytes": int(peak_end) if peak_end else None,
+        "monotonic": int(peak_end) >= int(peak_start),
+        "scope": start_memory["usage_scope"],
+        "source": start_memory["usage_source"],
         "start_bytes": int(peak_start) if peak_start else None,
+        "usage_trustworthy": start_memory["usage_trustworthy"],
+        "within_capacity": int(peak_end) <= start_memory["capacity_bytes"],
     },
     "elapsed_seconds": int(os.environ["BUILD_ELAPSED_SECONDS"]),
     "matrix_sha256": sha256(os.environ["MATRIX_PATH"]),
     "patch_sha256": sha256(os.environ["PATCH_FILE"]),
-    "resource_end": json.loads(os.environ["RESOURCE_END_JSON"]),
-    "resource_start": json.loads(os.environ["RESOURCE_START_JSON"]),
+    "memory_policy": {
+        "assigned_capacity_bytes": start_memory["assigned_capacity_bytes"],
+        "capacity_bytes": start_memory["capacity_bytes"],
+        "capacity_is_hard_limit": start_memory["capacity_is_hard_limit"],
+        "capacity_source": start_memory["capacity_source"],
+        "forced_single_job": resource_start["build"]["forced_single_job"],
+        "usage_peak_eligible": start_memory["usage_peak_eligible"],
+        "usage_scope": start_memory["usage_scope"],
+        "usage_source": start_memory["usage_source"],
+        "usage_trustworthy": start_memory["usage_trustworthy"],
+    },
+    "resource_end": resource_end,
+    "resource_start": resource_start,
+    "runpod_assignment": {
+        "memory_bytes": start_memory["assigned_capacity_bytes"],
+        "vcpu_count": resource_start["cpu"]["runpod_count"],
+    },
     "selected_gpu_id": selected_gpu_id,
     "selected_parallelism": {
         "extension_parallelism": int(os.environ["EXT_PARALLEL"]),

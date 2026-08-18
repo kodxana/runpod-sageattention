@@ -77,11 +77,11 @@ The image is SSH-ready and accepts newline-separated public keys through `SSH_AU
 
 Every default GPU-backed builder receives an absolute RFC3339 platform termination deadline and is deleted from a retried `finally` path. The explicit CPU fallback has no verified platform deadline, so it must enable `RUNPOD_SELF_TERMINATE_SECONDS` in addition to the same mandatory cleanup. When enabled, the entrypoint accepts only 600–21600 seconds, requires a valid `RUNPOD_POD_ID`, Pod-scoped `RUNPOD_API_KEY`, and the checksum-pinned `runpodctl` bundled in the image, then arms a detached deletion watchdog. Missing prerequisites fail startup, and credentials are never printed.
 
-`pod-resources` provides the authoritative cgroup-aware CPU and memory view. Scoped wrappers make `free`, `top`, and `htop` report Pod resources without setting `LD_PRELOAD` globally.
+The uploaded `tools/pod_resources.py` provides the authoritative cgroup-aware CPU and memory view, with the image-installed `pod-resources` retained as a fallback. Scoped wrappers make `free`, `top`, and `htop` report Pod resources without setting `LD_PRELOAD` globally.
 
 ## GPU-backed build
 
-The factory schedules compilation on a GPU Pod by default, but `build-wheel.sh` exports `CUDA_VISIBLE_DEVICES=""`; the attached accelerator and its VRAM do not compile the wheel. Host-system resources are authoritative. Build policy requires at least 4 effective vCPUs, a 32 GB system-RAM assignment, and an 80 GB container disk; 16 vCPUs and 64 GB system RAM are recommended. The backend-neutral in-Pod preflight independently requires a finite cgroup limit of at least 32 GiB, enough current headroom for the compiler reserve plus one job, and 20 GiB free on both the work and output filesystems. The reviewed default is two compiler jobs and one extension at a time. The live 2-by-2 proof peaked near 29.65 GiB, so higher parallelism should only be enabled with new peak evidence on a larger assignment.
+The factory schedules compilation on a GPU Pod by default, but `build-wheel.sh` exports `CUDA_VISIBLE_DEVICES=""`; the attached accelerator and its VRAM do not compile the wheel. Host-system resources are authoritative. Build policy requires at least 4 effective vCPUs, a receipt-backed Runpod assignment that establishes at least 32 GiB usable capacity, and an 80 GB container disk; 16 vCPUs and 64 GB system RAM are recommended. A smaller finite cgroup hard limit wins when present. On hosts exposing an unlimited/private cgroup root, the verified assignment supplies the capacity ceiling while the resolved cgroup counter supplies bounded usage and peak evidence; ambiguous roots force one Ninja job and one extension at a time. The in-Pod preflight also requires enough current headroom for the reserve plus one job and 20 GiB free on both work and output filesystems. The reviewed default is two compiler jobs and one extension at a time. The live 2-by-2 proof peaked near 29.65 GiB, so higher parallelism should only be enabled with new peak evidence on a larger assignment.
 
 The matrix field `resources.gpu_required=false` describes the build command's compute behavior, not the default Runpod provisioning backend. It remains false because compilation never launches a GPU kernel.
 
@@ -92,8 +92,8 @@ hidden. The host driver must still satisfy the matching CUDA scheduler floor so
 the container can start. Before source upload, orchestration verifies the exact
 selected GPU assignment, the matrix floor of 4 effective vCPUs, 32 GB system
 RAM, and an 80 GB container disk; 16 vCPUs and 64 GB system RAM remain
-recommended. The in-Pod cgroup preflight then independently verifies usable
-resources.
+recommended. The in-Pod assignment/cgroup preflight then independently verifies
+usable capacity, current headroom, and peak accounting.
 
 Run one matrix entry inside its matching builder:
 
@@ -112,7 +112,7 @@ The output directory must initially be empty. It receives exactly:
   `gpuId` for GPU-backed builds (JSON `null` for CPU fallback builds);
 - `SHA256SUMS` containing exactly that wheel.
 
-The system-resource preflight refuses an unlimited or undersized container. `ALLOW_LOW_RESOURCES=1` is an explicit escape hatch for diagnostics, not release builds. The build script is the sole authority for its cgroup-aware `MAX_JOBS` default; the SSH entrypoint does not precompute it. Values above the reviewed `MAX_JOBS=2` and `EXT_PARALLEL=1` caps are rejected unless `ALLOW_UNSAFE_PARALLELISM=1` is explicitly set on a larger Pod. Set `BUILDER_IMAGE_REF` and `BUILDER_IMAGE_DIGEST` in release jobs so the immutable builder identity is captured.
+The system-resource preflight requires the exact, receipt-backed Runpod API assignment for every release build; a smaller finite cgroup hard limit remains the selected capacity. The uploaded repository helper is preferred over an older copy installed in the builder image. Ambiguous `/` cgroup roots can supply bounded peak/headroom evidence but force `MAX_JOBS=1` and `EXT_PARALLEL=1`. Missing peak evidence, insufficient CPU, less than 32 GiB capacity, and insufficient actual disk are hard failures; `ALLOW_LOW_RESOURCES=1` cannot mask them. The build script is the sole authority for its cgroup-aware `MAX_JOBS` default; the SSH entrypoint does not precompute it. Values above the reviewed `MAX_JOBS=2` and `EXT_PARALLEL=1` caps are rejected unless `ALLOW_UNSAFE_PARALLELISM=1` is explicitly set on a larger Pod. Set `BUILDER_IMAGE_REF` and `BUILDER_IMAGE_DIGEST` in release jobs so the immutable builder identity is captured.
 
 ## Static and GPU validation
 
