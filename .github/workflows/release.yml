@@ -178,7 +178,9 @@ jobs:
       gpu_max_parallel: ${{ inputs.gpu_max_parallel }}
       enforce_image_digests: true
       confirm_paid_pods: ${{ inputs.confirm_paid_pods }}
-    secrets: inherit
+    secrets:
+      RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+      RUNPOD_SSH_PRIVATE_KEY: ${{ secrets.RUNPOD_SSH_PRIVATE_KEY }}
 
   publish:
     name: Publish only after every GPU test passes

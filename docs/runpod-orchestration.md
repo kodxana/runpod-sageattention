@@ -20,6 +20,13 @@ Store the following repository or `runpod-paid` environment secrets:
 | `RUNPOD_API_KEY` | Authenticates the Runpod REST API and checksum-pinned client. |
 | `RUNPOD_SSH_PRIVATE_KEY` | Ephemeral workflow-side SSH identity. |
 
+The gated release calls `build.yml` as a reusable workflow. Repository secrets
+are forwarded explicitly as optional fallbacks. Secrets stored only in the
+`runpod-paid` environment are resolved directly by the paid build and GPU-test
+jobs after that environment is attached; they are intentionally not required
+at the reusable-workflow call boundary. Both jobs verify that the two values
+are nonempty before downloading tooling or creating a Pod.
+
 The private key is written with mode `0600`; its public half is derived with
 `ssh-keygen -y` and passed to the Pod as `PUBLIC_KEY`, eliminating a mismatched
 key-pair secret. It is used only for that job and removed with the hosted

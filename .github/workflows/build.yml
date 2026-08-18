@@ -211,9 +211,11 @@ on:
         type: boolean
     secrets:
       RUNPOD_API_KEY:
-        required: true
+        description: Optional repository-level fallback; runpod-paid may provide it directly
+        required: false
       RUNPOD_SSH_PRIVATE_KEY:
-        required: true
+        description: Optional repository-level fallback; runpod-paid may provide it directly
+        required: false
 
 permissions:
   contents: read
@@ -501,6 +503,21 @@ jobs:
       max-parallel: 1
       matrix: ${{ fromJSON(needs.plan.outputs.builds) }}
     steps:
+      - name: Verify protected Runpod credentials
+        shell: bash
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          RUNPOD_SSH_PRIVATE_KEY: ${{ secrets.RUNPOD_SSH_PRIVATE_KEY }}
+        run: |
+          if [[ -z "${RUNPOD_API_KEY}" ]]; then
+            echo "RUNPOD_API_KEY is missing from repository secrets and the runpod-paid environment" >&2
+            exit 1
+          fi
+          if [[ -z "${RUNPOD_SSH_PRIVATE_KEY}" ]]; then
+            echo "RUNPOD_SSH_PRIVATE_KEY is missing from repository secrets and the runpod-paid environment" >&2
+            exit 1
+          fi
+
       - name: Check out requested source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -645,6 +662,21 @@ jobs:
       max-parallel: ${{ fromJSON(needs.plan.outputs.gpu_max_parallel) }}
       matrix: ${{ fromJSON(needs.plan.outputs.gpu-tests) }}
     steps:
+      - name: Verify protected Runpod credentials
+        shell: bash
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          RUNPOD_SSH_PRIVATE_KEY: ${{ secrets.RUNPOD_SSH_PRIVATE_KEY }}
+        run: |
+          if [[ -z "${RUNPOD_API_KEY}" ]]; then
+            echo "RUNPOD_API_KEY is missing from repository secrets and the runpod-paid environment" >&2
+            exit 1
+          fi
+          if [[ -z "${RUNPOD_SSH_PRIVATE_KEY}" ]]; then
+            echo "RUNPOD_SSH_PRIVATE_KEY is missing from repository secrets and the runpod-paid environment" >&2
+            exit 1
+          fi
+
       - name: Check out requested source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
