@@ -79,39 +79,72 @@ development builds also default to digest enforcement, but an operator may
 explicitly turn it off while iterating. Releases cannot turn it off. Runtime
 ComfyUI image inputs are subject to the same release-time digest requirement.
 
-## Exact GPU representatives
+## Ordered GPU candidates
 
-The factory prefills one exact Runpod GPU type for building and one for every
-required runtime capability. These are `gpuId` strings from the
+The factory accepts ordered, comma-separated exact Runpod `gpuId` candidates.
+The defaults below were conservatively reviewed against the
 [official Runpod GPU type table](https://docs.runpod.io/references/gpu-types),
-not fuzzy display names:
+[NVIDIA's compute-capability table](https://developer.nvidia.com/cuda/gpus),
+and the user's available-only catalog snapshot from 2026-08-18. They are not
+fuzzy display names and availability at dispatch time is not guaranteed:
 
-| Role | Capability | Prefilled exact `gpuId` |
+| Role | Required capability | Ordered exact `gpuId` candidates |
 |---|---|---|
-| Sequential builders | not used at runtime | `NVIDIA A100 80GB PCIe` |
-| Runtime representative | SM 8.0 | `NVIDIA A100 80GB PCIe` |
-| Runtime representative | SM 8.6 | `NVIDIA GeForce RTX 3090` |
-| Runtime representative | SM 8.9 | `NVIDIA GeForce RTX 4090` |
-| Runtime representative | SM 9.0 | `NVIDIA H100 PCIe` |
-| Runtime representative | SM 12.0 | `NVIDIA GeForce RTX 5090` |
+| Sequential builders | GPU hidden; capability unrestricted | `NVIDIA A100 80GB PCIe` → `NVIDIA A100-SXM4-80GB` → `NVIDIA H100 PCIe` → `NVIDIA H100 80GB HBM3` → `NVIDIA H100 NVL` → `NVIDIA H200` → `NVIDIA GeForce RTX 5090` → `NVIDIA RTX PRO 6000 Blackwell Server Edition` |
+| Runtime representative | SM 8.0 | `NVIDIA A100 80GB PCIe` → `NVIDIA A100-SXM4-80GB` |
+| Runtime representative | SM 8.6 | `NVIDIA A40` → `NVIDIA RTX A6000` → `NVIDIA GeForce RTX 3090` |
+| Runtime representative | SM 8.9 | `NVIDIA L40S` → `NVIDIA RTX 6000 Ada Generation` → `NVIDIA GeForce RTX 4090` → `NVIDIA L4` |
+| Runtime representative | SM 9.0 | `NVIDIA H100 PCIe` → `NVIDIA H100 80GB HBM3` → `NVIDIA H100 NVL` → `NVIDIA H200` |
+| Runtime representative | SM 12.0 | `NVIDIA GeForce RTX 5090` → `NVIDIA RTX PRO 6000 Blackwell Server Edition` → `NVIDIA RTX PRO 6000 Blackwell Workstation Edition` → `NVIDIA RTX PRO 4500 Blackwell Server Edition` → `NVIDIA RTX PRO 4500 Blackwell` |
 
-The attached build GPU is deliberately hidden from the compiler and does not
-need to match a wheel target. A100 PCIe is a scheduling default, not a resource
-guarantee: build policy still requires at least 4 effective vCPUs, 32 GiB
-system RAM, and an 80 GB container disk; 16 vCPUs and 64 GiB system RAM are
-recommended.
+Builder candidates may span architectures only because `build-wheel.sh` hides
+the accelerator before compilation. Runtime fallback is stricter: every entry
+in one validation list must have the exact same compute capability, and the job
+must verify both the assigned `gpuId` and the actual CUDA capability before it
+accepts evidence. Candidate exhaustion fails the job; it must not silently
+substitute another architecture. MIG profiles and the RTX PRO 6000 Blackwell
+Max-Q Workstation Edition are intentionally absent from these defaults.
 
-The same values are prefilled in `.env.example`. Confirm that each ID still
-exists and has capacity in the live catalog before a paid dispatch:
+Fallback is deliberately narrow. The orchestrator makes at most two ordered
+placement rounds, with a five-second backoff before round two only when every
+create in round one returned Runpod's explicit no-capacity response. A
+pre-upload assignment mismatch is deleted before the next candidate is tried
+and prevents another full round. Authentication, configuration, SSH, upload,
+build, and test failures are never treated as capacity and are not retried
+against another GPU. If deletion of a rejected Pod fails, fallback stops
+immediately instead of risking a second billed Pod.
+
+The SM120 server ID `NVIDIA RTX PRO 4500 Blackwell Server Edition` appears in
+NVIDIA's compute-capability table and in the user's live Runpod catalog. The
+static Runpod table currently lists the workstation/base ID
+`NVIDIA RTX PRO 4500 Blackwell` but not that server ID. Keep the live catalog
+spelling exact and recheck it before dispatch. `NVIDIA RTX A4500` is also left
+out of the prefilled SM86 list because NVIDIA's current capability table omits
+that SKU; add it only after a separate authoritative 8.6 confirmation.
+
+The attached build GPU is deliberately hidden from the compiler, so its model
+does not guarantee build resources. Every candidate still needs at least 4
+effective vCPUs, 32 GiB system RAM, and an 80 GB container disk; 16 vCPUs and
+64 GiB system RAM are recommended.
+
+For a GPU-backed build, the selected exact candidate is preserved as
+`artifact.build_evidence.selected_gpu_id` in `manifest.json`, and release
+provenance checks it against the configured builder list. CPU-backed fallback
+builds do not export a selected GPU and record this field as JSON `null`.
+
+The same ordered values are recorded in `.env.example`. Confirm exact IDs and
+current capacity in the live available-only catalog before a paid dispatch;
+use `--include-unavailable` only to diagnose a missing type, not to claim it has
+capacity. This behavior is defined by the
+[official `runpodctl gpu` reference](https://docs.runpod.io/runpodctl/reference/runpodctl-gpu):
 
 ```bash
-runpodctl gpu list --include-unavailable -o json \
+runpodctl gpu list -o json \
   | jq -r '.[] | [.displayName, .gpuId] | @tsv'
 ```
 
 The workflow does not enumerate every commercial GPU SKU. B200 (SM100) and
-B300 (SM103) are intentionally absent; [NVIDIA's compute-capability
-table](https://developer.nvidia.com/cuda/gpus) lists them as 10.0 and 10.3
+B300 (SM103) are intentionally absent; NVIDIA lists them as 10.0 and 10.3
 respectively, while SageAttention 2.2.0 has no SM10x
 source/cubin or dispatcher path. The SM120 RTX 5090 result does not imply SM100
 or SM103 compatibility. Adding either data-center GPU requires upstream kernel
@@ -134,7 +167,7 @@ release workflow.
    unexpected build/CUDA variants, or non-digest images when digest enforcement
    is enabled.
 2. The two build variants run sequentially. Each starts a one-GPU Pod from its
-   exact builder image with `gpuId=NVIDIA A100 80GB PCIe`, port 22, registry
+   exact builder image using the ordered builder candidates, port 22, registry
    authentication when needed, at least 80 GB
    container disk, and an absolute `--terminate-after` deadline. The checked-out
    repository is archived without Git metadata or links and uploaded below
@@ -146,7 +179,7 @@ release workflow.
    requested 80 GB container disk. `build-wheel.sh` then reads the assigned
    cgroup and requires 20 GiB currently free on both work and output
    filesystems. A 16-vCPU/64-GB system assignment is recommended. Passing the
-   A100 `gpuId` alone does not prove these host resources.
+   selected `gpuId` alone does not prove these host resources.
 4. `build-wheel.sh` hides the attached accelerator with
    `CUDA_VISIBLE_DEVICES=""`, derives safe compiler concurrency without
    exceeding the matrix cap, and executes the pinned source build. The output,
@@ -265,18 +298,19 @@ together.
 ## Direct operator use
 
 The same tool can run a reviewed command outside GitHub. This example uses the
-prefilled GPU-backed builder type and retrieves one build directory:
+first two ordered GPU-backed builder candidates and retrieves one build
+directory; repeat `--gpu-id` once per exact fallback in priority order:
 
 ```bash
 export RUNPOD_API_KEY=...
 export RUNPOD_SSH_PUBLIC_KEY='ssh-ed25519 AAAA... operator'
-export RUNPOD_BUILD_GPU_ID='NVIDIA A100 80GB PCIe'
 
 python3.12 tools/runpod_job.py \
   --allow-paid-pod \
   --mode gpu \
   --gpu-workload build \
-  --gpu-id "${RUNPOD_BUILD_GPU_ID}" \
+  --gpu-id 'NVIDIA A100 80GB PCIe' \
+  --gpu-id 'NVIDIA A100-SXM4-80GB' \
   --gpu-min-vcpu-count 16 \
   --gpu-min-memory-gb 32 \
   --min-cuda-version 12.8 \
@@ -294,9 +328,11 @@ python3.12 tools/runpod_job.py \
 ```
 
 Run the cu130 command only after cu128 finishes, using its matching builder
-image and `--min-cuda-version 13.0`. The tool never discovers or substitutes a
-different GPU; the exact requested id is sent to Runpod. Builders and runtime
-validators both pass the CUDA scheduler floor from their matrix entry.
+image and `--min-cuda-version 13.0`. The tool tries only the explicitly ordered
+exact IDs and accepts only the candidate actually reported by Runpod. Builders
+and runtime validators both pass the CUDA scheduler floor from their matrix
+entry; runtime candidates must additionally stay within that job's one exact
+compute capability.
 
 ## Operational cautions
 

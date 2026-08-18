@@ -28,7 +28,7 @@ import time
 import uuid
 from urllib import error as urllib_error
 from urllib import request as urllib_request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable, Mapping, Sequence
 
@@ -43,6 +43,14 @@ class JobTimeout(JobError):
 
 class CommandError(JobError):
     """A local, SSH, or runpodctl command failed."""
+
+
+class CapacityUnavailableError(CommandError):
+    """Runpod had no instance matching one exact GPU placement request."""
+
+
+class GpuPlacementError(JobError):
+    """A created GPU Pod failed retryable pre-upload placement checks."""
 
 
 @dataclass(frozen=True)
@@ -151,6 +159,7 @@ class JobSpec:
     commands: tuple[str, ...]
     artifact_paths: tuple[str, ...]
     artifact_output: Path
+    gpu_id_candidates: tuple[str, ...] = ()
     hard_timeout_seconds: int = 14_400
     terminate_grace_seconds: int = 900
     poll_seconds: float = 5.0
@@ -158,6 +167,25 @@ class JobSpec:
 
     def validate(self) -> None:
         self.pod.validate()
+        if self.pod.compute_type.upper() == "GPU":
+            candidates = self.gpu_id_candidates or (self.pod.gpu_id or "",)
+            if candidates[0] != self.pod.gpu_id:
+                raise ValueError(
+                    "the first gpu_id candidate must match the Pod request gpu_id"
+                )
+            if len(candidates) > 8:
+                raise ValueError("at most 8 ordered gpu_id candidates are allowed")
+            if any(
+                not candidate
+                or candidate != candidate.strip()
+                or "\n" in candidate
+                or "\r" in candidate
+                or "," in candidate
+                for candidate in candidates
+            ):
+                raise ValueError("gpu_id candidates must be exact non-empty single lines")
+            if len(set(candidates)) != len(candidates):
+                raise ValueError("gpu_id candidates must not contain duplicates")
         if not self.allow_paid_pod:
             raise ValueError(
                 "paid Pod creation is disabled; pass --allow-paid-pod only "
@@ -189,6 +217,7 @@ class JobResult:
     pod_id: str
     endpoint: Endpoint
     artifact_output: Path
+    selected_gpu_id: str | None = None
 
 
 Executor = Callable[..., subprocess.CompletedProcess[str]]
@@ -200,6 +229,20 @@ HttpExecutor = Callable[
 def _completed_text(proc: subprocess.CompletedProcess[str]) -> str:
     return "\n".join(
         part.strip() for part in (proc.stdout or "", proc.stderr or "") if part.strip()
+    )
+
+
+def _is_capacity_unavailable_error(error: CommandError) -> bool:
+    """Match only Runpod's explicit no-instance placement response."""
+
+    normalized = " ".join(str(error).casefold().split())
+    return any(
+        message in normalized
+        for message in (
+            "there are no longer any instances available with the requested "
+            "specifications",
+            "there are no instances available with the requested specifications",
+        )
     )
 
 
@@ -367,7 +410,12 @@ class Runpodctl:
         if request.min_cuda_version:
             args.extend(["--min-cuda-version", request.min_cuda_version])
 
-        payload = self.call_json(*args, timeout=timeout)
+        try:
+            payload = self.call_json(*args, timeout=timeout)
+        except CommandError as exc:
+            if _is_capacity_unavailable_error(exc):
+                raise CapacityUnavailableError(str(exc)) from exc
+            raise
         if not isinstance(payload, dict):
             raise CommandError("runpodctl pod create returned a non-object response")
         nested = payload.get("pod")
@@ -869,38 +917,41 @@ def verify_pod_assignment(
             f"Pod image mismatch: expected {request.image!r}, got {actual_image!r}"
         )
     if request.compute_type.upper() == "GPU":
-        if not request.is_gpu_build:
-            return
-
         gpu_type_id = _gpu_type_id(details)
         if gpu_type_id != request.gpu_id:
-            raise JobError(
+            raise GpuPlacementError(
                 f"GPU type mismatch: expected exact gpuId {request.gpu_id!r}, "
                 f"got {gpu_type_id!r}"
             )
+        if not request.is_gpu_build:
+            print(
+                f"Pod {pod_id}: verified image and gpu_id={gpu_type_id}"
+            )
+            return
+
         vcpus = _number(details, "vcpuCount")
         if vcpus is None or vcpus < request.gpu_min_vcpu_count:
-            raise JobError(
+            raise GpuPlacementError(
                 f"GPU build CPU count mismatch: required at least "
                 f"{request.gpu_min_vcpu_count}, got {details.get('vcpuCount')!r}"
             )
         memory = _number(details, "memoryInGb")
         if memory is None or memory < request.gpu_min_memory_gb:
-            raise JobError(
+            raise GpuPlacementError(
                 f"GPU build memory mismatch: required at least "
                 f"{request.gpu_min_memory_gb} GB, "
                 f"got {details.get('memoryInGb')!r}"
             )
         container_disk = _number(details, "containerDiskInGb")
         if container_disk is None or container_disk < request.container_disk_gb:
-            raise JobError(
+            raise GpuPlacementError(
                 f"container disk mismatch: requested at least "
                 f"{request.container_disk_gb} GB, "
                 f"got {details.get('containerDiskInGb')!r}"
             )
         pod_volume = _number(details, "volumeInGb")
         if pod_volume != 0:
-            raise JobError(
+            raise GpuPlacementError(
                 "unexpected paid Pod volume: requested 0 GB, "
                 f"got {details.get('volumeInGb')!r}"
             )
@@ -987,6 +1038,16 @@ def _rfc3339_after(
     return target.isoformat().replace("+00:00", "Z")
 
 
+GPU_PLACEMENT_ROUNDS = 2
+GPU_PLACEMENT_BACKOFF_SECONDS = 5.0
+
+
+def _gpu_candidates(spec: JobSpec) -> tuple[str, ...]:
+    if spec.pod.compute_type.upper() != "GPU":
+        return ()
+    return spec.gpu_id_candidates or (spec.pod.gpu_id or "",)
+
+
 def run_job(
     spec: JobSpec,
     *,
@@ -1002,6 +1063,7 @@ def run_job(
     transport = transport or SSHTransport(spec.ssh_private_key)
     pod_id: str | None = None
     endpoint: Endpoint | None = None
+    selected_gpu_id: str | None = None
     repo_uploaded = False
     primary_error: Exception | None = None
     artifact_error: Exception | None = None
@@ -1012,27 +1074,117 @@ def run_job(
             spec.hard_timeout_seconds + spec.terminate_grace_seconds
         )
         terminate_after = _rfc3339_after(self_terminate_seconds)
-        pod_id = ctl.create_pod(
-            spec.pod,
-            terminate_after=terminate_after,
-            self_terminate_seconds=self_terminate_seconds,
-            timeout=deadline.timeout(120),
-        )
         if spec.pod.compute_type.upper() == "CPU":
+            pod_id = ctl.create_pod(
+                spec.pod,
+                terminate_after=terminate_after,
+                self_terminate_seconds=self_terminate_seconds,
+                timeout=deadline.timeout(120),
+            )
             print(
                 f"Created CPU Pod {pod_id}; in-Pod self-delete after "
                 f"{self_terminate_seconds}s"
             )
+            endpoint = wait_fn(
+                ctl,
+                transport,
+                pod_id,
+                deadline,
+                poll_seconds=spec.poll_seconds,
+            )
+            verify_pod_assignment(ctl, pod_id, spec.pod, deadline)
         else:
-            print(f"Created GPU Pod {pod_id}; terminate-after={terminate_after}")
-        endpoint = wait_fn(
-            ctl,
-            transport,
-            pod_id,
-            deadline,
-            poll_seconds=spec.poll_seconds,
-        )
-        verify_pod_assignment(ctl, pod_id, spec.pod, deadline)
+            candidates = _gpu_candidates(spec)
+            placement_failures: list[str] = []
+            for round_number in range(1, GPU_PLACEMENT_ROUNDS + 1):
+                if round_number > 1:
+                    backoff = deadline.timeout(GPU_PLACEMENT_BACKOFF_SECONDS)
+                    print(
+                        "All GPU candidates rejected in placement round "
+                        f"{round_number - 1}; retrying once after {backoff:g}s"
+                    )
+                    time.sleep(backoff)
+                round_only_capacity_failures = True
+                for candidate_number, candidate in enumerate(candidates, start=1):
+                    candidate_request = replace(spec.pod, gpu_id=candidate)
+                    pod_id = None
+                    endpoint = None
+                    try:
+                        pod_id = ctl.create_pod(
+                            candidate_request,
+                            terminate_after=terminate_after,
+                            self_terminate_seconds=self_terminate_seconds,
+                            timeout=deadline.timeout(120),
+                        )
+                    except CapacityUnavailableError as exc:
+                        placement_failures.append(
+                            f"round {round_number} {candidate!r}: {exc}"
+                        )
+                        print(
+                            f"GPU candidate {candidate_number}/{len(candidates)} "
+                            f"{candidate!r} has no matching capacity",
+                            file=sys.stderr,
+                        )
+                        continue
+
+                    print(
+                        f"Created GPU Pod {pod_id} for candidate {candidate!r}; "
+                        f"terminate-after={terminate_after}"
+                    )
+                    endpoint = wait_fn(
+                        ctl,
+                        transport,
+                        pod_id,
+                        deadline,
+                        poll_seconds=spec.poll_seconds,
+                    )
+                    try:
+                        verify_pod_assignment(
+                            ctl,
+                            pod_id,
+                            candidate_request,
+                            deadline,
+                        )
+                    except GpuPlacementError as exc:
+                        round_only_capacity_failures = False
+                        placement_failures.append(
+                            f"round {round_number} {candidate!r}: {exc}"
+                        )
+                        print(
+                            f"GPU candidate {candidate!r} was rejected "
+                            f"before upload: {exc}",
+                            file=sys.stderr,
+                        )
+                        rejected_cleanup_error = _terminate_strictly(ctl, pod_id)
+                        if rejected_cleanup_error is not None:
+                            raise JobError(
+                                "refusing GPU candidate fallback because rejected "
+                                f"Pod {pod_id} could not be deleted: "
+                                f"{rejected_cleanup_error}"
+                            ) from exc
+                        pod_id = None
+                        endpoint = None
+                        continue
+
+                    selected_gpu_id = candidate
+                    print(
+                        f"Selected GPU candidate {candidate!r} for Pod {pod_id} "
+                        f"(round {round_number})"
+                    )
+                    break
+                if selected_gpu_id is not None:
+                    break
+                if not round_only_capacity_failures:
+                    break
+
+            if selected_gpu_id is None:
+                detail = "; ".join(placement_failures)
+                raise JobError(
+                    "GPU placement exhausted two ordered rounds before upload"
+                    + (f": {detail}" if detail else "")
+                )
+
+        assert pod_id is not None and endpoint is not None
         transport.upload_repo(
             endpoint,
             spec.repo_root,
@@ -1041,7 +1193,18 @@ def run_job(
         )
         repo_uploaded = True
         for command in spec.commands:
-            transport.run_script(endpoint, spec.remote_dir, command, deadline)
+            remote_command = command
+            if selected_gpu_id is not None:
+                remote_command = (
+                    "export RUNPOD_SELECTED_GPU_ID="
+                    f"{shlex.quote(selected_gpu_id)}; {command}"
+                )
+            transport.run_script(
+                endpoint,
+                spec.remote_dir,
+                remote_command,
+                deadline,
+            )
     except Exception as exc:
         primary_error = exc
     finally:
@@ -1076,7 +1239,12 @@ def run_job(
         detail = "; ".join(f"{label}: {error}" for label, error in present)
         raise JobError(detail) from primary_error
     assert pod_id is not None and endpoint is not None
-    return JobResult(pod_id, endpoint, spec.artifact_output)
+    return JobResult(
+        pod_id,
+        endpoint,
+        spec.artifact_output,
+        selected_gpu_id=selected_gpu_id,
+    )
 
 
 def _read_public_key(args: argparse.Namespace) -> str:
@@ -1090,7 +1258,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--image", required=True, help="immutable builder/test image ref")
     parser.add_argument("--name", required=True, help="short unique Pod name")
     parser.add_argument("--mode", choices=("cpu", "gpu"), required=True)
-    parser.add_argument("--gpu-id", help="exact Runpod gpuId; required in GPU mode")
+    parser.add_argument(
+        "--gpu-id",
+        action="append",
+        metavar="GPU_ID",
+        help=(
+            "exact Runpod gpuId; required in GPU mode and repeatable up to 8 "
+            "times in ordered fallback priority"
+        ),
+    )
     parser.add_argument("--min-cuda-version")
     parser.add_argument(
         "--gpu-workload",
@@ -1173,12 +1349,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         previous_handlers[signum] = signal.getsignal(signum)
         signal.signal(signum, request_shutdown)
     try:
+        gpu_id_candidates = tuple(args.gpu_id or ())
         request = PodRequest(
             image=args.image,
             name=args.name,
             public_key=_read_public_key(args),
             compute_type=args.mode.upper(),
-            gpu_id=args.gpu_id,
+            gpu_id=gpu_id_candidates[0] if gpu_id_candidates else None,
             cloud_type=args.cloud_type,
             container_disk_gb=args.container_disk_gb,
             min_cuda_version=args.min_cuda_version,
@@ -1208,6 +1385,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             commands=tuple(args.command),
             artifact_paths=tuple(args.artifact),
             artifact_output=args.artifact_output.resolve(),
+            gpu_id_candidates=(
+                gpu_id_candidates if args.mode == "gpu" else ()
+            ),
             hard_timeout_seconds=args.timeout_seconds,
             terminate_grace_seconds=args.terminate_grace_seconds,
             poll_seconds=args.poll_seconds,
@@ -1220,17 +1400,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     finally:
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
-    print(
-        json.dumps(
-            {
-                "pod_id": result.pod_id,
-                "ssh_host": result.endpoint.host,
-                "ssh_port": result.endpoint.port,
-                "artifact_output": str(result.artifact_output),
-            },
-            sort_keys=True,
-        )
-    )
+    result_payload = {
+        "pod_id": result.pod_id,
+        "ssh_host": result.endpoint.host,
+        "ssh_port": result.endpoint.port,
+        "artifact_output": str(result.artifact_output),
+    }
+    if result.selected_gpu_id is not None:
+        result_payload["selected_gpu_id"] = result.selected_gpu_id
+    print(json.dumps(result_payload, sort_keys=True))
     return 0
 
 

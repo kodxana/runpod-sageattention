@@ -16,9 +16,9 @@ on:
           - GPU
           - CPU
       build_gpu_id:
-        description: Exact Runpod gpuId used only for GPU-backed compilation
+        description: Ordered comma-separated Runpod gpuId candidates for GPU compilation
         required: true
-        default: "NVIDIA A100 80GB PCIe"
+        default: "NVIDIA A100 80GB PCIe,NVIDIA A100-SXM4-80GB,NVIDIA H100 PCIe,NVIDIA H100 80GB HBM3,NVIDIA H100 NVL,NVIDIA H200,NVIDIA GeForce RTX 5090,NVIDIA RTX PRO 6000 Blackwell Server Edition"
         type: string
       builder_image_cu128:
         description: Immutable CUDA 12.8 builder image (@sha256 required)
@@ -41,29 +41,29 @@ on:
         default: "runpod/comfyui@sha256:0bf75436da591e0f26d299af3741e07cb8ce8ce36566d1a7d8d78aae458e5d67"
         type: string
       gpu_id_sm80:
-        description: Exact Runpod gpuId for one SM 8.0 representative
+        description: Ordered SM 8.0-only Runpod gpuId candidates
         required: true
-        default: "NVIDIA A100 80GB PCIe"
+        default: "NVIDIA A100 80GB PCIe,NVIDIA A100-SXM4-80GB"
         type: string
       gpu_id_sm86:
-        description: Exact Runpod gpuId for one SM 8.6 representative
+        description: Ordered SM 8.6-only Runpod gpuId candidates
         required: true
-        default: "NVIDIA GeForce RTX 3090"
+        default: "NVIDIA A40,NVIDIA RTX A6000,NVIDIA GeForce RTX 3090"
         type: string
       gpu_id_sm89:
-        description: Exact Runpod gpuId for one SM 8.9 representative
+        description: Ordered SM 8.9-only Runpod gpuId candidates
         required: true
-        default: "NVIDIA GeForce RTX 4090"
+        default: "NVIDIA L40S,NVIDIA RTX 6000 Ada Generation,NVIDIA GeForce RTX 4090,NVIDIA L4"
         type: string
       gpu_id_sm90:
-        description: Exact Runpod gpuId for one SM 9.0 representative
+        description: Ordered SM 9.0-only Runpod gpuId candidates
         required: true
-        default: "NVIDIA H100 PCIe"
+        default: "NVIDIA H100 PCIe,NVIDIA H100 80GB HBM3,NVIDIA H100 NVL,NVIDIA H200"
         type: string
       gpu_id_sm120:
-        description: Exact Runpod gpuId for one SM 12.0 representative
+        description: Ordered SM 12.0-only Runpod gpuId candidates
         required: true
-        default: "NVIDIA GeForce RTX 5090"
+        default: "NVIDIA GeForce RTX 5090,NVIDIA RTX PRO 6000 Blackwell Server Edition,NVIDIA RTX PRO 6000 Blackwell Workstation Edition,NVIDIA RTX PRO 4500 Blackwell Server Edition,NVIDIA RTX PRO 4500 Blackwell"
         type: string
       cloud_type:
         description: Runpod capacity pool
@@ -256,9 +256,26 @@ jobs:
           import subprocess
           from pathlib import Path
 
+          def candidates(environment_name):
+              values = [
+                  item.strip()
+                  for item in os.environ[environment_name].split(",")
+              ]
+              if not values or any(not item for item in values):
+                  raise SystemExit(
+                      f"{environment_name} is not a valid candidate list"
+                  )
+              if len(values) != len(set(values)):
+                  raise SystemExit(
+                      f"{environment_name} contains duplicate candidates"
+                  )
+              return values
+
           matrix = json.loads(Path("matrix.json").read_text())
           destination = Path("release-assets")
           destination.mkdir()
+          configured_builder_candidates = candidates("BUILD_GPU_ID")
+          selected_builder_gpu_ids = {}
           runtime_by_cuda = {
               "12.8": os.environ["RUNTIME_CU128"],
               "13.0": os.environ["RUNTIME_CU130"],
@@ -289,16 +306,34 @@ jobs:
               artifacts = manifest.get("artifacts")
               if not isinstance(artifacts, list) or len(artifacts) != 1:
                   raise SystemExit(f"invalid per-build manifest for {build_id}")
+              build_evidence = artifacts[0].get("build_evidence", {})
+              if not isinstance(build_evidence, dict):
+                  raise SystemExit(f"invalid build evidence for {build_id}")
               recorded_builder = (
-                  artifacts[0].get("build_evidence", {})
-                  .get("builder_image", {})
-                  .get("ref")
+                  build_evidence.get("builder_image", {}).get("ref")
               )
               expected_builder = builder_by_cuda[build["cuda_version"]]
               if recorded_builder != expected_builder:
                   raise SystemExit(
                       f"builder image binding mismatch for {build_id}: "
                       f"expected {expected_builder!r}, got {recorded_builder!r}"
+                  )
+              selected_builder_gpu = build_evidence.get("selected_gpu_id")
+              if os.environ["BUILD_BACKEND"] == "GPU":
+                  if (
+                      not isinstance(selected_builder_gpu, str)
+                      or not selected_builder_gpu
+                      or selected_builder_gpu not in configured_builder_candidates
+                  ):
+                      raise SystemExit(
+                          f"selected builder GPU mismatch for {build_id}: "
+                          f"{selected_builder_gpu!r}"
+                      )
+                  selected_builder_gpu_ids[build_id] = selected_builder_gpu
+              elif selected_builder_gpu is not None:
+                  raise SystemExit(
+                      f"CPU build unexpectedly recorded a selected GPU for "
+                      f"{build_id}: {selected_builder_gpu!r}"
                   )
               shutil.copy2(wheels[0], destination / wheels[0].name)
               shutil.copy2(source / "manifest.json", destination / f"{build_id}.manifest.json")
@@ -420,11 +455,12 @@ jobs:
               "release_tag": os.environ["RELEASE_TAG"],
               "source_commit": os.environ["RESOLVED_SOURCE_SHA"],
               "build_backend": os.environ["BUILD_BACKEND"],
-              "build_gpu_id": (
-                  os.environ["BUILD_GPU_ID"]
+              "build_gpu_candidates": (
+                  configured_builder_candidates
                   if os.environ["BUILD_BACKEND"] == "GPU"
-                  else None
+                  else []
               ),
+              "selected_build_gpu_ids": selected_builder_gpu_ids,
               "github_run": {
                   "repository": os.environ["GITHUB_REPOSITORY"],
                   "run_id": os.environ["GITHUB_RUN_ID"],
@@ -438,12 +474,12 @@ jobs:
                   "cu128": os.environ["RUNTIME_CU128"],
                   "cu130": os.environ["RUNTIME_CU130"],
               },
-              "representative_gpu_ids": {
-                  "8.0": os.environ["GPU_SM80"],
-                  "8.6": os.environ["GPU_SM86"],
-                  "8.9": os.environ["GPU_SM89"],
-                  "9.0": os.environ["GPU_SM90"],
-                  "12.0": os.environ["GPU_SM120"],
+              "representative_gpu_candidates": {
+                  "8.0": candidates("GPU_SM80"),
+                  "8.6": candidates("GPU_SM86"),
+                  "8.9": candidates("GPU_SM89"),
+                  "9.0": candidates("GPU_SM90"),
+                  "12.0": candidates("GPU_SM120"),
               },
               "cpu_placement": (
                   {

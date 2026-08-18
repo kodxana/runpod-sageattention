@@ -14,6 +14,7 @@ from unittest import mock
 from pathlib import Path
 
 from tools.runpod_job import (
+    CapacityUnavailableError,
     CommandError,
     Deadline,
     Endpoint,
@@ -200,6 +201,38 @@ class RunpodctlTests(unittest.TestCase):
             "2026-08-18T05:00:00Z",
         )
 
+    def test_gpu_create_classifies_only_explicit_capacity_failure(self) -> None:
+        request = PodRequest(
+            image="registry.invalid/builder@sha256:" + "e" * 64,
+            name="gpu-build",
+            public_key="ssh-ed25519 AAAA test",
+            compute_type="GPU",
+            gpu_id="NVIDIA A100 80GB PCIe",
+            gpu_workload="BUILD",
+        )
+        capacity = completed(
+            stderr=(
+                "Error: There are no longer any instances available with the "
+                "requested specifications."
+            ),
+            code=1,
+        )
+        with self.assertRaises(CapacityUnavailableError):
+            Runpodctl(executor=RecordingExecutor(capacity)).create_pod(
+                request,
+                terminate_after="2026-08-18T05:00:00Z",
+                self_terminate_seconds=15_300,
+            )
+
+        unauthorized = completed(stderr="Error: unauthorized", code=1)
+        with self.assertRaises(CommandError) as raised:
+            Runpodctl(executor=RecordingExecutor(unauthorized)).create_pod(
+                request,
+                terminate_after="2026-08-18T05:00:00Z",
+                self_terminate_seconds=15_300,
+            )
+        self.assertNotIsInstance(raised.exception, CapacityUnavailableError)
+
     def test_gpu_build_request_enforces_compilation_minima(self) -> None:
         request = PodRequest(
             image="registry.invalid/builder",
@@ -230,6 +263,8 @@ class RunpodctlTests(unittest.TestCase):
                 "gpu",
                 "--gpu-id",
                 "NVIDIA A100 80GB PCIe",
+                "--gpu-id",
+                "NVIDIA H100 PCIe",
                 "--gpu-workload",
                 "build",
                 "--gpu-min-vcpu-count",
@@ -243,6 +278,10 @@ class RunpodctlTests(unittest.TestCase):
             ]
         )
         self.assertEqual(args.gpu_workload, "build")
+        self.assertEqual(
+            args.gpu_id,
+            ["NVIDIA A100 80GB PCIe", "NVIDIA H100 PCIe"],
+        )
         self.assertEqual(args.gpu_min_vcpu_count, 24)
         self.assertEqual(args.gpu_min_memory_gb, 64)
         parser = _parser()
@@ -464,6 +503,7 @@ class AssignmentTests(unittest.TestCase):
             def assignment_details(self, pod_id, timeout):
                 return {
                     "image": "registry.invalid/runtime@sha256:" + "b" * 64,
+                    "gpu": {"id": "NVIDIA RTX 4090"},
                 }
 
         verify_pod_assignment(
@@ -478,6 +518,29 @@ class AssignmentTests(unittest.TestCase):
             ),
             Deadline(10),
         )
+
+    def test_gpu_validation_assignment_requires_exact_gpu_id(self) -> None:
+        class FakeCtl:
+            def assignment_details(self, pod_id, timeout):
+                return {
+                    "image": "registry.invalid/runtime@sha256:" + "b" * 64,
+                    "gpuTypeId": "NVIDIA L40S",
+                }
+
+        request = PodRequest(
+            image="registry.invalid/runtime@sha256:" + "b" * 64,
+            name="gpu-validation",
+            public_key="ssh-ed25519 AAAA test",
+            compute_type="GPU",
+            gpu_id="NVIDIA RTX 4090",
+        )
+        with self.assertRaisesRegex(JobError, "GPU type mismatch"):
+            verify_pod_assignment(
+                FakeCtl(),  # type: ignore[arg-type]
+                "pod-validation",
+                request,
+                Deadline(10),
+            )
 
     def test_gpu_build_assignment_accepts_both_gpu_id_shapes(self) -> None:
         base = {
@@ -756,6 +819,28 @@ class RunJobCleanupTests(unittest.TestCase):
             allow_paid_pod=allow_paid,
         )
 
+    def _gpu_spec(
+        self,
+        root: Path,
+        candidates: tuple[str, ...] = (
+            "NVIDIA A100 80GB PCIe",
+            "NVIDIA H100 PCIe",
+        ),
+    ) -> JobSpec:
+        pod = PodRequest(
+            image="registry.invalid/builder@sha256:" + "e" * 64,
+            name="gpu-build",
+            public_key="ssh-ed25519 AAAA test",
+            compute_type="GPU",
+            gpu_id=candidates[0],
+            gpu_workload="BUILD",
+        )
+        return replace(
+            self._spec(root),
+            pod=pod,
+            gpu_id_candidates=candidates,
+        )
+
     def test_paid_guard_fails_before_auth_or_create(self) -> None:
         class FakeCtl:
             called = False
@@ -842,6 +927,282 @@ class RunJobCleanupTests(unittest.TestCase):
                 )
             self.assertRegex(ctl.terminate_after, r"Z$")
             self.assertEqual(ctl.terminated, ["pod-gpu-build"])
+
+    def test_gpu_build_rejects_and_deletes_before_next_candidate(self) -> None:
+        first = "NVIDIA A100 80GB PCIe"
+        second = "NVIDIA H100 PCIe"
+        events: list[tuple[str, str]] = []
+
+        class FakeCtl:
+            def __init__(self):
+                self.deadlines: list[str] = []
+
+            def check_auth(self, timeout):
+                return None
+
+            def create_pod(
+                self, request, terminate_after, self_terminate_seconds, timeout
+            ):
+                self.deadlines.append(terminate_after)
+                events.append(("create", request.gpu_id))
+                return "pod-first" if request.gpu_id == first else "pod-second"
+
+            def assignment_details(self, pod_id, timeout):
+                gpu_id = first if pod_id == "pod-first" else second
+                return {
+                    "imageName": "registry.invalid/builder@sha256:" + "e" * 64,
+                    "gpuTypeId": gpu_id,
+                    "vcpuCount": 3 if pod_id == "pod-first" else 4,
+                    "memoryInGb": 32,
+                    "containerDiskInGb": 80,
+                    "volumeInGb": 0,
+                }
+
+            def terminate_pod(self, pod_id, timeout):
+                events.append(("delete", pod_id))
+
+        class FakeTransport:
+            def __init__(self):
+                self.scripts: list[str] = []
+
+            def upload_repo(self, endpoint, repo_root, remote_dir, deadline):
+                events.append(("upload", endpoint.host))
+
+            def run_script(self, endpoint, remote_dir, script, deadline):
+                self.scripts.append(script)
+                events.append(("command", endpoint.host))
+
+            def download_artifacts(self, *args):
+                events.append(("download", "artifacts"))
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            ctl = FakeCtl()
+            transport = FakeTransport()
+            result = run_job(
+                self._gpu_spec(root, (first, second)),
+                ctl=ctl,  # type: ignore[arg-type]
+                transport=transport,  # type: ignore[arg-type]
+                wait_fn=lambda *args, **kwargs: Endpoint("host", 2200),
+            )
+
+        self.assertEqual(result.selected_gpu_id, second)
+        self.assertEqual(ctl.deadlines[0], ctl.deadlines[1])
+        self.assertRegex(ctl.deadlines[0], r"Z$")
+        self.assertLess(
+            events.index(("delete", "pod-first")),
+            events.index(("create", second)),
+        )
+        self.assertLess(
+            events.index(("create", second)),
+            events.index(("upload", "host")),
+        )
+        self.assertEqual(events[-1], ("delete", "pod-second"))
+        self.assertIn(
+            "export RUNPOD_SELECTED_GPU_ID='NVIDIA H100 PCIe';",
+            transport.scripts[0],
+        )
+
+    def test_gpu_validation_exact_assignment_mismatch_uses_next_candidate(self) -> None:
+        first = "NVIDIA GeForce RTX 4090"
+        second = "NVIDIA L40S"
+
+        class FakeCtl:
+            def __init__(self):
+                self.candidates: list[str] = []
+                self.terminated: list[str] = []
+
+            def check_auth(self, timeout):
+                return None
+
+            def create_pod(
+                self, request, terminate_after, self_terminate_seconds, timeout
+            ):
+                self.candidates.append(request.gpu_id)
+                return f"pod-{len(self.candidates)}"
+
+            def assignment_details(self, pod_id, timeout):
+                return {
+                    "image": "registry.invalid/runtime@sha256:" + "f" * 64,
+                    "gpuTypeId": "unexpected" if pod_id == "pod-1" else second,
+                }
+
+            def terminate_pod(self, pod_id, timeout):
+                self.terminated.append(pod_id)
+
+        class FakeTransport:
+            def upload_repo(self, *args):
+                return None
+
+            def run_script(self, *args):
+                return None
+
+            def download_artifacts(self, *args):
+                return None
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            pod = PodRequest(
+                image="registry.invalid/runtime@sha256:" + "f" * 64,
+                name="gpu-validation",
+                public_key="ssh-ed25519 AAAA test",
+                compute_type="GPU",
+                gpu_id=first,
+            )
+            spec = replace(
+                self._spec(root),
+                pod=pod,
+                gpu_id_candidates=(first, second),
+                remote_dir="/workspace",
+            )
+            ctl = FakeCtl()
+            result = run_job(
+                spec,
+                ctl=ctl,  # type: ignore[arg-type]
+                transport=FakeTransport(),  # type: ignore[arg-type]
+                wait_fn=lambda *args, **kwargs: Endpoint("host", 2200),
+            )
+
+        self.assertEqual(ctl.candidates, [first, second])
+        self.assertEqual(ctl.terminated, ["pod-1", "pod-2"])
+        self.assertEqual(result.selected_gpu_id, second)
+
+    def test_gpu_capacity_fallback_uses_two_bounded_ordered_rounds(self) -> None:
+        first = "NVIDIA A100 80GB PCIe"
+        second = "NVIDIA H100 PCIe"
+
+        class FakeCtl:
+            def __init__(self):
+                self.candidates: list[str] = []
+                self.deadlines: list[str] = []
+                self.terminated: list[str] = []
+
+            def check_auth(self, timeout):
+                return None
+
+            def create_pod(
+                self, request, terminate_after, self_terminate_seconds, timeout
+            ):
+                self.candidates.append(request.gpu_id)
+                self.deadlines.append(terminate_after)
+                if len(self.candidates) <= 2:
+                    raise CapacityUnavailableError(
+                        "There are no longer any instances available with the "
+                        "requested specifications"
+                    )
+                return "pod-selected"
+
+            def assignment_details(self, pod_id, timeout):
+                return {
+                    "image": "registry.invalid/builder@sha256:" + "e" * 64,
+                    "gpu": {"id": first},
+                    "vcpuCount": 4,
+                    "memoryInGb": 32,
+                    "containerDiskInGb": 80,
+                    "volumeInGb": 0,
+                }
+
+            def terminate_pod(self, pod_id, timeout):
+                self.terminated.append(pod_id)
+
+        class FakeTransport:
+            def upload_repo(self, *args):
+                return None
+
+            def run_script(self, *args):
+                return None
+
+            def download_artifacts(self, *args):
+                return None
+
+        with tempfile.TemporaryDirectory() as temp, mock.patch(
+            "tools.runpod_job.time.sleep"
+        ) as sleep:
+            ctl = FakeCtl()
+            result = run_job(
+                self._gpu_spec(Path(temp), (first, second)),
+                ctl=ctl,  # type: ignore[arg-type]
+                transport=FakeTransport(),  # type: ignore[arg-type]
+                wait_fn=lambda *args, **kwargs: Endpoint("host", 2200),
+            )
+
+        self.assertEqual(ctl.candidates, [first, second, first])
+        self.assertEqual(len(set(ctl.deadlines)), 1)
+        self.assertRegex(ctl.deadlines[0], r"Z$")
+        sleep.assert_called_once()
+        self.assertAlmostEqual(sleep.call_args.args[0], 5.0)
+        self.assertEqual(result.selected_gpu_id, first)
+        self.assertEqual(ctl.terminated, ["pod-selected"])
+
+    def test_gpu_candidate_fallback_does_not_retry_configuration_error(self) -> None:
+        class FakeCtl:
+            def __init__(self):
+                self.candidates: list[str] = []
+
+            def check_auth(self, timeout):
+                return None
+
+            def create_pod(
+                self, request, terminate_after, self_terminate_seconds, timeout
+            ):
+                self.candidates.append(request.gpu_id)
+                raise CommandError("runpodctl pod create failed: unauthorized")
+
+        with tempfile.TemporaryDirectory() as temp:
+            ctl = FakeCtl()
+            with self.assertRaisesRegex(JobError, "unauthorized"):
+                run_job(
+                    self._gpu_spec(Path(temp)),
+                    ctl=ctl,  # type: ignore[arg-type]
+                    transport=object(),  # type: ignore[arg-type]
+                )
+        self.assertEqual(ctl.candidates, ["NVIDIA A100 80GB PCIe"])
+
+    def test_gpu_candidate_fallback_stops_when_upload_begins(self) -> None:
+        first = "NVIDIA A100 80GB PCIe"
+
+        class FakeCtl:
+            def __init__(self):
+                self.candidates: list[str] = []
+                self.terminated: list[str] = []
+
+            def check_auth(self, timeout):
+                return None
+
+            def create_pod(
+                self, request, terminate_after, self_terminate_seconds, timeout
+            ):
+                self.candidates.append(request.gpu_id)
+                return "pod-first"
+
+            def assignment_details(self, pod_id, timeout):
+                return {
+                    "image": "registry.invalid/builder@sha256:" + "e" * 64,
+                    "gpuTypeId": first,
+                    "vcpuCount": 4,
+                    "memoryInGb": 32,
+                    "containerDiskInGb": 80,
+                    "volumeInGb": 0,
+                }
+
+            def terminate_pod(self, pod_id, timeout):
+                self.terminated.append(pod_id)
+
+        class UploadFailure:
+            def upload_repo(self, *args):
+                raise CommandError("source upload failed")
+
+        with tempfile.TemporaryDirectory() as temp:
+            ctl = FakeCtl()
+            with self.assertRaisesRegex(JobError, "source upload failed"):
+                run_job(
+                    self._gpu_spec(Path(temp)),
+                    ctl=ctl,  # type: ignore[arg-type]
+                    transport=UploadFailure(),  # type: ignore[arg-type]
+                    wait_fn=lambda *args, **kwargs: Endpoint("host", 2200),
+                )
+        self.assertEqual(ctl.candidates, [first])
+        self.assertEqual(ctl.terminated, ["pod-first"])
 
     def test_command_failure_still_downloads_debug_artifacts_and_terminates(self) -> None:
         class FakeCtl:

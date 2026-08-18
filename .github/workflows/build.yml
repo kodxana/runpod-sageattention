@@ -17,9 +17,9 @@ on:
           - GPU
           - CPU
       build_gpu_id:
-        description: Exact Runpod gpuId used only for GPU-backed compilation
+        description: Ordered comma-separated Runpod gpuId candidates for GPU compilation
         required: true
-        default: "NVIDIA A100 80GB PCIe"
+        default: "NVIDIA A100 80GB PCIe,NVIDIA A100-SXM4-80GB,NVIDIA H100 PCIe,NVIDIA H100 80GB HBM3,NVIDIA H100 NVL,NVIDIA H200,NVIDIA GeForce RTX 5090,NVIDIA RTX PRO 6000 Blackwell Server Edition"
         type: string
       builder_image_cu128:
         description: CUDA 12.8 builder image (immutable Docker Hub digest)
@@ -42,29 +42,29 @@ on:
         default: "runpod/comfyui@sha256:0bf75436da591e0f26d299af3741e07cb8ce8ce36566d1a7d8d78aae458e5d67"
         type: string
       gpu_id_sm80:
-        description: Exact Runpod gpuId for one SM 8.0 representative
+        description: Ordered SM 8.0-only Runpod gpuId candidates
         required: true
-        default: "NVIDIA A100 80GB PCIe"
+        default: "NVIDIA A100 80GB PCIe,NVIDIA A100-SXM4-80GB"
         type: string
       gpu_id_sm86:
-        description: Exact Runpod gpuId for one SM 8.6 representative
+        description: Ordered SM 8.6-only Runpod gpuId candidates
         required: true
-        default: "NVIDIA GeForce RTX 3090"
+        default: "NVIDIA A40,NVIDIA RTX A6000,NVIDIA GeForce RTX 3090"
         type: string
       gpu_id_sm89:
-        description: Exact Runpod gpuId for one SM 8.9 representative
+        description: Ordered SM 8.9-only Runpod gpuId candidates
         required: true
-        default: "NVIDIA GeForce RTX 4090"
+        default: "NVIDIA L40S,NVIDIA RTX 6000 Ada Generation,NVIDIA GeForce RTX 4090,NVIDIA L4"
         type: string
       gpu_id_sm90:
-        description: Exact Runpod gpuId for one SM 9.0 representative
+        description: Ordered SM 9.0-only Runpod gpuId candidates
         required: true
-        default: "NVIDIA H100 PCIe"
+        default: "NVIDIA H100 PCIe,NVIDIA H100 80GB HBM3,NVIDIA H100 NVL,NVIDIA H200"
         type: string
       gpu_id_sm120:
-        description: Exact Runpod gpuId for one SM 12.0 representative
+        description: Ordered SM 12.0-only Runpod gpuId candidates
         required: true
-        default: "NVIDIA GeForce RTX 5090"
+        default: "NVIDIA GeForce RTX 5090,NVIDIA RTX PRO 6000 Blackwell Server Edition,NVIDIA RTX PRO 6000 Blackwell Workstation Edition,NVIDIA RTX PRO 4500 Blackwell Server Edition,NVIDIA RTX PRO 4500 Blackwell"
         type: string
       cloud_type:
         description: Runpod capacity pool
@@ -130,8 +130,9 @@ on:
         default: GPU
         type: string
       build_gpu_id:
+        description: Ordered comma-separated Runpod gpuId candidates for GPU compilation
         required: false
-        default: "NVIDIA A100 80GB PCIe"
+        default: "NVIDIA A100 80GB PCIe,NVIDIA A100-SXM4-80GB,NVIDIA H100 PCIe,NVIDIA H100 80GB HBM3,NVIDIA H100 NVL,NVIDIA H200,NVIDIA GeForce RTX 5090,NVIDIA RTX PRO 6000 Blackwell Server Edition"
         type: string
       builder_image_cu128:
         required: false
@@ -151,23 +152,23 @@ on:
         type: string
       gpu_id_sm80:
         required: false
-        default: "NVIDIA A100 80GB PCIe"
+        default: "NVIDIA A100 80GB PCIe,NVIDIA A100-SXM4-80GB"
         type: string
       gpu_id_sm86:
         required: false
-        default: "NVIDIA GeForce RTX 3090"
+        default: "NVIDIA A40,NVIDIA RTX A6000,NVIDIA GeForce RTX 3090"
         type: string
       gpu_id_sm89:
         required: false
-        default: "NVIDIA GeForce RTX 4090"
+        default: "NVIDIA L40S,NVIDIA RTX 6000 Ada Generation,NVIDIA GeForce RTX 4090,NVIDIA L4"
         type: string
       gpu_id_sm90:
         required: false
-        default: "NVIDIA H100 PCIe"
+        default: "NVIDIA H100 PCIe,NVIDIA H100 80GB HBM3,NVIDIA H100 NVL,NVIDIA H200"
         type: string
       gpu_id_sm120:
         required: false
-        default: "NVIDIA GeForce RTX 5090"
+        default: "NVIDIA GeForce RTX 5090,NVIDIA RTX PRO 6000 Blackwell Server Edition,NVIDIA RTX PRO 6000 Blackwell Workstation Edition,NVIDIA RTX PRO 4500 Blackwell Server Edition,NVIDIA RTX PRO 4500 Blackwell"
         type: string
       cloud_type:
         required: false
@@ -289,19 +290,45 @@ jobs:
                   "paid Pods were not confirmed; dispatch again with "
                   "confirm_paid_pods=true"
               )
+
+          def candidates(raw, label):
+              if "\n" in raw or "\r" in raw:
+                  raise SystemExit(f"{label} contains a line break")
+              values = [item.strip() for item in raw.split(",")]
+              if not values or any(not item for item in values):
+                  raise SystemExit(f"{label} must be a nonempty comma-separated list")
+              if len(values) != len(set(values)):
+                  raise SystemExit(f"{label} contains duplicate gpuId candidates")
+              if len(values) > 8:
+                  raise SystemExit(f"{label} exceeds the eight-candidate CLI cap")
+              return values
+
           build_backend = os.environ["BUILD_BACKEND"]
-          build_gpu_id = os.environ["BUILD_GPU_ID"]
+          build_gpu_candidates = candidates(
+              os.environ["BUILD_GPU_ID"], "build_gpu_id"
+          )
           if build_backend not in {"CPU", "GPU"}:
               raise SystemExit(
                   f"build_backend must be CPU or GPU, got {build_backend!r}"
               )
-          if build_backend == "GPU" and (
-              not build_gpu_id.strip()
-              or build_gpu_id != build_gpu_id.strip()
-              or "\n" in build_gpu_id
-              or "\r" in build_gpu_id
-          ):
-              raise SystemExit("build_gpu_id must be one exact Runpod gpuId")
+          allowed_build_gpu_ids = {
+              "NVIDIA A100 80GB PCIe",
+              "NVIDIA A100-SXM4-80GB",
+              "NVIDIA H100 PCIe",
+              "NVIDIA H100 80GB HBM3",
+              "NVIDIA H100 NVL",
+              "NVIDIA H200",
+              "NVIDIA GeForce RTX 5090",
+              "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+          }
+          unexpected_build_gpu_ids = (
+              set(build_gpu_candidates) - allowed_build_gpu_ids
+          )
+          if unexpected_build_gpu_ids:
+              raise SystemExit(
+                  "build_gpu_id contains unreviewed candidates: "
+                  f"{sorted(unexpected_build_gpu_ids)!r}"
+              )
           disk = int(os.environ["CONTAINER_DISK_GB"])
           cpu_vcpus = int(os.environ["CPU_VCPU_COUNT"])
           cpu_min_memory = int(os.environ["CPU_MIN_MEMORY_GB"])
@@ -349,18 +376,58 @@ jobs:
               "12.8": (os.environ["BUILDER_CU128"], os.environ["RUNTIME_CU128"]),
               "13.0": (os.environ["BUILDER_CU130"], os.environ["RUNTIME_CU130"]),
           }
-          gpu_ids = {
-              "8.0": os.environ["GPU_SM80"],
-              "8.6": os.environ["GPU_SM86"],
-              "8.9": os.environ["GPU_SM89"],
-              "9.0": os.environ["GPU_SM90"],
-              "12.0": os.environ["GPU_SM120"],
+          gpu_candidates = {
+              "8.0": candidates(os.environ["GPU_SM80"], "gpu_id_sm80"),
+              "8.6": candidates(os.environ["GPU_SM86"], "gpu_id_sm86"),
+              "8.9": candidates(os.environ["GPU_SM89"], "gpu_id_sm89"),
+              "9.0": candidates(os.environ["GPU_SM90"], "gpu_id_sm90"),
+              "12.0": candidates(os.environ["GPU_SM120"], "gpu_id_sm120"),
           }
+          allowed_validation_gpu_ids = {
+              "8.0": {
+                  "NVIDIA A100 80GB PCIe",
+                  "NVIDIA A100-SXM4-80GB",
+              },
+              "8.6": {
+                  "NVIDIA A40",
+                  "NVIDIA RTX A6000",
+                  "NVIDIA GeForce RTX 3090",
+              },
+              "8.9": {
+                  "NVIDIA L40S",
+                  "NVIDIA RTX 6000 Ada Generation",
+                  "NVIDIA GeForce RTX 4090",
+                  "NVIDIA L4",
+              },
+              "9.0": {
+                  "NVIDIA H100 PCIe",
+                  "NVIDIA H100 80GB HBM3",
+                  "NVIDIA H100 NVL",
+                  "NVIDIA H200",
+              },
+              "12.0": {
+                  "NVIDIA GeForce RTX 5090",
+                  "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+                  "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+                  "NVIDIA RTX PRO 4500 Blackwell Server Edition",
+                  "NVIDIA RTX PRO 4500 Blackwell",
+              },
+          }
+          for capability, configured in gpu_candidates.items():
+              unexpected = set(configured) - allowed_validation_gpu_ids[capability]
+              if unexpected:
+                  raise SystemExit(
+                      "candidate list crosses its reviewed capability family "
+                      "(cross capability family or unreviewed): "
+                      f"SM {capability} contains {sorted(unexpected)!r}"
+                  )
           digest_ref = re.compile(r"^\S+@sha256:[0-9a-fA-F]{64}$")
           enforce = os.environ["ENFORCE_DIGESTS"].lower() == "true"
-          for label, value in {**{f"gpu {k}": v for k, v in gpu_ids.items()},
-                               **{f"image {k} {n}": v for k, pair in image_by_cuda.items()
-                                  for n, v in zip(("builder", "runtime"), pair)}}.items():
+          for label, value in {
+              f"image {cuda} {name}": value
+              for cuda, pair in image_by_cuda.items()
+              for name, value in zip(("builder", "runtime"), pair)
+          }.items():
               if not value or "\n" in value or "\r" in value:
                   raise SystemExit(f"missing or malformed {label} input")
           for cuda, pair in image_by_cuda.items():
@@ -381,9 +448,9 @@ jobs:
               for item in source["validation"]["representative_gpu_capabilities"]
               if item.get("required")
           ]
-          if set(required_caps) != set(gpu_ids):
+          if set(required_caps) != set(gpu_candidates):
               raise SystemExit(
-                  f"workflow GPU inputs {sorted(gpu_ids)} do not match matrix "
+                  f"workflow GPU inputs {sorted(gpu_candidates)} do not match matrix "
                   f"requirements {sorted(required_caps)}"
               )
 
@@ -401,6 +468,7 @@ jobs:
                   "min_cuda": build["minimum_cuda_scheduler_version"],
                   "build_min_vcpu_count": build_min_vcpus,
                   "build_min_memory_gb": build_min_memory_gb,
+                  "build_gpu_candidates_csv": ",".join(build_gpu_candidates),
                   "artifact_name": f"wheel-{build['id']}",
               }
               builds.append(entry)
@@ -410,7 +478,7 @@ jobs:
                       **entry,
                       "capability": capability,
                       "sm": sm,
-                      "gpu_id": gpu_ids[capability],
+                      "gpu_candidates_csv": ",".join(gpu_candidates[capability]),
                       "result_artifact": f"runtime-{build['id']}-{sm}",
                   })
 
@@ -470,7 +538,7 @@ jobs:
           BUILDER_IMAGE: ${{ matrix.builder_image }}
           MIN_CUDA: ${{ matrix.min_cuda }}
           BUILD_BACKEND: ${{ inputs.build_backend }}
-          BUILD_GPU_ID: ${{ inputs.build_gpu_id }}
+          BUILD_GPU_CANDIDATES: ${{ matrix.build_gpu_candidates_csv }}
           BUILD_MIN_VCPU_COUNT: ${{ matrix.build_min_vcpu_count }}
           BUILD_MIN_MEMORY_GB: ${{ matrix.build_min_memory_gb }}
           CLOUD_TYPE: ${{ inputs.cloud_type }}
@@ -498,7 +566,18 @@ jobs:
               backend_args=(
                 --mode gpu
                 --gpu-workload build
-                --gpu-id "${BUILD_GPU_ID}"
+              )
+              IFS=',' read -r -a raw_gpu_candidates <<< "${BUILD_GPU_CANDIDATES}"
+              for raw_candidate in "${raw_gpu_candidates[@]}"; do
+                candidate="${raw_candidate#"${raw_candidate%%[![:space:]]*}"}"
+                candidate="${candidate%"${candidate##*[![:space:]]}"}"
+                [[ -n "${candidate}" ]] || {
+                  echo "empty GPU build candidate" >&2
+                  exit 64
+                }
+                backend_args+=(--gpu-id "${candidate}")
+              done
+              backend_args+=(
                 --gpu-min-vcpu-count "${BUILD_MIN_VCPU_COUNT}"
                 --gpu-min-memory-gb "${BUILD_MIN_MEMORY_GB}"
                 --min-cuda-version "${MIN_CUDA}"
@@ -613,7 +692,7 @@ jobs:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
           BUILD_ID: ${{ matrix.build_id }}
           RUNTIME_IMAGE: ${{ matrix.runtime_image }}
-          GPU_ID: ${{ matrix.gpu_id }}
+          GPU_CANDIDATES: ${{ matrix.gpu_candidates_csv }}
           CAPABILITY: ${{ matrix.capability }}
           SM: ${{ matrix.sm }}
           MIN_CUDA: ${{ matrix.min_cuda }}
@@ -626,13 +705,24 @@ jobs:
           if [[ -n "${REGISTRY_AUTH_ID}" ]]; then
             registry_args+=(--registry-auth-id "${REGISTRY_AUTH_ID}")
           fi
+          gpu_candidate_args=()
+          IFS=',' read -r -a raw_gpu_candidates <<< "${GPU_CANDIDATES}"
+          for raw_candidate in "${raw_gpu_candidates[@]}"; do
+            candidate="${raw_candidate#"${raw_candidate%%[![:space:]]*}"}"
+            candidate="${candidate%"${candidate##*[![:space:]]}"}"
+            [[ -n "${candidate}" ]] || {
+              echo "empty GPU validation candidate" >&2
+              exit 64
+            }
+            gpu_candidate_args+=(--gpu-id "${candidate}")
+          done
           prepare="mkdir -p runtime-results/${BUILD_ID}; set -- dist/${BUILD_ID}/*.whl; test \"\$#\" -eq 1; python3.12 -m pip install --no-deps --force-reinstall \"\$1\""
           printf -v runtime_ref_q '%q' "${RUNTIME_IMAGE}"
           validate="set -- dist/${BUILD_ID}/*.whl; RUNTIME_IMAGE_REF=${runtime_ref_q} python3.12 scripts/validate-wheel.py --matrix matrix.json --build-id ${BUILD_ID} --wheel \"\$1\" --manifest dist/${BUILD_ID}/manifest.json --checksums dist/${BUILD_ID}/SHA256SUMS --runtime --expected-capability ${CAPABILITY} --runtime-report runtime-results/${BUILD_ID}/${SM}.json"
           python3.12 tools/runpod_job.py \
             --allow-paid-pod \
             --mode gpu \
-            --gpu-id "${GPU_ID}" \
+            "${gpu_candidate_args[@]}" \
             --min-cuda-version "${MIN_CUDA}" \
             --image "${RUNTIME_IMAGE}" \
             --name "sage-test-${BUILD_ID}-${SM}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \

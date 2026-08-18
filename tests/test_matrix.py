@@ -302,17 +302,29 @@ def test_workflows_prefill_reviewed_runpod_gpu_ids() -> None:
         encoding="utf-8")
     release_workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
         encoding="utf-8")
-    defaults = {
-        "NVIDIA A100 80GB PCIe": (4, 2),
-        "NVIDIA GeForce RTX 3090": (2, 1),
-        "NVIDIA GeForce RTX 4090": (2, 1),
-        "NVIDIA H100 PCIe": (2, 1),
-        "NVIDIA GeForce RTX 5090": (2, 1),
-    }
-    for gpu_id, (build_count, release_count) in defaults.items():
-        default = f'default: "{gpu_id}"'
-        assert build_workflow.count(default) == build_count
-        assert release_workflow.count(default) == release_count
+    defaults = (
+        "NVIDIA A100 80GB PCIe,NVIDIA A100-SXM4-80GB,NVIDIA H100 PCIe,"
+        "NVIDIA H100 80GB HBM3,NVIDIA H100 NVL,NVIDIA H200,"
+        "NVIDIA GeForce RTX 5090,NVIDIA RTX PRO 6000 Blackwell Server Edition",
+        "NVIDIA A100 80GB PCIe,NVIDIA A100-SXM4-80GB",
+        "NVIDIA A40,NVIDIA RTX A6000,NVIDIA GeForce RTX 3090",
+        "NVIDIA L40S,NVIDIA RTX 6000 Ada Generation,"
+        "NVIDIA GeForce RTX 4090,NVIDIA L4",
+        "NVIDIA H100 PCIe,NVIDIA H100 80GB HBM3,NVIDIA H100 NVL,NVIDIA H200",
+        "NVIDIA GeForce RTX 5090,NVIDIA RTX PRO 6000 Blackwell Server Edition,"
+        "NVIDIA RTX PRO 6000 Blackwell Workstation Edition,"
+        "NVIDIA RTX PRO 4500 Blackwell Server Edition,NVIDIA RTX PRO 4500 Blackwell",
+    )
+    for candidates in defaults:
+        default = f'default: "{candidates}"'
+        assert build_workflow.count(default) == 2
+        assert release_workflow.count(default) == 1
+    assert 'backend_args+=(--gpu-id "${candidate}")' in build_workflow
+    assert 'gpu_candidate_args+=(--gpu-id "${candidate}")' in build_workflow
+    assert "allowed_validation_gpu_ids" in build_workflow
+    assert "cross capability family" in build_workflow
+    assert "NVIDIA RTX A4500" not in build_workflow
+    assert "NVIDIA RTX A4500" not in release_workflow
     assert build_workflow.count("default: GPU") == 2
     assert release_workflow.count("default: GPU") == 1
     assert "max-parallel: 1" in build_workflow
@@ -327,6 +339,9 @@ def test_build_hides_gpu_before_import_and_records_visibility() -> None:
         "import torch")
     assert '"cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES")' in build_script
     assert 'build_evidence["cuda_visible_devices"] == ""' in validator
+    assert 'os.environ.get("RUNPOD_SELECTED_GPU_ID") or None' in build_script
+    assert '"selected_gpu_id": selected_gpu_id' in build_script
+    assert 'build_evidence["selected_gpu_id"]' in validator
 
 
 class MatrixTests(unittest.TestCase):

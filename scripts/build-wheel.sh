@@ -435,6 +435,14 @@ builder_ref = os.environ["BUILDER_IMAGE_REF"] or None
 builder_digest = os.environ["BUILDER_IMAGE_DIGEST"] or None
 if builder_digest is None and builder_ref and "@sha256:" in builder_ref:
     builder_digest = builder_ref.split("@", 1)[1]
+selected_gpu_id = os.environ.get("RUNPOD_SELECTED_GPU_ID") or None
+if selected_gpu_id is not None and (
+    selected_gpu_id != selected_gpu_id.strip()
+    or "\n" in selected_gpu_id
+    or "\r" in selected_gpu_id
+    or "," in selected_gpu_id
+):
+    raise SystemExit("RUNPOD_SELECTED_GPU_ID must be one exact Runpod gpuId")
 evidence = {
     "builder_image": {
         "digest": builder_digest,
@@ -451,6 +459,7 @@ evidence = {
     "patch_sha256": sha256(os.environ["PATCH_FILE"]),
     "resource_end": json.loads(os.environ["RESOURCE_END_JSON"]),
     "resource_start": json.loads(os.environ["RESOURCE_START_JSON"]),
+    "selected_gpu_id": selected_gpu_id,
     "selected_parallelism": {
         "extension_parallelism": int(os.environ["EXT_PARALLEL"]),
         "max_jobs": int(os.environ["MAX_JOBS"]),

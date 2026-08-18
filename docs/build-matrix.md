@@ -26,7 +26,13 @@ The wheel contains native SASS only. No PTX fallback is included. The requested 
 
 The upstream dispatcher uses the SM80 CUDA path on SM80, Triton on SM86, the SM89 CUDA path on SM89 and SM120, and the dedicated SM90 path on SM90. The wider matrix above intentionally preserves explicitly callable public CUDA APIs as well as the automatic dispatcher.
 
-Runtime validation is prefilled with exact Runpod `gpuId` values: `NVIDIA A100 80GB PCIe` (SM80), `NVIDIA GeForce RTX 3090` (SM86), `NVIDIA GeForce RTX 4090` (SM89), `NVIDIA H100 PCIe` (SM90), and `NVIDIA GeForce RTX 5090` (SM120). B200 (SM100) and B300 (SM103) are excluded because SageAttention 2.2.0 has no SM10x cubins or dispatcher path; an SM120 result is not compatible with either data-center architecture.
+Runtime validation uses ordered exact Runpod `gpuId` lists restricted to one
+capability per job: SM80, SM86, SM89, SM90, and SM120. The complete reviewed
+lists and live-catalog caveats are in
+[`runpod-orchestration.md`](runpod-orchestration.md#ordered-gpu-candidates).
+B200 (SM100) and B300 (SM103) are excluded because SageAttention 2.2.0 has no
+SM10x cubins or dispatcher path; an SM120 result is not compatible with either
+data-center architecture.
 
 ## Builder images
 
@@ -50,7 +56,15 @@ The factory schedules compilation on a GPU Pod by default, but `build-wheel.sh` 
 
 The matrix field `resources.gpu_required=false` describes the build command's compute behavior, not the default Runpod provisioning backend. It remains false because compilation never launches a GPU kernel.
 
-The cu128 and cu130 builders run sequentially. `NVIDIA A100 80GB PCIe` is the prefilled Runpod build `gpuId`; its architecture and VRAM are irrelevant to compilation because the GPU is hidden. The host driver must still satisfy the matching CUDA scheduler floor so the container can start. Before source upload, orchestration verifies the exact GPU assignment, the matrix floor of 4 effective vCPUs, 32 GB system RAM, and an 80 GB container disk; 16 vCPUs and 64 GB system RAM remain recommended. The in-Pod cgroup preflight then independently verifies usable resources.
+The cu128 and cu130 builders run sequentially. Their ordered Runpod build
+candidates begin with `NVIDIA A100 80GB PCIe` and may span architectures; GPU
+architecture and VRAM are irrelevant to compilation because the accelerator is
+hidden. The host driver must still satisfy the matching CUDA scheduler floor so
+the container can start. Before source upload, orchestration verifies the exact
+selected GPU assignment, the matrix floor of 4 effective vCPUs, 32 GB system
+RAM, and an 80 GB container disk; 16 vCPUs and 64 GB system RAM remain
+recommended. The in-Pod cgroup preflight then independently verifies usable
+resources.
 
 Run one matrix entry inside its matching builder:
 
@@ -63,7 +77,10 @@ bash /workspace/scripts/build-wheel.sh \
 The output directory must initially be empty. It receives exactly:
 
 - the exact wheel named by `matrix.json`;
-- `manifest.json` with compatibility, cubin coverage, hashes, tool versions, matrix and patch hashes, image identity, resource snapshots, selected parallelism, elapsed time, and cgroup peak evidence;
+- `manifest.json` with compatibility, cubin coverage, hashes, tool versions,
+  matrix and patch hashes, image identity, resource snapshots, selected
+  parallelism, elapsed time, cgroup peak evidence, and the selected exact build
+  `gpuId` for GPU-backed builds (JSON `null` for CPU fallback builds);
 - `SHA256SUMS` containing exactly that wheel.
 
 The system-resource preflight refuses an unlimited or undersized container. `ALLOW_LOW_RESOURCES=1` is an explicit escape hatch for diagnostics, not release builds. The build script is the sole authority for its cgroup-aware `MAX_JOBS` default; the SSH entrypoint does not precompute it. Values above the reviewed `MAX_JOBS=2` and `EXT_PARALLEL=1` caps are rejected unless `ALLOW_UNSAFE_PARALLELISM=1` is explicitly set on a larger Pod. Set `BUILDER_IMAGE_REF` and `BUILDER_IMAGE_DIGEST` in release jobs so the immutable builder identity is captured.

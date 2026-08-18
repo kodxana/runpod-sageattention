@@ -325,6 +325,7 @@ def validate(
             "patch_sha256",
             "resource_end",
             "resource_start",
+            "selected_gpu_id",
             "selected_parallelism",
             "tool_versions",
         }
@@ -332,6 +333,19 @@ def validate(
                 f"build evidence is incomplete: missing {sorted(required_evidence - set(build_evidence))}")
         require(build_evidence["cuda_visible_devices"] == "",
                 "build evidence does not prove that the GPU was hidden")
+        selected_gpu_id = build_evidence["selected_gpu_id"]
+        require(
+            selected_gpu_id is None
+            or (
+                isinstance(selected_gpu_id, str)
+                and bool(selected_gpu_id)
+                and selected_gpu_id == selected_gpu_id.strip()
+                and "\n" not in selected_gpu_id
+                and "\r" not in selected_gpu_id
+                and "," not in selected_gpu_id
+            ),
+            "build evidence selected_gpu_id is malformed",
+        )
         patch_path = (
             matrix_path.parent / "patches" / "sageattention"
             / package["upstream_version"] / "setup.py.patch"

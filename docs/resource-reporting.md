@@ -9,7 +9,10 @@ SageAttention builders are GPU-backed, but the build hides the accelerator with
 `CUDA_VISIBLE_DEVICES=""`. Resource policy therefore concerns the Pod's
 host-system vCPU, system RAM, and container disk—not GPU utilization or VRAM.
 The attached GPU type is a scheduling choice and cannot substitute for a finite
-system-memory cgroup limit.
+system-memory cgroup limit. Ordered builder fallbacks may therefore span GPU
+architectures, but every selected candidate is still subject to the same
+assignment and cgroup checks; candidate ordering must never be based on VRAM as
+a proxy for system RAM.
 
 This repository handles the problem in two layers:
 
