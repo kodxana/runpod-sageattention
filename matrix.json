@@ -76,6 +76,12 @@
       ]
     }
   },
+  "build_frontend": {
+    "build": "1.2.2.post1",
+    "packaging": "25.0",
+    "setuptools": "80.9.0",
+    "wheel": "0.45.1"
+  },
   "resources": {
     "gpu_required": false,
     "minimum_cpus": 4,

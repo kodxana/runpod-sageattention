@@ -103,6 +103,7 @@ package = matrix["package"]
 platform = matrix["platform"]
 policy = matrix["cuda_policy"]
 resources = matrix["resources"]
+build_frontend = matrix["build_frontend"]
 values = [
     package["source_url"],
     package["source_commit"],
@@ -124,6 +125,10 @@ values = [
     str(resources["default_max_jobs"]),
     str(resources["default_extension_parallelism"]),
     str(resources["compiler_memory_per_job_mib"]),
+    build_frontend["build"],
+    build_frontend["packaging"],
+    build_frontend["setuptools"],
+    build_frontend["wheel"],
 ]
 if any("\n" in value or "\r" in value for value in values):
     raise SystemExit("matrix values must be single-line strings")
@@ -131,7 +136,7 @@ print("\n".join(values))
 PY
 )
 
-if [[ ${#MATRIX_VALUES[@]} -ne 20 ]]; then
+if [[ ${#MATRIX_VALUES[@]} -ne 24 ]]; then
     echo "Could not read a complete build definition from ${MATRIX_PATH}" >&2
     exit 65
 fi
@@ -156,6 +161,10 @@ MIN_DISK_GIB="${MATRIX_VALUES[16]}"
 DEFAULT_MAX_JOBS="${MATRIX_VALUES[17]}"
 DEFAULT_EXT_PARALLEL="${MATRIX_VALUES[18]}"
 COMPILER_MEMORY_PER_JOB_MIB="${MATRIX_VALUES[19]}"
+BUILD_FRONTEND_BUILD="${MATRIX_VALUES[20]}"
+BUILD_FRONTEND_PACKAGING="${MATRIX_VALUES[21]}"
+BUILD_FRONTEND_SETUPTOOLS="${MATRIX_VALUES[22]}"
+BUILD_FRONTEND_WHEEL="${MATRIX_VALUES[23]}"
 
 if [[ "${TORCH_CUDA_ARCH_LIST}" == *"+PTX"* || "${TORCH_CUDA_ARCH_LIST}" == *" "* ]]; then
     echo "Architecture list must be semicolon-delimited native SASS targets: ${TORCH_CUDA_ARCH_LIST}" >&2
@@ -301,13 +310,35 @@ if [[ -n "${BUILDER_TORCH_VERSION:-}" && "${BUILDER_TORCH_VERSION}" != "${TORCH_
     exit 65
 fi
 
+EXPECTED_BUILD_FRONTEND_BUILD="${BUILD_FRONTEND_BUILD}" \
+EXPECTED_BUILD_FRONTEND_PACKAGING="${BUILD_FRONTEND_PACKAGING}" \
+EXPECTED_BUILD_FRONTEND_SETUPTOOLS="${BUILD_FRONTEND_SETUPTOOLS}" \
+EXPECTED_BUILD_FRONTEND_WHEEL="${BUILD_FRONTEND_WHEEL}" \
 EXPECTED_PYTHON="${PYTHON_VERSION}" EXPECTED_TORCH="${TORCH_VERSION}" \
 EXPECTED_TORCH_CUDA="${TORCH_CUDA_VERSION}" EXPECTED_CUDA="${CUDA_VERSION}" python3.12 - <<'PY'
+import importlib.metadata
 import os
 import re
 import subprocess
 import sys
 import torch
+
+expected_frontend = {
+    "build": os.environ["EXPECTED_BUILD_FRONTEND_BUILD"],
+    "packaging": os.environ["EXPECTED_BUILD_FRONTEND_PACKAGING"],
+    "setuptools": os.environ["EXPECTED_BUILD_FRONTEND_SETUPTOOLS"],
+    "wheel": os.environ["EXPECTED_BUILD_FRONTEND_WHEEL"],
+}
+for distribution, expected in expected_frontend.items():
+    try:
+        actual = importlib.metadata.version(distribution)
+    except importlib.metadata.PackageNotFoundError:
+        actual = "<missing>"
+    if actual != expected:
+        raise SystemExit(
+            f"build frontend mismatch for {distribution}: "
+            f"expected {expected}, got {actual}"
+        )
 
 python_version = f"{sys.version_info.major}.{sys.version_info.minor}"
 if python_version != os.environ["EXPECTED_PYTHON"]:
@@ -474,6 +505,7 @@ evidence = {
         "build": importlib.metadata.version("build"),
         "gcc": subprocess.check_output(["gcc", "-dumpfullversion"], text=True).strip(),
         "nvcc": nvcc_release.group(1) if nvcc_release else nvcc_output.strip(),
+        "packaging": importlib.metadata.version("packaging"),
         "python": platform.python_version(),
         "setuptools": importlib.metadata.version("setuptools"),
         "torch": importlib.metadata.version("torch"),

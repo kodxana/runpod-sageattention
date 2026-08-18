@@ -9,6 +9,10 @@ ARG TORCH_CUDA_VERSION
 ARG TORCH_INDEX_SUFFIX
 ARG PYTHON_VERSION
 ARG NVCC_TARGETS
+ARG BUILD_VERSION
+ARG PACKAGING_VERSION
+ARG SETUPTOOLS_VERSION
+ARG WHEEL_VERSION
 ARG CUDA_KEYRING_SHA256=d2a6b11c096396d868758b86dab1823b25e14d70333f1dfa74da5ddaf6a06dba
 ARG RUNPODCTL_VERSION=v2.3.0
 ARG RUNPODCTL_SHA256=908f2210571e8a26a1cba6fb45f09556b34dcad3e1b20dd502df2adf7a57c169
@@ -33,7 +37,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
     BUILDER_TORCH_CUDA_VERSION=${TORCH_CUDA_VERSION} \
     BUILDER_TORCH_INDEX_SUFFIX=${TORCH_INDEX_SUFFIX} \
     BUILDER_PYTHON_VERSION=${PYTHON_VERSION} \
-    BUILDER_NVCC_TARGETS=${NVCC_TARGETS}
+    BUILDER_NVCC_TARGETS=${NVCC_TARGETS} \
+    BUILDER_BUILD_VERSION=${BUILD_VERSION} \
+    BUILDER_PACKAGING_VERSION=${PACKAGING_VERSION} \
+    BUILDER_SETUPTOOLS_VERSION=${SETUPTOOLS_VERSION} \
+    BUILDER_WHEEL_VERSION=${WHEEL_VERSION}
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -43,7 +51,11 @@ RUN test -n "${CUDA_VERSION}" \
     && test -n "${TORCH_CUDA_VERSION}" \
     && test -n "${TORCH_INDEX_SUFFIX}" \
     && test -n "${PYTHON_VERSION}" \
-    && test -n "${NVCC_TARGETS}"
+    && test -n "${NVCC_TARGETS}" \
+    && test -n "${BUILD_VERSION}" \
+    && test -n "${PACKAGING_VERSION}" \
+    && test -n "${SETUPTOOLS_VERSION}" \
+    && test -n "${WHEEL_VERSION}"
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -103,10 +115,10 @@ ENV VIRTUAL_ENV=/opt/sageattention-builder-venv \
 RUN /usr/bin/python3.12 -m venv "${VIRTUAL_ENV}" \
     && "${VIRTUAL_ENV}/bin/python" -m pip install --upgrade "pip==26.1.2" \
     && "${VIRTUAL_ENV}/bin/python" -m pip install \
-        "build==1.2.2.post1" \
-        "packaging==25.0" \
-        "setuptools==80.9.0" \
-        "wheel==0.45.1" \
+        "build==${BUILD_VERSION}" \
+        "packaging==${PACKAGING_VERSION}" \
+        "setuptools==${SETUPTOOLS_VERSION}" \
+        "wheel==${WHEEL_VERSION}" \
     && "${VIRTUAL_ENV}/bin/python" -m pip install \
         --index-url https://pypi.org/simple \
         --extra-index-url "https://download.pytorch.org/whl/${TORCH_INDEX_SUFFIX}" \
@@ -126,7 +138,11 @@ RUN chmod 0755 \
         --torch-version "${TORCH_VERSION}" \
         --torch-cuda-version "${TORCH_CUDA_VERSION}" \
         --python-version "${PYTHON_VERSION}" \
-        --nvcc-targets "${NVCC_TARGETS}"
+        --nvcc-targets "${NVCC_TARGETS}" \
+        --build-version "${BUILD_VERSION}" \
+        --packaging-version "${PACKAGING_VERSION}" \
+        --setuptools-version "${SETUPTOOLS_VERSION}" \
+        --wheel-version "${WHEEL_VERSION}"
 
 RUN install -d -m 0700 /root/.ssh \
     && install -d -m 0755 /run/sshd /workspace /work \

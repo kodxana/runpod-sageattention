@@ -28,6 +28,11 @@ Required options (or matching BUILDER_* environment variables):
   --python-version VERSION     Python major.minor version, for example 3.12
   --nvcc-targets LIST          Semicolon-delimited native targets, for example
                                sm_80;sm_86;sm_89;sm_90a;sm_120
+Optional as a complete set (defaults to matching BUILDER_* metadata):
+  --build-version VERSION      Exact build frontend version
+  --packaging-version VERSION  Exact packaging version
+  --setuptools-version VERSION Exact setuptools version
+  --wheel-version VERSION      Exact wheel version
 EOF
 }
 
@@ -36,6 +41,10 @@ EXPECTED_TORCH_VERSION="${BUILDER_TORCH_VERSION:-}"
 EXPECTED_TORCH_CUDA_VERSION="${BUILDER_TORCH_CUDA_VERSION:-}"
 EXPECTED_PYTHON_VERSION="${BUILDER_PYTHON_VERSION:-}"
 NVCC_TARGETS="${BUILDER_NVCC_TARGETS:-}"
+EXPECTED_BUILD_VERSION="${BUILDER_BUILD_VERSION:-}"
+EXPECTED_PACKAGING_VERSION="${BUILDER_PACKAGING_VERSION:-}"
+EXPECTED_SETUPTOOLS_VERSION="${BUILDER_SETUPTOOLS_VERSION:-}"
+EXPECTED_WHEEL_VERSION="${BUILDER_WHEEL_VERSION:-}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -57,6 +66,22 @@ while [[ $# -gt 0 ]]; do
             ;;
         --nvcc-targets)
             NVCC_TARGETS="${2:?missing value for --nvcc-targets}"
+            shift 2
+            ;;
+        --build-version)
+            EXPECTED_BUILD_VERSION="${2:?missing value for --build-version}"
+            shift 2
+            ;;
+        --packaging-version)
+            EXPECTED_PACKAGING_VERSION="${2:?missing value for --packaging-version}"
+            shift 2
+            ;;
+        --setuptools-version)
+            EXPECTED_SETUPTOOLS_VERSION="${2:?missing value for --setuptools-version}"
+            shift 2
+            ;;
+        --wheel-version)
+            EXPECTED_WHEEL_VERSION="${2:?missing value for --wheel-version}"
             shift 2
             ;;
         -h|--help)
@@ -96,6 +121,21 @@ done
     exit 64
 }
 
+BUILD_FRONTEND_EXPECTATIONS=(
+    "${EXPECTED_BUILD_VERSION}"
+    "${EXPECTED_PACKAGING_VERSION}"
+    "${EXPECTED_SETUPTOOLS_VERSION}"
+    "${EXPECTED_WHEEL_VERSION}"
+)
+BUILD_FRONTEND_EXPECTATION_COUNT=0
+for expectation in "${BUILD_FRONTEND_EXPECTATIONS[@]}"; do
+    [[ -z "${expectation}" ]] || ((BUILD_FRONTEND_EXPECTATION_COUNT += 1))
+done
+if (( BUILD_FRONTEND_EXPECTATION_COUNT != 0 && BUILD_FRONTEND_EXPECTATION_COUNT != 4 )); then
+    echo "Build frontend versions must be provided together as one exact set" >&2
+    exit 64
+fi
+
 for required_command in git gcc g++ ninja patch nvcc ptxas cuobjdump python3.12; do
     command -v "${required_command}" >/dev/null 2>&1 || {
         echo "Builder image is missing required command: ${required_command}" >&2
@@ -134,13 +174,17 @@ for metadata in \
     "BUILDER_TORCH_VERSION:${EXPECTED_TORCH_VERSION}" \
     "BUILDER_TORCH_CUDA_VERSION:${EXPECTED_TORCH_CUDA_VERSION}" \
     "BUILDER_PYTHON_VERSION:${EXPECTED_PYTHON_VERSION}" \
-    "BUILDER_NVCC_TARGETS:${NVCC_TARGETS}"; do
+    "BUILDER_NVCC_TARGETS:${NVCC_TARGETS}" \
+    "BUILDER_BUILD_VERSION:${EXPECTED_BUILD_VERSION}" \
+    "BUILDER_PACKAGING_VERSION:${EXPECTED_PACKAGING_VERSION}" \
+    "BUILDER_SETUPTOOLS_VERSION:${EXPECTED_SETUPTOOLS_VERSION}" \
+    "BUILDER_WHEEL_VERSION:${EXPECTED_WHEEL_VERSION}"; do
     name="${metadata%%:*}"
     expected="${metadata#*:}"
     actual="${!name:-}"
-    # PYTHON_VERSION and NVCC_TARGETS were added after the first published
-    # digests. Their absence is acceptable because the independent runtime
-    # checks below prove the tuple; a declared contradictory value is not.
+    # These metadata fields were expanded after the first published digests.
+    # Their absence is acceptable because the independent runtime checks below
+    # prove the tuple; a declared contradictory value is not.
     if [[ -n "${actual}" && "${actual}" != "${expected}" ]]; then
         echo "Builder image metadata mismatch for ${name}: expected ${expected}, got ${actual}" >&2
         exit 65
@@ -151,7 +195,12 @@ EXPECTED_PYTHON_VERSION="${EXPECTED_PYTHON_VERSION}" \
 EXPECTED_TORCH_VERSION="${EXPECTED_TORCH_VERSION}" \
 EXPECTED_TORCH_CUDA_VERSION="${EXPECTED_TORCH_CUDA_VERSION}" \
 EXPECTED_CUDA_HOME="$(readlink -f -- "${CUDA_HOME}")" \
+EXPECTED_BUILD_VERSION="${EXPECTED_BUILD_VERSION}" \
+EXPECTED_PACKAGING_VERSION="${EXPECTED_PACKAGING_VERSION}" \
+EXPECTED_SETUPTOOLS_VERSION="${EXPECTED_SETUPTOOLS_VERSION}" \
+EXPECTED_WHEEL_VERSION="${EXPECTED_WHEEL_VERSION}" \
 python3.12 - <<'PY'
+import importlib.metadata
 import os
 import pathlib
 import sys
@@ -189,6 +238,25 @@ if actual_cuda_home != expected_cuda_home:
         f"PyTorch CUDA_HOME mismatch: expected {expected_cuda_home}, "
         f"got {actual_cuda_home}"
     )
+
+expected_build_frontend = {
+    "build": os.environ["EXPECTED_BUILD_VERSION"],
+    "packaging": os.environ["EXPECTED_PACKAGING_VERSION"],
+    "setuptools": os.environ["EXPECTED_SETUPTOOLS_VERSION"],
+    "wheel": os.environ["EXPECTED_WHEEL_VERSION"],
+}
+for distribution, expected_version in expected_build_frontend.items():
+    if not expected_version:
+        continue
+    try:
+        actual_version = importlib.metadata.version(distribution)
+    except importlib.metadata.PackageNotFoundError:
+        raise SystemExit(f"{distribution} is not installed") from None
+    if actual_version != expected_version:
+        raise SystemExit(
+            f"{distribution} mismatch: expected {expected_version}, "
+            f"got {actual_version}"
+        )
 PY
 
 require_cuda_file() {
@@ -279,3 +347,10 @@ printf '%s\n' \
     "  PyTorch CUDA: ${EXPECTED_TORCH_CUDA_VERSION}" \
     "  CUDA toolkit: ${EXPECTED_CUDA_VERSION}" \
     "  NVCC targets: ${NVCC_TARGETS}"
+if (( BUILD_FRONTEND_EXPECTATION_COUNT == 4 )); then
+    printf '%s\n' \
+        "  build: ${EXPECTED_BUILD_VERSION}" \
+        "  packaging: ${EXPECTED_PACKAGING_VERSION}" \
+        "  setuptools: ${EXPECTED_SETUPTOOLS_VERSION}" \
+        "  wheel: ${EXPECTED_WHEEL_VERSION}"
+fi

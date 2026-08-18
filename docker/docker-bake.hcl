@@ -15,8 +15,12 @@ target "builder-common" {
   dockerfile = "docker/Dockerfile.builder"
   platforms  = ["linux/amd64"]
   args = {
-    PYTHON_VERSION = "3.12"
-    NVCC_TARGETS   = "sm_80;sm_86;sm_89;sm_90a;sm_120"
+    PYTHON_VERSION     = "3.12"
+    NVCC_TARGETS       = "sm_80;sm_86;sm_89;sm_90a;sm_120"
+    BUILD_VERSION      = "1.2.2.post1"
+    PACKAGING_VERSION  = "25.0"
+    SETUPTOOLS_VERSION = "80.9.0"
+    WHEEL_VERSION      = "0.45.1"
   }
 }
 

@@ -161,3 +161,17 @@ diff --git a/setup.py b/setup.py
      python_requires='>=3.9',
      ext_modules=ext_modules,
      cmdclass=cmdclass,
+diff --git a/pyproject.toml b/pyproject.toml
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,7 +1,7 @@
+ [build-system]
+ requires = [
+-  "setuptools>=62,<75",
+-  "wheel>=0.38,<0.44",
+-  "packaging>=21,<24",
++  "setuptools==80.9.0",
++  "wheel==0.45.1",
++  "packaging==25.0",
+ ]
+ build-backend = "setuptools.build_meta"

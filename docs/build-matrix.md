@@ -44,12 +44,25 @@ docker buildx bake -f docker/docker-bake.hcl builder-cu128 builder-cu130
 
 The images install Ubuntu 24.04 build tools, Python 3.12 headers, CUDA compiler/runtime development packages, cuBLAS, cuSOLVER, cuSPARSE, `cuobjdump`, PyTorch, and the wheel inspection tools. The CUDA keyring package is verified against its pinned SHA-256 before installation. CUDA driver stubs are available through `LIBRARY_PATH` solely for linking the Hopper extension; they are neither placed on runtime `LD_LIBRARY_PATH` nor packaged in a wheel.
 
+The pinned upstream `pyproject.toml` caps older packaging tools, while the
+reviewed builder images already contain `build==1.2.2.post1`,
+`packaging==25.0`, `setuptools==80.9.0`, and `wheel==0.45.1`. The downstream
+patch replaces those upstream ranges with this exact matrix-owned frontend.
+The build keeps PyPA's normal no-isolation dependency check enabled; it does
+not bypass or suppress the resulting contract validation. This also lets the
+existing immutable builder digests work without downloading or downgrading
+packaging tools on a short-lived Pod.
+
 Image construction finishes by running `validate-builder-image` without a GPU.
 The probe checks the exact Python, PyTorch, PyTorch-CUDA, and NVCC versions,
+the matrix-pinned `build`, `packaging`, `setuptools`, and `wheel` frontend,
 required compiler commands, CUDA headers and development libraries, the driver
 link stub, and a real NVCC/ptxas/cuobjdump compile for every reviewed native
-target. The same command can be run on a CI host before provisioning a paid
-builder Pod; failure means the image digest must not be dispatched to Runpod.
+target. Older published digests do not declare the newer frontend metadata, so
+the validator accepts its absence but still verifies explicitly supplied
+expected versions against the installed distributions. The same command can be
+run on a CI host before provisioning a paid builder Pod; failure means the image
+digest must not be dispatched to Runpod.
 
 Runpod SSH commands start with OpenSSH's system-only `PATH`, so they do not
 automatically see the Docker image's CUDA or virtual-environment path entries.

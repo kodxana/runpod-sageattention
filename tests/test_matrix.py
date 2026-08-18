@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -286,9 +287,23 @@ def test_docker_bake_pins_both_toolchains() -> None:
     assert "COPY scripts/validate-builder-image.sh" in dockerfile
     assert "COPY scripts/activate-builder.sh" in dockerfile
     assert "/usr/local/bin/validate-builder-image" in dockerfile
-    assert 'PYTHON_VERSION = "3.12"' in bake
+    assert re.search(r'PYTHON_VERSION\s*=\s*"3\.12"', bake)
     expected_nvcc_targets = "sm_80;sm_86;sm_89;sm_90a;sm_120"
-    assert f'NVCC_TARGETS   = "{expected_nvcc_targets}"' in bake
+    assert re.search(
+        rf'NVCC_TARGETS\s*=\s*"{re.escape(expected_nvcc_targets)}"', bake)
+    bake_frontend_args = {
+        "build": "BUILD_VERSION",
+        "packaging": "PACKAGING_VERSION",
+        "setuptools": "SETUPTOOLS_VERSION",
+        "wheel": "WHEEL_VERSION",
+    }
+    for distribution, argument in bake_frontend_args.items():
+        expected_version = MATRIX["build_frontend"][distribution]
+        assert re.search(
+            rf'{argument}\s*=\s*"{re.escape(expected_version)}"', bake)
+        assert f'"{distribution}==${{{argument}}}"' in dockerfile
+        assert f"BUILDER_{argument}=${{{argument}}}" in dockerfile
+        assert f'--{distribution}-version "${{{argument}}}"' in dockerfile
     expected_compile_targets = {
         target
         for targets in MATRIX["cuda_policy"]["extension_compile_targets"].values()
