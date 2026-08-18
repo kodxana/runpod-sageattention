@@ -157,27 +157,30 @@ jobs:
     uses: ./.github/workflows/build.yml
     with:
       source_ref: ${{ needs.preflight.outputs.source_sha }}
-      build_backend: ${{ inputs.build_backend }}
-      build_gpu_id: ${{ inputs.build_gpu_id }}
-      builder_image_cu128: ${{ inputs.builder_image_cu128 }}
-      builder_image_cu130: ${{ inputs.builder_image_cu130 }}
-      runtime_image_cu128: ${{ inputs.runtime_image_cu128 }}
-      runtime_image_cu130: ${{ inputs.runtime_image_cu130 }}
-      gpu_id_sm80: ${{ inputs.gpu_id_sm80 }}
-      gpu_id_sm86: ${{ inputs.gpu_id_sm86 }}
-      gpu_id_sm89: ${{ inputs.gpu_id_sm89 }}
-      gpu_id_sm90: ${{ inputs.gpu_id_sm90 }}
-      gpu_id_sm120: ${{ inputs.gpu_id_sm120 }}
-      cloud_type: ${{ inputs.cloud_type }}
-      registry_auth_id: ${{ inputs.registry_auth_id }}
-      container_disk_gb: ${{ inputs.container_disk_gb }}
-      cpu_flavor_ids: ${{ inputs.cpu_flavor_ids }}
-      cpu_vcpu_count: ${{ inputs.cpu_vcpu_count }}
-      cpu_min_memory_gb: ${{ inputs.cpu_min_memory_gb }}
-      timeout_seconds: ${{ inputs.timeout_seconds }}
-      gpu_max_parallel: ${{ inputs.gpu_max_parallel }}
+      # Reusable-call inputs only allow the github and needs expression
+      # contexts. github.event.inputs is string-valued, so preserve the
+      # declared workflow_call number/boolean types with fromJSON.
+      build_backend: ${{ github.event.inputs.build_backend }}
+      build_gpu_id: ${{ github.event.inputs.build_gpu_id }}
+      builder_image_cu128: ${{ github.event.inputs.builder_image_cu128 }}
+      builder_image_cu130: ${{ github.event.inputs.builder_image_cu130 }}
+      runtime_image_cu128: ${{ github.event.inputs.runtime_image_cu128 }}
+      runtime_image_cu130: ${{ github.event.inputs.runtime_image_cu130 }}
+      gpu_id_sm80: ${{ github.event.inputs.gpu_id_sm80 }}
+      gpu_id_sm86: ${{ github.event.inputs.gpu_id_sm86 }}
+      gpu_id_sm89: ${{ github.event.inputs.gpu_id_sm89 }}
+      gpu_id_sm90: ${{ github.event.inputs.gpu_id_sm90 }}
+      gpu_id_sm120: ${{ github.event.inputs.gpu_id_sm120 }}
+      cloud_type: ${{ github.event.inputs.cloud_type }}
+      registry_auth_id: ${{ github.event.inputs.registry_auth_id }}
+      container_disk_gb: ${{ fromJSON(github.event.inputs.container_disk_gb) }}
+      cpu_flavor_ids: ${{ github.event.inputs.cpu_flavor_ids }}
+      cpu_vcpu_count: ${{ fromJSON(github.event.inputs.cpu_vcpu_count) }}
+      cpu_min_memory_gb: ${{ fromJSON(github.event.inputs.cpu_min_memory_gb) }}
+      timeout_seconds: ${{ fromJSON(github.event.inputs.timeout_seconds) }}
+      gpu_max_parallel: ${{ fromJSON(github.event.inputs.gpu_max_parallel) }}
       enforce_image_digests: true
-      confirm_paid_pods: ${{ inputs.confirm_paid_pods }}
+      confirm_paid_pods: ${{ fromJSON(github.event.inputs.confirm_paid_pods) }}
     secrets:
       RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
       RUNPOD_SSH_PRIVATE_KEY: ${{ secrets.RUNPOD_SSH_PRIVATE_KEY }}

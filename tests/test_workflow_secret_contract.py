@@ -44,6 +44,57 @@ class WorkflowSecretContractTests(unittest.TestCase):
             factory,
         )
 
+    def test_release_call_uses_supported_expression_contexts_and_types(self) -> None:
+        factory = self.release.split("  factory:\n", 1)[1].split(
+            "\n  publish:\n", 1
+        )[0]
+        call_inputs = factory.split("    with:\n", 1)[1].split(
+            "\n    secrets:\n", 1
+        )[0]
+
+        # GitHub permits only github and needs in jobs.<job_id>.with.<input_id>
+        # for reusable-workflow calls. The typed inputs context is not legal here.
+        self.assertNotIn("${{ inputs.", call_inputs)
+        self.assertIn(
+            "source_ref: ${{ needs.preflight.outputs.source_sha }}", call_inputs
+        )
+
+        numeric_or_boolean = {
+            "container_disk_gb",
+            "cpu_vcpu_count",
+            "cpu_min_memory_gb",
+            "timeout_seconds",
+            "gpu_max_parallel",
+            "confirm_paid_pods",
+        }
+        string_inputs = {
+            "build_backend",
+            "build_gpu_id",
+            "builder_image_cu128",
+            "builder_image_cu130",
+            "runtime_image_cu128",
+            "runtime_image_cu130",
+            "gpu_id_sm80",
+            "gpu_id_sm86",
+            "gpu_id_sm89",
+            "gpu_id_sm90",
+            "gpu_id_sm120",
+            "cloud_type",
+            "registry_auth_id",
+            "cpu_flavor_ids",
+        }
+        for name in numeric_or_boolean:
+            with self.subTest(typed_input=name):
+                self.assertIn(
+                    f"{name}: ${{{{ fromJSON(github.event.inputs.{name}) }}}}",
+                    call_inputs,
+                )
+        for name in string_inputs:
+            with self.subTest(string_input=name):
+                self.assertIn(
+                    f"{name}: ${{{{ github.event.inputs.{name} }}}}", call_inputs
+                )
+
     def test_paid_jobs_fail_before_work_when_credentials_are_unavailable(self) -> None:
         self.assertEqual(
             self.build.count("- name: Verify protected Runpod credentials"), 2
