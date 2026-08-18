@@ -211,19 +211,36 @@ class RunpodctlTests(unittest.TestCase):
             gpu_id="NVIDIA A100 80GB PCIe",
             gpu_workload="BUILD",
         )
-        capacity = completed(
+        capacity_messages = (
+            "Error: There are no longer any instances available with the "
+            "requested specifications.",
+            "Error: This machine does not have the resources to deploy your pod. "
+            "Please try a different machine",
+        )
+        for message in capacity_messages:
+            with self.subTest(message=message):
+                capacity = completed(stderr=message, code=1)
+                with self.assertRaises(CapacityUnavailableError):
+                    Runpodctl(executor=RecordingExecutor(capacity)).create_pod(
+                        request,
+                        terminate_after="2026-08-18T05:00:00Z",
+                        self_terminate_seconds=15_300,
+                    )
+
+        near_match = completed(
             stderr=(
-                "Error: There are no longer any instances available with the "
-                "requested specifications."
+                "Error: This machine does not have permission to deploy your pod. "
+                "Please try a different machine"
             ),
             code=1,
         )
-        with self.assertRaises(CapacityUnavailableError):
-            Runpodctl(executor=RecordingExecutor(capacity)).create_pod(
+        with self.assertRaises(CommandError) as raised:
+            Runpodctl(executor=RecordingExecutor(near_match)).create_pod(
                 request,
                 terminate_after="2026-08-18T05:00:00Z",
                 self_terminate_seconds=15_300,
             )
+        self.assertNotIsInstance(raised.exception, CapacityUnavailableError)
 
         unauthorized = completed(stderr="Error: unauthorized", code=1)
         with self.assertRaises(CommandError) as raised:

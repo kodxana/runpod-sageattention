@@ -104,14 +104,14 @@ Automation should require all of the following before starting a SageAttention
 build:
 
 - `schema_version == 2`
-- `cgroup.version` is `1` or `2`
 - `memory.capacity_bytes > 0`
 - `memory.assigned_capacity_bytes > 0`, authorized by the exact receipt and
   command-scoped environment pair for every Runpod release build
 - capacity comes either from a consistent finite cgroup hard limit or from
   `memory.capacity_source == "runpod-api-assignment"`
-- `memory.usage_peak_eligible == true` and `memory.usage_source` names the
-  resolved cgroup membership used for peak evidence
+- either `memory.peak_evidence_mode == "cgroup"`, with cgroup version 1 or 2
+  and a peak-eligible resolved membership source, or the restricted
+  `process-group-rss` fallback described below
 - `build.suggested_jobs >= 1`
 
 `RUNPOD_ASSIGNED_MEMORY_BYTES` is reserved for the orchestrator: it must be
@@ -130,8 +130,32 @@ from inside the container. When its readable counter does not exceed the
 verified assignment it is eligible for conservative headroom and peak checks;
 inactive cache receives no reclaimability credit. The helper marks the scope
 `ambiguous-cgroup-root` and forces both `MAX_JOBS=1` and `EXT_PARALLEL=1`. A
-missing, malformed, or over-assignment counter is not accepted even for peak
-evidence, and the build stops before compilation.
+malformed or over-assignment counter is not accepted, and the build stops
+before compilation.
+
+When the cgroup membership or its current counter is genuinely absent, the
+helper can instead select `peak_evidence_mode=process-group-rss`. This is not a
+general escape hatch: the selected capacity must be the exact receipt-backed
+Runpod assignment, it must meet the matrix's recommended 64 GiB capacity, both
+compiler parallelism values are forced to one, and neither low-resource nor
+unsafe-parallelism overrides may be active. A readable counter that conflicts
+with the assignment never qualifies for this fallback.
+
+In this mode a Python supervisor launches the exact wheel command with
+`start_new_session=True` and samples only that dedicated Linux process group
+every 100 ms. It checkpoints incomplete evidence atomically every five seconds,
+then records the PGID/leader binding, positive endpoints and peak, lifecycle
+timestamps, and an observed native compiler executable. It requires at least
+two samples and checks that the peak plus the normal build reserve fits the
+verified assignment. HUP, INT, and TERM received by either the build shell or
+supervisor are forwarded to the isolated group; cleanup escalates to KILL after
+ten seconds and verifies that no descendant remains.
+
+The resulting evidence is labeled `process-group-rss`, not cgroup peak
+accounting: it excludes unrelated Pod processes and most filesystem cache, may
+conservatively count shared resident pages more than once, and is not
+kernel-enforced or whole-Pod enforcement. Promotion validates those limitations,
+the supervisor lifecycle, and the serialized policy explicitly.
 
 Default GPU-backed release policy requires an assignment with at least 4
 assigned vCPUs, 32 GB system RAM, and an 80 GB container disk before source
@@ -139,7 +163,7 @@ upload; 16 vCPUs and 64 GB system RAM are recommended. The backend-neutral
 helper and build script then independently require at least 4 effective vCPUs,
 a verified API assignment for every release build, and at least 32 GiB
 established by the smaller of that assignment and a finite cgroup limit. They
-also require one safe compiler job, measurable cgroup peak usage, and 20 GiB
+also require one safe compiler job, acceptable typed peak evidence, and 20 GiB
 currently free on both work and output filesystems. CPU, minimum capacity, and
 actual disk checks cannot be bypassed with `ALLOW_LOW_RESOURCES`; disk is
 checked by `build-wheel.sh`, not by the resource-reporting helper.
@@ -147,6 +171,7 @@ checked by `build-wheel.sh`, not by the resource-reporting helper.
 The shell form exports `POD_MEMORY_LIMIT_BYTES`, `POD_MEMORY_CAPACITY_BYTES`,
 `POD_MEMORY_CAPACITY_SOURCE`, `POD_MEMORY_USAGE_SOURCE`,
 `POD_MEMORY_USAGE_PEAK_ELIGIBLE`,
+`POD_MEMORY_PEAK_EVIDENCE_MODE`,
 `POD_MEMORY_CURRENT_BYTES`, `POD_MEMORY_WORKING_SET_BYTES`,
 `POD_MEMORY_AVAILABLE_BYTES`, `POD_CPU_COUNT`, `POD_BUILD_JOBS`, and the
 assumptions used for the recommendation, among other `POD_*` values. Values are

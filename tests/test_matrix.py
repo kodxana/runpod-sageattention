@@ -35,6 +35,14 @@ def test_exact_build_matrix_matches_comfyui_base() -> None:
         "source_url": "https://github.com/thu-ml/SageAttention.git",
         "source_commit": "eb615cf6cf4d221338033340ee2de1c37fbdba4a",
         "source_date_epoch": 1761613216,
+        "downstream_revision": "sm90fix1",
+        "upstream_backports": [
+            {
+                "commit": "d9704247a5139ab4c03bf7fc6b35cc0e2cbb5ea4",
+                "subject": "fix same name issue in sm09_compile.py",
+                "file": "sageattention/sm90_compile.py",
+            }
+        ],
     }
     assert MATRIX["platform"]["base_image"] == "ubuntu:24.04"
     assert MATRIX["platform"]["python_version"] == "3.12"
@@ -48,13 +56,13 @@ def test_exact_build_matrix_matches_comfyui_base() -> None:
     expected = {
         "cp312-torch2.10.0-cu128": (
             "12.8", "2.10.0+cu128", "12.8",
-            "2.2.0+torch2.10.0.cu128",
+            "2.2.0+torch2.10.0.cu128.sm90fix1",
             "runpod/comfyui@sha256:ce5e842ca0c7233a983ff76a83739b445172259c77a43a117453ef7e6a64d0b7",
             "madiatorlabs/sageattention-wheel-builder@sha256:556979b41a98e5331ad38a1ae599161cb37a78cb09bec34e3f982978b84816d0",
         ),
         "cp312-torch2.10.0-cu130": (
             "13.0", "2.10.0+cu130", "13.0",
-            "2.2.0+torch2.10.0.cu130",
+            "2.2.0+torch2.10.0.cu130.sm90fix1",
             "runpod/comfyui@sha256:0bf75436da591e0f26d299af3741e07cb8ce8ce36566d1a7d8d78aae458e5d67",
             "madiatorlabs/sageattention-wheel-builder@sha256:bed84f32bf76ba292728faf9fbe446d5d7f84d194444b2b6d006e663cccba906",
         ),
@@ -141,7 +149,7 @@ def test_resource_and_runtime_release_thresholds_are_conservative() -> None:
     assert "for causal in case[\"causal_modes\"]" in validator
     assert validator.index("output_shape = list(raw_actual.shape)") < validator.index(
         "actual = raw_actual.float()")
-    assert validator.index("raw_actual.dtype == dtype") < validator.index(
+    assert validator.index("raw_actual.dtype == expected_dtype") < validator.index(
         "actual = raw_actual.float()")
     for result_field in {
         "expected_output_dtype",
@@ -178,6 +186,49 @@ def test_downstream_patch_scopes_gencodes_and_exact_torch_metadata() -> None:
     assert 'code=compute_{num}' not in added_lines
     assert 'torch=={REQUIRED_TORCH_VERSION}' in patch
     assert "version=PACKAGE_VERSION" in patch
+
+
+def test_sm90_fake_impl_backport_is_exact_and_versioned() -> None:
+    patch = (
+        ROOT / "patches" / "sageattention" / "2.2.0" / "setup.py.patch"
+    ).read_text(encoding="utf-8")
+    marker = (
+        "diff --git a/sageattention/sm90_compile.py "
+        "b/sageattention/sm90_compile.py"
+    )
+    assert patch.count(marker) == 1
+    sm90_patch = patch.split(marker, 1)[1]
+    changed_source_lines = [
+        line for line in sm90_patch.splitlines()
+        if line.startswith(("+", "-"))
+        and not line.startswith(("+++", "---"))
+    ]
+    assert changed_source_lines == [
+        "-def qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(",
+        "+def qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf_fake_impl(",
+    ]
+
+    upstream_fix = "d9704247a5139ab4c03bf7fc6b35cc0e2cbb5ea4"
+    assert MATRIX["package"]["downstream_revision"] == "sm90fix1"
+    assert MATRIX["package"]["upstream_backports"] == [
+        {
+            "commit": upstream_fix,
+            "subject": "fix same name issue in sm09_compile.py",
+            "file": "sageattention/sm90_compile.py",
+        }
+    ]
+    for build in MATRIX["builds"]:
+        assert build["wheel_version"].endswith(".sm90fix1")
+        assert build["wheel_filename"] == (
+            f"sageattention-{build['wheel_version']}-cp312-cp312-linux_x86_64.whl"
+        )
+    for documentation in (
+        ROOT / "README.md",
+        ROOT / "docs" / "build-matrix.md",
+        ROOT / "CHANGELOG.md",
+        ROOT / "NOTICE",
+    ):
+        assert upstream_fix in documentation.read_text(encoding="utf-8")
 
 
 def fake_artifact(build: dict, digest: str = "0" * 64) -> dict:
@@ -402,6 +453,9 @@ class MatrixTests(unittest.TestCase):
 
     def test_downstream_patch_scopes_gencodes_and_exact_torch_metadata(self) -> None:
         test_downstream_patch_scopes_gencodes_and_exact_torch_metadata()
+
+    def test_sm90_fake_impl_backport_is_exact_and_versioned(self) -> None:
+        test_sm90_fake_impl_backport_is_exact_and_versioned()
 
     def test_selector_requires_one_exact_runtime_tuple(self) -> None:
         test_selector_requires_one_exact_runtime_tuple()

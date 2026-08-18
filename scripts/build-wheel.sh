@@ -203,6 +203,7 @@ MIN_CPUS="${MIN_CPUS}" MIN_MEMORY_GIB="${MIN_MEMORY_GIB}" \
 RECOMMENDED_MEMORY_GIB="${RECOMMENDED_MEMORY_GIB}" MIN_DISK_GIB="${MIN_DISK_GIB}" \
 OUTPUT_DIR="${OUTPUT_DIR}" WORK_PARENT="${WORK_PARENT}" \
 ALLOW_LOW_RESOURCES="${ALLOW_LOW_RESOURCES:-0}" \
+ALLOW_UNSAFE_PARALLELISM="${ALLOW_UNSAFE_PARALLELISM:-0}" \
 RESOURCE_SNAPSHOT_JSON="${RESOURCE_SNAPSHOT_JSON}" python3.12 - <<'PY'
 import json
 import os
@@ -220,6 +221,7 @@ usage_source = memory.get("usage_source")
 usage_trustworthy = memory.get("usage_trustworthy")
 usage_peak_eligible = memory.get("usage_peak_eligible")
 usage_scope = memory.get("usage_scope")
+peak_evidence_mode = memory.get("peak_evidence_mode")
 available = memory.get("available_bytes")
 minimum_cpus = int(os.environ["MIN_CPUS"])
 minimum_limit = float(os.environ["MIN_MEMORY_GIB"]) * 1024 ** 3
@@ -272,7 +274,8 @@ else:
 
 if cpu["effective_count"] < minimum_cpus:
     hard_failures.append(f"effective CPU {cpu['effective_count']} < {minimum_cpus}")
-if usage_peak_eligible is True and positive_integer(capacity):
+if peak_evidence_mode == "cgroup" and usage_peak_eligible is True \
+        and positive_integer(capacity):
     if not isinstance(available, int) or isinstance(available, bool):
         diagnostic_memory_failures.append("pod-scoped memory headroom is unknown")
     else:
@@ -281,15 +284,48 @@ if usage_peak_eligible is True and positive_integer(capacity):
             diagnostic_memory_failures.append(
                 f"memory headroom {available / 1024 ** 3:.1f} GiB cannot cover "
                 f"reserve plus one compiler ({required_headroom / 1024 ** 3:.1f} GiB)")
-elif not (build.get("forced_single_job") is True
-          and build.get("suggested_jobs") == 1):
+elif peak_evidence_mode == "process-group-rss":
+    if not (
+        capacity_source == "runpod-api-assignment"
+        and positive_integer(assigned_capacity)
+        and assigned_capacity == capacity
+        and capacity_is_hard_limit is False
+        and memory.get("usage_current_bytes") is None
+        and usage_source == ""
+        and usage_scope == "unavailable"
+        and usage_peak_eligible is False
+        and usage_trustworthy is False
+    ):
+        hard_failures.append(
+            "process-group RSS fallback requires genuinely unavailable cgroup "
+            "accounting and an exact verified Runpod assignment")
+    if positive_integer(capacity) and capacity < recommended_limit:
+        hard_failures.append(
+            f"process-group RSS fallback requires the recommended memory "
+            f"capacity {recommended_limit / 1024 ** 3:.1f} GiB")
+    if not (build.get("forced_single_job") is True
+            and build.get("suggested_jobs") == 1):
+        hard_failures.append(
+            "process-group RSS fallback must force a one-job build recommendation")
+    if os.environ.get("ALLOW_LOW_RESOURCES") == "1":
+        hard_failures.append(
+            "ALLOW_LOW_RESOURCES is forbidden with process-group RSS accounting")
+    if os.environ.get("ALLOW_UNSAFE_PARALLELISM") == "1":
+        hard_failures.append(
+            "ALLOW_UNSAFE_PARALLELISM is forbidden with process-group RSS accounting")
+elif peak_evidence_mode == "cgroup":
+    hard_failures.append("cgroup peak evidence is internally inconsistent")
+else:
     hard_failures.append(
-        "untrusted memory usage must force a one-job build recommendation")
+        "neither cgroup peak accounting nor the restricted process-group RSS "
+        "fallback is available")
 
-if usage_peak_eligible is not True:
-    hard_failures.append("no cgroup membership counter is eligible for peak evidence")
-elif not isinstance(usage_source, str) or not usage_source.startswith("cgroup-v"):
-    hard_failures.append("peak-eligible memory usage has no cgroup source")
+if peak_evidence_mode == "cgroup":
+    if usage_peak_eligible is not True:
+        hard_failures.append(
+            "no cgroup membership counter is eligible for peak evidence")
+    elif not isinstance(usage_source, str) or not usage_source.startswith("cgroup-v"):
+        hard_failures.append("peak-eligible memory usage has no cgroup source")
 
 for label, free_gib in disk_free_gib.items():
     if free_gib < minimum_disk:
@@ -301,12 +337,18 @@ capacity_text = (
     "unknown" if not positive_integer(capacity)
     else f"{capacity / 1024 ** 3:.1f} GiB"
 )
-available_text = "unknown" if available is None else f"{available / 1024 ** 3:.1f} GiB"
+available_text = (
+    "unmeasured"
+    if peak_evidence_mode == "process-group-rss"
+    else "unknown"
+    if available is None
+    else f"{available / 1024 ** 3:.1f} GiB"
+)
 print(
     f"CPU-bound preflight: cpus={cpu['effective_count']}, "
     f"memory_capacity={capacity_text}, capacity_source={capacity_source}, "
     f"hard_limit={capacity_is_hard_limit}, usage_trustworthy={usage_trustworthy}, "
-    f"usage_scope={usage_scope}, "
+    f"usage_scope={usage_scope}, peak_evidence_mode={peak_evidence_mode}, "
     f"memory_headroom={available_text}, "
     f"output_free_disk={disk_free_gib['output']:.1f} GiB, "
     f"work_free_disk={disk_free_gib['work']:.1f} GiB, "
@@ -369,19 +411,89 @@ except (OSError, ValueError):
 PY
 }
 
+# BEGIN RSS SUPERVISOR SHELL
+run_rss_supervised_command() {
+    local evidence_file="$1"
+    shift
+    local supervisor_pid=""
+    local pending_signal=""
+    local command_status=0
+
+    relay_supervisor_signal() {
+        local signal_name="$1"
+        pending_signal="${signal_name}"
+        if [[ -n "${supervisor_pid}" ]] \
+                && kill -0 "${supervisor_pid}" 2>/dev/null; then
+            kill -s "${signal_name}" "${supervisor_pid}" 2>/dev/null || true
+        fi
+    }
+
+    trap 'relay_supervisor_signal HUP' HUP
+    trap 'relay_supervisor_signal INT' INT
+    trap 'relay_supervisor_signal TERM' TERM
+    "${RESOURCE_HELPER[@]}" \
+        --monitor-process-group "${evidence_file}" \
+        --sample-interval-ms 100 \
+        --termination-grace-seconds 10 \
+        -- "$@" &
+    supervisor_pid=$!
+    if [[ -n "${pending_signal}" ]]; then
+        relay_supervisor_signal "${pending_signal}"
+    fi
+    while true; do
+        if wait "${supervisor_pid}"; then
+            command_status=0
+        else
+            command_status=$?
+        fi
+        if ! kill -0 "${supervisor_pid}" 2>/dev/null; then
+            break
+        fi
+    done
+    supervisor_pid=""
+    trap - HUP INT TERM
+    unset -f relay_supervisor_signal
+    if [[ -n "${pending_signal}" && "${command_status}" == "0" ]]; then
+        case "${pending_signal}" in
+            HUP) command_status=129 ;;
+            INT) command_status=130 ;;
+            TERM) command_status=143 ;;
+        esac
+    fi
+    return "${command_status}"
+}
+# END RSS SUPERVISOR SHELL
+
 BUILD_STARTED_SECONDS="$(date +%s)"
-CGROUP_PEAK_START="$(cgroup_peak_from_snapshot "${RESOURCE_SNAPSHOT_JSON}")"
+MEMORY_EVIDENCE_MODE="$(RESOURCE_SNAPSHOT_JSON="${RESOURCE_SNAPSHOT_JSON}" python3.12 -c \
+    'import json,os; print(json.loads(os.environ["RESOURCE_SNAPSHOT_JSON"])["memory"]["peak_evidence_mode"])')"
 MEMORY_CAPACITY_BYTES="$(RESOURCE_SNAPSHOT_JSON="${RESOURCE_SNAPSHOT_JSON}" python3.12 -c \
     'import json,os; print(json.loads(os.environ["RESOURCE_SNAPSHOT_JSON"])["memory"]["capacity_bytes"])')"
-if [[ ! "${CGROUP_PEAK_START}" =~ ^[1-9][0-9]*$ ]]; then
-    echo "A positive cgroup-membership memory peak is required before compilation" >&2
-    exit 70
-fi
-if [[ ! "${MEMORY_CAPACITY_BYTES}" =~ ^[1-9][0-9]*$ ]] \
-        || (( CGROUP_PEAK_START > MEMORY_CAPACITY_BYTES )); then
-    echo "Initial cgroup memory peak exceeds the selected memory capacity" >&2
-    exit 70
-fi
+CGROUP_PEAK_START=""
+case "${MEMORY_EVIDENCE_MODE}" in
+    cgroup)
+        CGROUP_PEAK_START="$(cgroup_peak_from_snapshot "${RESOURCE_SNAPSHOT_JSON}")"
+        if [[ ! "${CGROUP_PEAK_START}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "A positive cgroup-membership memory peak is required before compilation" >&2
+            exit 70
+        fi
+        if [[ ! "${MEMORY_CAPACITY_BYTES}" =~ ^[1-9][0-9]*$ ]] \
+                || (( CGROUP_PEAK_START > MEMORY_CAPACITY_BYTES )); then
+            echo "Initial cgroup memory peak exceeds the selected memory capacity" >&2
+            exit 70
+        fi
+        ;;
+    process-group-rss)
+        [[ "${MEMORY_CAPACITY_BYTES}" =~ ^[1-9][0-9]*$ ]] || {
+            echo "A positive verified capacity is required for process-group RSS accounting" >&2
+            exit 70
+        }
+        ;;
+    *)
+        echo "Unsupported memory peak evidence mode: ${MEMORY_EVIDENCE_MODE}" >&2
+        exit 70
+        ;;
+esac
 
 if [[ -n "${BUILDER_CUDA_VERSION:-}" && "${BUILDER_CUDA_VERSION}" != "${CUDA_VERSION}" ]]; then
     echo "Builder CUDA mismatch: image=${BUILDER_CUDA_VERSION}, matrix=${CUDA_VERSION}" >&2
@@ -443,6 +555,8 @@ if [[ "${WORK_DIR}" != "${WORK_PARENT}/"* ]]; then
     echo "Refusing unsafe temporary build path: ${WORK_DIR}" >&2
     exit 73
 fi
+PROCESS_RSS_FILE=""
+PROCESS_RSS_JSON=""
 cleanup() {
     if [[ "${KEEP_WORK}" == "1" ]]; then
         echo "Keeping build directory: ${WORK_DIR}"
@@ -496,7 +610,19 @@ export CXX_APPEND_FLAGS="${CXX_APPEND_FLAGS:-} -ffile-prefix-map=${CHECKOUT}=/us
 export NVCC_APPEND_FLAGS="${NVCC_APPEND_FLAGS:-} -Xcompiler=-ffile-prefix-map=${CHECKOUT}=/usr/src/sageattention"
 
 echo "Building ${WHEEL_FILENAME} with MAX_JOBS=${MAX_JOBS}, EXT_PARALLEL=${EXT_PARALLEL}"
-python3.12 -m build --wheel --no-isolation --outdir "${WHEEL_STAGE}" "${CHECKOUT}"
+if [[ "${MEMORY_EVIDENCE_MODE}" == "process-group-rss" ]]; then
+    PROCESS_RSS_FILE="${WORK_DIR}/process-group-rss.json"
+    run_rss_supervised_command "${PROCESS_RSS_FILE}" \
+        python3.12 -m build --wheel --no-isolation \
+            --outdir "${WHEEL_STAGE}" "${CHECKOUT}" || {
+        build_status=$?
+        echo "Supervised wheel build failed with status ${build_status}" >&2
+        exit "${build_status}"
+    }
+else
+    python3.12 -m build --wheel --no-isolation \
+        --outdir "${WHEEL_STAGE}" "${CHECKOUT}"
+fi
 
 mapfile -t BUILT_WHEELS < <(find "${WHEEL_STAGE}" -maxdepth 1 -type f -name '*.whl' -print)
 if [[ ${#BUILT_WHEELS[@]} -ne 1 ]]; then
@@ -507,6 +633,102 @@ BUILT_WHEEL="${BUILT_WHEELS[0]}"
 if [[ "$(basename -- "${BUILT_WHEEL}")" != "${WHEEL_FILENAME}" ]]; then
     echo "Wheel filename mismatch: expected ${WHEEL_FILENAME}, got $(basename -- "${BUILT_WHEEL}")" >&2
     exit 65
+fi
+
+if [[ "${MEMORY_EVIDENCE_MODE}" == "process-group-rss" ]]; then
+    [[ -s "${PROCESS_RSS_FILE}" ]] || {
+        echo "Process-group RSS sampler did not produce final evidence" >&2
+        exit 70
+    }
+    PROCESS_RSS_JSON="$(<"${PROCESS_RSS_FILE}")"
+PROCESS_RSS_JSON="${PROCESS_RSS_JSON}" \
+RESOURCE_SNAPSHOT_JSON="${RESOURCE_SNAPSHOT_JSON}" python3.12 - <<'PY'
+import json
+import os
+import re
+
+sample = json.loads(os.environ["PROCESS_RSS_JSON"])
+snapshot = json.loads(os.environ["RESOURCE_SNAPSHOT_JSON"])
+memory = snapshot["memory"]
+build = snapshot["build"]
+
+def positive_integer(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+expected = {
+    "build_exit_status": 0,
+    "child_returncode": 0,
+    "checkpoint_interval_ms": 5000,
+    "complete": True,
+    "covers_other_pod_processes": False,
+    "forced_kill": False,
+    "forwarded_signal": None,
+    "includes_file_cache": False,
+    "leader_observed": True,
+    "method": "proc-process-group-rss-sum",
+    "monitor_error": None,
+    "observed_compiler_executable": True,
+    "sample_interval_ms": 100,
+    "schema_version": 2,
+    "scope": "build-process-group",
+    "shared_pages_may_be_double_counted": True,
+    "source": "/proc/*/statm",
+    "termination_grace_seconds": 10,
+    "whole_pod_enforced": False,
+}
+for field, value in expected.items():
+    if sample.get(field) != value:
+        raise SystemExit(
+            f"process-group RSS evidence has invalid {field}: "
+            f"expected {value!r}, got {sample.get(field)!r}")
+for field in (
+    "duration_ms",
+    "end_bytes",
+    "finished_monotonic_ns",
+    "leader_pid",
+    "maximum_process_count",
+    "peak_bytes",
+    "process_group_id",
+    "sample_count",
+    "start_bytes",
+    "started_monotonic_ns",
+):
+    if not positive_integer(sample.get(field)):
+        raise SystemExit(f"process-group RSS evidence has invalid {field}")
+if sample["sample_count"] < 2:
+    raise SystemExit("process-group RSS evidence requires at least two samples")
+if sample["maximum_process_count"] < 2:
+    raise SystemExit(
+        "process-group RSS evidence never observed the build and a compiler")
+if sample["leader_pid"] != sample["process_group_id"]:
+    raise SystemExit("supervised build leader is not the sampled process-group leader")
+if sample["finished_monotonic_ns"] <= sample["started_monotonic_ns"]:
+    raise SystemExit("process-group RSS lifecycle timestamps are non-monotonic")
+if sample["duration_ms"] != (
+    sample["finished_monotonic_ns"] - sample["started_monotonic_ns"]
+) // 1_000_000:
+    raise SystemExit("process-group RSS duration does not match lifecycle timestamps")
+if not isinstance(sample.get("command_sha256"), str) or not re.fullmatch(
+    r"[0-9a-f]{64}", sample["command_sha256"]
+):
+    raise SystemExit("process-group RSS command hash is invalid")
+compiler_executables = sample.get("observed_compiler_executables")
+if (
+    not isinstance(compiler_executables, list)
+    or not compiler_executables
+    or any(not isinstance(item, str) or not item for item in compiler_executables)
+    or len(set(compiler_executables)) != len(compiler_executables)
+):
+    raise SystemExit("process-group RSS compiler executable evidence is invalid")
+if sample["peak_bytes"] < max(sample["start_bytes"], sample["end_bytes"]):
+    raise SystemExit("process-group RSS peak is lower than an endpoint")
+capacity = memory["capacity_bytes"]
+reserve = build["reserve_bytes"]
+if sample["peak_bytes"] + reserve > capacity:
+    raise SystemExit(
+        "process-group RSS peak plus the build reserve exceeds the verified "
+        "Runpod assignment")
+PY
 fi
 
 RESOURCE_END_JSON="$("${RESOURCE_HELPER[@]}" --json)" || {
@@ -528,6 +750,7 @@ memory_fields = (
     "usage_source",
     "usage_scope",
     "usage_peak_eligible",
+    "peak_evidence_mode",
     "usage_trustworthy",
 )
 for field in memory_fields:
@@ -536,15 +759,18 @@ for field in memory_fields:
 if end["build"].get("forced_single_job") != start["build"].get("forced_single_job"):
     raise SystemExit("forced-single-job policy changed during build")
 PY
-CGROUP_PEAK_END="$(cgroup_peak_from_snapshot "${RESOURCE_END_JSON}")"
-if [[ ! "${CGROUP_PEAK_END}" =~ ^[1-9][0-9]*$ ]]; then
-    echo "A positive cgroup-membership memory peak is required after compilation" >&2
-    exit 70
-fi
-if (( CGROUP_PEAK_END < CGROUP_PEAK_START \
-        || CGROUP_PEAK_END > MEMORY_CAPACITY_BYTES )); then
-    echo "Final cgroup memory peak is non-monotonic or exceeds selected capacity" >&2
-    exit 70
+CGROUP_PEAK_END=""
+if [[ "${MEMORY_EVIDENCE_MODE}" == "cgroup" ]]; then
+    CGROUP_PEAK_END="$(cgroup_peak_from_snapshot "${RESOURCE_END_JSON}")"
+    if [[ ! "${CGROUP_PEAK_END}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "A positive cgroup-membership memory peak is required after compilation" >&2
+        exit 70
+    fi
+    if (( CGROUP_PEAK_END < CGROUP_PEAK_START \
+            || CGROUP_PEAK_END > MEMORY_CAPACITY_BYTES )); then
+        echo "Final cgroup memory peak is non-monotonic or exceeds selected capacity" >&2
+        exit 70
+    fi
 fi
 BUILD_FINISHED_SECONDS="$(date +%s)"
 BUILD_ELAPSED_SECONDS="$((BUILD_FINISHED_SECONDS - BUILD_STARTED_SECONDS))"
@@ -553,10 +779,12 @@ RESOURCE_START_JSON="${RESOURCE_SNAPSHOT_JSON}" RESOURCE_END_JSON="${RESOURCE_EN
 MATRIX_PATH="${MATRIX_PATH}" PATCH_FILE="${PATCH_FILE}" MAX_JOBS="${MAX_JOBS}" \
 EXT_PARALLEL="${EXT_PARALLEL}" BUILD_ELAPSED_SECONDS="${BUILD_ELAPSED_SECONDS}" \
 CGROUP_PEAK_START="${CGROUP_PEAK_START}" CGROUP_PEAK_END="${CGROUP_PEAK_END}" \
+PROCESS_RSS_JSON="${PROCESS_RSS_JSON}" \
 BUILDER_IMAGE_EXPECTED="${BUILDER_IMAGE_EXPECTED}" \
 BUILDER_IMAGE_REF="${BUILDER_IMAGE_REF:-${BUILDER_IMAGE_EXPECTED}}" \
 BUILDER_IMAGE_DIGEST="${BUILDER_IMAGE_DIGEST:-}" \
 ALLOW_UNSAFE_PARALLELISM="${ALLOW_UNSAFE_PARALLELISM:-0}" \
+ALLOW_LOW_RESOURCES="${ALLOW_LOW_RESOURCES:-0}" \
 python3.12 - "${EVIDENCE_FILE}" <<'PY'
 import hashlib
 import importlib.metadata
@@ -596,6 +824,95 @@ if selected_gpu_id is not None and (
 resource_start = json.loads(os.environ["RESOURCE_START_JSON"])
 resource_end = json.loads(os.environ["RESOURCE_END_JSON"])
 start_memory = resource_start["memory"]
+peak_evidence_mode = start_memory["peak_evidence_mode"]
+if peak_evidence_mode == "cgroup":
+    cgroup_peak = {
+        "available": True,
+        "end_bytes": int(peak_end),
+        "monotonic": int(peak_end) >= int(peak_start),
+        "scope": start_memory["usage_scope"],
+        "source": start_memory["usage_source"],
+        "start_bytes": int(peak_start),
+        "usage_trustworthy": start_memory["usage_trustworthy"],
+        "within_capacity": int(peak_end) <= start_memory["capacity_bytes"],
+    }
+    memory_peak = {
+        "available": True,
+        "complete": True,
+        "end_bytes": int(peak_end),
+        "includes_file_cache": True,
+        "kernel_enforced": start_memory["capacity_is_hard_limit"],
+        "method": "kernel-cgroup-peak",
+        "mode": "cgroup",
+        "peak_bytes": int(peak_end),
+        "sample_interval_ms": None,
+        "scope": start_memory["usage_scope"],
+        "source": start_memory["usage_source"],
+        "start_bytes": int(peak_start),
+        "within_selected_capacity": True,
+    }
+elif peak_evidence_mode == "process-group-rss":
+    sample = json.loads(os.environ["PROCESS_RSS_JSON"])
+    sampled_peak_plus_reserve_within_assignment = (
+        sample["peak_bytes"] + resource_start["build"]["reserve_bytes"]
+        <= start_memory["capacity_bytes"]
+    )
+    cgroup_peak = {
+        "available": False,
+        "end_bytes": None,
+        "monotonic": None,
+        "scope": "unavailable",
+        "source": "",
+        "start_bytes": None,
+        "usage_trustworthy": False,
+        "within_capacity": None,
+    }
+    memory_peak = {
+        "available": True,
+        "build_exit_status": sample["build_exit_status"],
+        "child_returncode": sample["child_returncode"],
+        "checkpoint_interval_ms": sample["checkpoint_interval_ms"],
+        "command_sha256": sample["command_sha256"],
+        "complete": sample["complete"],
+        "covers_other_pod_processes": sample["covers_other_pod_processes"],
+        "duration_ms": sample["duration_ms"],
+        "end_bytes": sample["end_bytes"],
+        "finished_monotonic_ns": sample["finished_monotonic_ns"],
+        "forced_kill": sample["forced_kill"],
+        "forwarded_signal": sample["forwarded_signal"],
+        "includes_file_cache": sample["includes_file_cache"],
+        "kernel_enforced": False,
+        "leader_observed": sample["leader_observed"],
+        "leader_pid": sample["leader_pid"],
+        "maximum_process_count": sample["maximum_process_count"],
+        "method": sample["method"],
+        "mode": "process-group-rss",
+        "monitor_error": sample["monitor_error"],
+        "observed_compiler_executable": sample[
+            "observed_compiler_executable"
+        ],
+        "observed_compiler_executables": sample[
+            "observed_compiler_executables"
+        ],
+        "peak_bytes": sample["peak_bytes"],
+        "process_group_id": sample["process_group_id"],
+        "sample_count": sample["sample_count"],
+        "sample_interval_ms": sample["sample_interval_ms"],
+        "sampled_peak_plus_reserve_within_assignment": (
+            sampled_peak_plus_reserve_within_assignment
+        ),
+        "scope": sample["scope"],
+        "shared_pages_may_be_double_counted": sample[
+            "shared_pages_may_be_double_counted"
+        ],
+        "source": sample["source"],
+        "start_bytes": sample["start_bytes"],
+        "started_monotonic_ns": sample["started_monotonic_ns"],
+        "termination_grace_seconds": sample["termination_grace_seconds"],
+        "whole_pod_enforced": sample["whole_pod_enforced"],
+    }
+else:
+    raise SystemExit(f"unsupported memory peak evidence mode: {peak_evidence_mode}")
 evidence = {
     "builder_image": {
         "digest": builder_digest,
@@ -603,15 +920,7 @@ evidence = {
         "ref": builder_ref,
     },
     "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
-    "cgroup_peak": {
-        "end_bytes": int(peak_end) if peak_end else None,
-        "monotonic": int(peak_end) >= int(peak_start),
-        "scope": start_memory["usage_scope"],
-        "source": start_memory["usage_source"],
-        "start_bytes": int(peak_start) if peak_start else None,
-        "usage_trustworthy": start_memory["usage_trustworthy"],
-        "within_capacity": int(peak_end) <= start_memory["capacity_bytes"],
-    },
+    "cgroup_peak": cgroup_peak,
     "elapsed_seconds": int(os.environ["BUILD_ELAPSED_SECONDS"]),
     "matrix_sha256": sha256(os.environ["MATRIX_PATH"]),
     "patch_sha256": sha256(os.environ["PATCH_FILE"]),
@@ -621,11 +930,13 @@ evidence = {
         "capacity_is_hard_limit": start_memory["capacity_is_hard_limit"],
         "capacity_source": start_memory["capacity_source"],
         "forced_single_job": resource_start["build"]["forced_single_job"],
+        "peak_evidence_mode": peak_evidence_mode,
         "usage_peak_eligible": start_memory["usage_peak_eligible"],
         "usage_scope": start_memory["usage_scope"],
         "usage_source": start_memory["usage_source"],
         "usage_trustworthy": start_memory["usage_trustworthy"],
     },
+    "memory_peak": memory_peak,
     "resource_end": resource_end,
     "resource_start": resource_start,
     "runpod_assignment": {
@@ -635,6 +946,7 @@ evidence = {
     "selected_gpu_id": selected_gpu_id,
     "selected_parallelism": {
         "extension_parallelism": int(os.environ["EXT_PARALLEL"]),
+        "low_resource_override": os.environ["ALLOW_LOW_RESOURCES"] == "1",
         "max_jobs": int(os.environ["MAX_JOBS"]),
         "unsafe_override": os.environ["ALLOW_UNSAFE_PARALLELISM"] == "1",
     },

@@ -7,8 +7,10 @@ import argparse
 import importlib
 import importlib.util
 import json
+import math
 import os
 import re
+from contextlib import suppress
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -33,12 +35,54 @@ def require(condition: bool, message: str) -> None:
         raise ValidationError(message)
 
 
+def _runtime_error(stage: str, error: BaseException | str) -> dict[str, str]:
+    if isinstance(error, BaseException):
+        error_type = type(error).__name__
+        message = str(error) or error_type
+    else:
+        error_type = "ValidationError"
+        message = error
+    return {
+        "stage": stage,
+        "type": error_type,
+        "message": message,
+    }
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, allow_nan=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        os.replace(temporary, path)
+    finally:
+        with suppress(OSError):
+            temporary.unlink(missing_ok=True)
+
+
 def normalized_requirement(requirement: str) -> str:
     return re.sub(r"\s+", "", requirement.split(";", 1)[0]).lower()
 
 
 def _positive_integer(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _compiler_executable_name(value: object) -> bool:
+    if not isinstance(value, str) or not value or Path(value).name != value:
+        return False
+    lowered = value.lower()
+    return (
+        lowered in {"c++", "cc1plus", "nvcc", "ptxas"}
+        or "nvcc" in lowered
+        or "ptxas" in lowered
+        or "g++" in lowered
+        or lowered.endswith("-c++")
+    )
 
 
 def validate_resource_evidence(
@@ -49,12 +93,19 @@ def validate_resource_evidence(
 
     minimum_cpus = resources.get("minimum_cpus")
     minimum_memory_gib = resources.get("minimum_memory_gib")
+    recommended_memory_gib = resources.get("recommended_memory_gib")
     require(_positive_integer(minimum_cpus), "matrix minimum CPU count is invalid")
     require(
         _positive_integer(minimum_memory_gib),
         "matrix minimum memory GiB is invalid",
     )
+    require(
+        _positive_integer(recommended_memory_gib)
+        and recommended_memory_gib >= minimum_memory_gib,
+        "matrix recommended memory GiB is invalid",
+    )
     minimum_memory_bytes = minimum_memory_gib * 1024 ** 3
+    recommended_memory_bytes = recommended_memory_gib * 1024 ** 3
 
     memory_policy = build_evidence.get("memory_policy")
     require(isinstance(memory_policy, dict), "build evidence has no memory_policy")
@@ -84,6 +135,7 @@ def validate_resource_evidence(
         usage_scope = memory.get("usage_scope")
         usage_peak_eligible = memory.get("usage_peak_eligible")
         usage_trustworthy = memory.get("usage_trustworthy")
+        peak_evidence_mode = memory.get("peak_evidence_mode")
         effective_cpus = cpu.get("effective_count")
         runpod_cpus = cpu.get("runpod_count")
         cgroup_version = cgroup.get("version")
@@ -113,8 +165,12 @@ def validate_resource_evidence(
             f"{evidence_name} memory hard-limit policy is malformed",
         )
         require(
-            cgroup_version in {1, 2},
-            f"{evidence_name} has no supported memory cgroup",
+            isinstance(usage_trustworthy, bool),
+            f"{evidence_name} usage trust policy is malformed",
+        )
+        require(
+            peak_evidence_mode in {"cgroup", "process-group-rss"},
+            f"{evidence_name} memory peak evidence mode is unsupported",
         )
         cgroup_prefix = f"cgroup-v{cgroup_version}:"
         if capacity_source == "runpod-api-assignment":
@@ -124,30 +180,14 @@ def validate_resource_evidence(
             )
         else:
             require(
-                capacity_source.startswith(cgroup_prefix)
+                _positive_integer(cgroup_version)
+                and cgroup_version in {1, 2}
+                and capacity_source.startswith(cgroup_prefix)
                 and capacity_is_hard_limit is True
                 and memory.get("limited") is True
                 and memory.get("limit_bytes") == capacity,
                 f"{evidence_name} cgroup capacity policy is inconsistent",
             )
-
-        require(
-            isinstance(usage_source, str) and usage_source.startswith(cgroup_prefix),
-            f"{evidence_name} peak usage source is not a cgroup",
-        )
-        require(
-            usage_scope
-            in {"cgroup-capacity", "pod-cgroup", "ambiguous-cgroup-root"},
-            f"{evidence_name} peak usage scope is unsupported",
-        )
-        require(
-            usage_peak_eligible is True,
-            f"{evidence_name} is not eligible for cgroup peak evidence",
-        )
-        require(
-            isinstance(usage_trustworthy, bool),
-            f"{evidence_name} usage trust policy is malformed",
-        )
         require(
             _positive_integer(effective_cpus) and effective_cpus >= minimum_cpus,
             f"{evidence_name} effective CPU count is below the matrix minimum",
@@ -164,11 +204,63 @@ def validate_resource_evidence(
             isinstance(build.get("forced_single_job"), bool),
             f"{evidence_name} forced-single-job policy is malformed",
         )
-        if usage_trustworthy is False:
+
+        if peak_evidence_mode == "cgroup":
             require(
-                usage_scope == "ambiguous-cgroup-root"
-                and build["forced_single_job"] is True,
-                f"{evidence_name} untrusted usage is not safely constrained",
+                _positive_integer(cgroup_version) and cgroup_version in {1, 2},
+                f"{evidence_name} has no supported memory cgroup",
+            )
+            require(
+                isinstance(usage_source, str)
+                and usage_source.startswith(cgroup_prefix),
+                f"{evidence_name} peak usage source is not a cgroup",
+            )
+            require(
+                usage_scope
+                in {"cgroup-capacity", "pod-cgroup", "ambiguous-cgroup-root"},
+                f"{evidence_name} peak usage scope is unsupported",
+            )
+            require(
+                usage_peak_eligible is True,
+                f"{evidence_name} is not eligible for cgroup peak evidence",
+            )
+            if usage_trustworthy is False:
+                require(
+                    usage_scope == "ambiguous-cgroup-root"
+                    and build["forced_single_job"] is True,
+                    f"{evidence_name} untrusted usage is not safely constrained",
+                )
+        else:
+            require(
+                capacity_source == "runpod-api-assignment"
+                and capacity == assigned_capacity
+                and capacity_is_hard_limit is False,
+                f"{evidence_name} RSS fallback requires the verified assignment capacity",
+            )
+            require(
+                capacity >= recommended_memory_bytes,
+                f"{evidence_name} RSS fallback capacity is below the matrix recommendation",
+            )
+            require(
+                cgroup_version is None
+                or (_positive_integer(cgroup_version) and cgroup_version in {1, 2}),
+                f"{evidence_name} RSS fallback cgroup metadata is malformed",
+            )
+            require(
+                memory.get("usage_current_bytes") is None
+                and usage_source == ""
+                and usage_scope == "unavailable"
+                and usage_peak_eligible is False
+                and usage_trustworthy is False,
+                f"{evidence_name} RSS fallback requires genuinely unavailable cgroup usage",
+            )
+            require(
+                build["forced_single_job"] is True
+                and _positive_integer(build.get("suggested_jobs"))
+                and build["suggested_jobs"] == 1
+                and _positive_integer(build.get("max_jobs_cap"))
+                and build["max_jobs_cap"] == 1,
+                f"{evidence_name} RSS fallback is not constrained to one build job",
             )
         snapshots[evidence_name] = (memory, cpu, build)
 
@@ -182,6 +274,7 @@ def validate_resource_evidence(
         "usage_source",
         "usage_scope",
         "usage_peak_eligible",
+        "peak_evidence_mode",
         "usage_trustworthy",
     )
     for field in bound_memory_fields:
@@ -213,6 +306,7 @@ def validate_resource_evidence(
         "capacity_is_hard_limit": start_memory["capacity_is_hard_limit"],
         "capacity_source": start_memory["capacity_source"],
         "forced_single_job": start_build["forced_single_job"],
+        "peak_evidence_mode": start_memory["peak_evidence_mode"],
         "usage_peak_eligible": start_memory["usage_peak_eligible"],
         "usage_scope": start_memory["usage_scope"],
         "usage_source": start_memory["usage_source"],
@@ -229,49 +323,400 @@ def validate_resource_evidence(
     )
     if memory_policy["forced_single_job"] is True:
         require(
-            selected_parallelism.get("max_jobs") == 1,
+            _positive_integer(selected_parallelism.get("max_jobs"))
+            and selected_parallelism["max_jobs"] == 1,
             "forced-single-job memory policy requires max_jobs=1",
         )
         require(
-            selected_parallelism.get("extension_parallelism") == 1,
+            _positive_integer(selected_parallelism.get("extension_parallelism"))
+            and selected_parallelism["extension_parallelism"] == 1,
             "forced-single-job memory policy requires extension_parallelism=1",
+        )
+
+    peak_evidence_mode = memory_policy["peak_evidence_mode"]
+    if peak_evidence_mode == "process-group-rss":
+        for field in (
+            "suggested_jobs",
+            "max_jobs_cap",
+            "reserve_bytes",
+            "memory_per_job_bytes",
+        ):
+            require(
+                end_build.get(field) == start_build.get(field),
+                f"RSS fallback build policy changed during build: {field}",
+            )
+        require(
+            _positive_integer(start_build.get("reserve_bytes")),
+            "RSS fallback build reserve is missing or invalid",
+        )
+        require(
+            _positive_integer(start_build.get("memory_per_job_bytes")),
+            "RSS fallback compiler memory assumption is missing or invalid",
+        )
+        require(
+            selected_parallelism.get("low_resource_override") is False,
+            "RSS fallback forbids the low-resource override",
+        )
+        require(
+            selected_parallelism.get("unsafe_override") is False,
+            "RSS fallback forbids the unsafe-parallelism override",
         )
 
     cgroup_peak = build_evidence.get("cgroup_peak")
     require(isinstance(cgroup_peak, dict), "build evidence has no cgroup_peak")
-    require(
-        cgroup_peak.get("source") == memory_policy["usage_source"],
-        "cgroup peak source does not match memory policy",
-    )
-    require(
-        cgroup_peak.get("scope") == memory_policy["usage_scope"],
-        "cgroup peak scope does not match memory policy",
-    )
-    require(
-        cgroup_peak.get("usage_trustworthy")
-        == memory_policy["usage_trustworthy"],
-        "cgroup peak trust policy does not match memory policy",
-    )
-    peak_start = cgroup_peak.get("start_bytes")
-    peak_end = cgroup_peak.get("end_bytes")
     selected_capacity = memory_policy["capacity_bytes"]
-    require(
-        _positive_integer(peak_start) and _positive_integer(peak_end),
-        "build evidence has no positive measured cgroup peak",
-    )
-    require(peak_end >= peak_start, "cgroup peak decreased during build")
-    require(
-        cgroup_peak.get("monotonic") is True,
-        "cgroup peak monotonic policy is missing or inconsistent",
-    )
-    require(
-        peak_start <= selected_capacity and peak_end <= selected_capacity,
-        "cgroup peak exceeds selected memory capacity",
-    )
-    require(
-        cgroup_peak.get("within_capacity") is True,
-        "cgroup peak capacity policy is missing or inconsistent",
-    )
+    memory_peak = build_evidence.get("memory_peak")
+    require(isinstance(memory_peak, dict), "build evidence has no memory_peak")
+
+    if peak_evidence_mode == "cgroup":
+        require(
+            cgroup_peak.get("available") is True,
+            "cgroup peak is not marked available",
+        )
+        require(
+            cgroup_peak.get("source") == memory_policy["usage_source"],
+            "cgroup peak source does not match memory policy",
+        )
+        require(
+            cgroup_peak.get("scope") == memory_policy["usage_scope"],
+            "cgroup peak scope does not match memory policy",
+        )
+        require(
+            cgroup_peak.get("usage_trustworthy")
+            == memory_policy["usage_trustworthy"],
+            "cgroup peak trust policy does not match memory policy",
+        )
+        peak_start = cgroup_peak.get("start_bytes")
+        peak_end = cgroup_peak.get("end_bytes")
+        require(
+            _positive_integer(peak_start) and _positive_integer(peak_end),
+            "build evidence has no positive measured cgroup peak",
+        )
+        require(peak_end >= peak_start, "cgroup peak decreased during build")
+        require(
+            cgroup_peak.get("monotonic") is True,
+            "cgroup peak monotonic policy is missing or inconsistent",
+        )
+        require(
+            peak_start <= selected_capacity and peak_end <= selected_capacity,
+            "cgroup peak exceeds selected memory capacity",
+        )
+        require(
+            cgroup_peak.get("within_capacity") is True,
+            "cgroup peak capacity policy is missing or inconsistent",
+        )
+        expected_memory_peak = {
+            "available": True,
+            "complete": True,
+            "end_bytes": peak_end,
+            "includes_file_cache": True,
+            "kernel_enforced": memory_policy["capacity_is_hard_limit"],
+            "method": "kernel-cgroup-peak",
+            "mode": "cgroup",
+            "peak_bytes": peak_end,
+            "sample_interval_ms": None,
+            "scope": memory_policy["usage_scope"],
+            "source": memory_policy["usage_source"],
+            "start_bytes": peak_start,
+            "within_selected_capacity": True,
+        }
+        require(
+            memory_peak == expected_memory_peak,
+            "cgroup memory_peak does not match the measured cgroup evidence",
+        )
+    else:
+        unavailable_cgroup_peak = {
+            "available": False,
+            "end_bytes": None,
+            "monotonic": None,
+            "scope": "unavailable",
+            "source": "",
+            "start_bytes": None,
+            "usage_trustworthy": False,
+            "within_capacity": None,
+        }
+        require(
+            cgroup_peak == unavailable_cgroup_peak,
+            "RSS fallback must not claim cgroup peak evidence",
+        )
+        expected_memory_peak_fields = {
+            "available",
+            "build_exit_status",
+            "child_returncode",
+            "checkpoint_interval_ms",
+            "command_sha256",
+            "complete",
+            "covers_other_pod_processes",
+            "duration_ms",
+            "end_bytes",
+            "finished_monotonic_ns",
+            "forced_kill",
+            "forwarded_signal",
+            "includes_file_cache",
+            "kernel_enforced",
+            "leader_observed",
+            "leader_pid",
+            "maximum_process_count",
+            "method",
+            "mode",
+            "monitor_error",
+            "observed_compiler_executable",
+            "observed_compiler_executables",
+            "peak_bytes",
+            "process_group_id",
+            "sample_count",
+            "sample_interval_ms",
+            "sampled_peak_plus_reserve_within_assignment",
+            "scope",
+            "shared_pages_may_be_double_counted",
+            "source",
+            "start_bytes",
+            "started_monotonic_ns",
+            "termination_grace_seconds",
+            "whole_pod_enforced",
+        }
+        require(
+            set(memory_peak) == expected_memory_peak_fields,
+            "RSS memory_peak fields are incomplete or unexpected",
+        )
+        expected_rss_policy = {
+            "available": True,
+            "build_exit_status": 0,
+            "child_returncode": 0,
+            "complete": True,
+            "covers_other_pod_processes": False,
+            "forced_kill": False,
+            "forwarded_signal": None,
+            "includes_file_cache": False,
+            "kernel_enforced": False,
+            "leader_observed": True,
+            "method": "proc-process-group-rss-sum",
+            "mode": "process-group-rss",
+            "monitor_error": None,
+            "observed_compiler_executable": True,
+            "sampled_peak_plus_reserve_within_assignment": True,
+            "scope": "build-process-group",
+            "shared_pages_may_be_double_counted": True,
+            "source": "/proc/*/statm",
+            "whole_pod_enforced": False,
+        }
+        for field, expected in expected_rss_policy.items():
+            matches = (
+                memory_peak.get(field) is expected
+                if isinstance(expected, bool) or expected is None
+                else memory_peak.get(field) == expected
+            )
+            require(
+                matches,
+                f"RSS memory_peak has invalid {field}",
+            )
+        for field, expected in (
+            ("sample_interval_ms", 100),
+            ("checkpoint_interval_ms", 5000),
+            ("termination_grace_seconds", 10),
+        ):
+            value = memory_peak.get(field)
+            require(
+                _positive_integer(value) and value == expected,
+                f"RSS memory_peak has invalid {field}",
+            )
+        for field in ("child_returncode", "build_exit_status"):
+            value = memory_peak.get(field)
+            require(
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and value == 0,
+                f"RSS memory_peak has invalid {field}",
+            )
+        command_sha256 = memory_peak.get("command_sha256")
+        require(
+            isinstance(command_sha256, str)
+            and re.fullmatch(r"[0-9a-f]{64}", command_sha256) is not None,
+            "RSS memory_peak has invalid command_sha256",
+        )
+        start_bytes = memory_peak.get("start_bytes")
+        end_bytes = memory_peak.get("end_bytes")
+        peak_bytes = memory_peak.get("peak_bytes")
+        require(
+            _positive_integer(start_bytes)
+            and _positive_integer(end_bytes)
+            and _positive_integer(peak_bytes),
+            "RSS memory_peak has no positive sampled endpoints and peak",
+        )
+        require(
+            peak_bytes >= max(start_bytes, end_bytes),
+            "RSS memory_peak is lower than a sampled endpoint",
+        )
+        require(
+            _positive_integer(memory_peak.get("sample_count"))
+            and memory_peak["sample_count"] >= 2,
+            "RSS memory_peak has too few samples",
+        )
+        require(
+            _positive_integer(memory_peak.get("maximum_process_count"))
+            and memory_peak["maximum_process_count"] >= 2,
+            "RSS memory_peak did not observe the build leader and a compiler",
+        )
+        process_group_id = memory_peak.get("process_group_id")
+        leader_pid = memory_peak.get("leader_pid")
+        require(
+            _positive_integer(process_group_id)
+            and _positive_integer(leader_pid)
+            and process_group_id == leader_pid,
+            "RSS memory_peak is not bound to its isolated process-group leader",
+        )
+        compiler_executables = memory_peak.get("observed_compiler_executables")
+        require(
+            isinstance(compiler_executables, list)
+            and bool(compiler_executables)
+            and all(_compiler_executable_name(item) for item in compiler_executables)
+            and compiler_executables == sorted(set(compiler_executables)),
+            "RSS memory_peak has invalid compiler executable evidence",
+        )
+        started_monotonic_ns = memory_peak.get("started_monotonic_ns")
+        finished_monotonic_ns = memory_peak.get("finished_monotonic_ns")
+        duration_ms = memory_peak.get("duration_ms")
+        require(
+            _positive_integer(started_monotonic_ns)
+            and _positive_integer(finished_monotonic_ns)
+            and finished_monotonic_ns > started_monotonic_ns,
+            "RSS memory_peak lifecycle timestamps are invalid",
+        )
+        require(
+            _positive_integer(duration_ms)
+            and duration_ms
+            == (finished_monotonic_ns - started_monotonic_ns) // 1_000_000,
+            "RSS memory_peak duration does not match its lifecycle timestamps",
+        )
+        require(
+            peak_bytes + start_build["reserve_bytes"] <= selected_capacity,
+            "RSS peak plus reserve exceeds the verified assignment capacity",
+        )
+
+
+def _evaluate_runtime_case(
+    *,
+    torch_module: Any,
+    implementation: Any,
+    implementation_name: str,
+    causal: bool,
+    reference: Any,
+    expected_output_shape: list[int],
+    expected_output_dtype: str,
+    expected_dtype: Any,
+    policy: dict[str, Any],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "causal": causal,
+        "expected_output_dtype": expected_output_dtype,
+        "expected_output_shape": expected_output_shape,
+        "implementation": implementation_name,
+    }
+    errors: list[dict[str, str]] = []
+
+    try:
+        raw_actual = implementation(causal)
+        torch_module.cuda.synchronize()
+    except Exception as error:
+        result["errors"] = [_runtime_error("execution", error)]
+        return result
+
+    if not isinstance(raw_actual, torch_module.Tensor):
+        result["errors"] = [
+            _runtime_error(
+                "output-validation",
+                f"non-tensor output for {implementation_name}, causal={causal}",
+            )
+        ]
+        return result
+
+    output_shape = list(raw_actual.shape)
+    output_dtype = str(raw_actual.dtype).removeprefix("torch.")
+    result["output_dtype"] = output_dtype
+    result["output_shape"] = output_shape
+    output_is_cuda = bool(raw_actual.is_cuda)
+    shape_matches = output_shape == expected_output_shape
+    dtype_matches = raw_actual.dtype == expected_dtype
+
+    if not output_is_cuda:
+        errors.append(_runtime_error(
+            "output-validation",
+            f"non-CUDA output for {implementation_name}, causal={causal}",
+        ))
+    if not shape_matches:
+        errors.append(_runtime_error(
+            "output-validation",
+            f"output shape {output_shape} != {expected_output_shape} for "
+            f"{implementation_name}, causal={causal}",
+        ))
+    if not dtype_matches:
+        errors.append(_runtime_error(
+            "output-validation",
+            f"output dtype {output_dtype} != {expected_output_dtype} for "
+            f"{implementation_name}, causal={causal}",
+        ))
+
+    try:
+        actual = raw_actual.float()
+        output_is_finite = bool(torch_module.isfinite(actual).all())
+    except Exception as error:
+        errors.append(_runtime_error("output-validation", error))
+        output_is_finite = False
+        actual = None
+
+    if actual is not None and not output_is_finite:
+        errors.append(_runtime_error(
+            "output-validation",
+            f"non-finite output for {implementation_name}, causal={causal}",
+        ))
+
+    if actual is not None and output_is_cuda and shape_matches and output_is_finite:
+        try:
+            reference_flat = reference.flatten()
+            actual_flat = actual.flatten()
+            cosine = float(
+                torch_module.dot(reference_flat, actual_flat)
+                / (
+                    torch_module.linalg.vector_norm(reference_flat)
+                    * torch_module.linalg.vector_norm(actual_flat)
+                ).clamp_min(1e-12)
+            )
+            relative_l2 = float(
+                torch_module.linalg.vector_norm(actual_flat - reference_flat)
+                / torch_module.linalg.vector_norm(reference_flat).clamp_min(1e-12)
+            )
+            if not math.isfinite(cosine):
+                errors.append(_runtime_error(
+                    "numeric-validation",
+                    f"non-finite cosine for {implementation_name}, causal={causal}",
+                ))
+            else:
+                result["cosine_similarity"] = cosine
+                if cosine < policy["minimum_cosine_similarity"]:
+                    errors.append(_runtime_error(
+                        "numeric-validation",
+                        f"cosine {cosine:.6f} below threshold for "
+                        f"{implementation_name}, causal={causal}",
+                    ))
+            if not math.isfinite(relative_l2):
+                errors.append(_runtime_error(
+                    "numeric-validation",
+                    f"non-finite relative L2 for {implementation_name}, causal={causal}",
+                ))
+            else:
+                result["relative_l2"] = relative_l2
+                if relative_l2 > policy["maximum_relative_l2"]:
+                    errors.append(_runtime_error(
+                        "numeric-validation",
+                        f"relative L2 {relative_l2:.6f} above threshold for "
+                        f"{implementation_name}, causal={causal}",
+                    ))
+        except Exception as error:
+            errors.append(_runtime_error("numeric-validation", error))
+
+    if errors:
+        result["errors"] = errors
+    return result
 
 
 def run_runtime_validation(
@@ -324,6 +769,7 @@ def run_runtime_validation(
     actual_capability = f"{major}.{minor}"
     require(actual_capability == expected_capability,
             f"scheduler GPU mismatch: expected {expected_capability}, got {actual_capability}")
+    cuda_device_name = torch.cuda.get_device_name(0)
 
     policy = matrix["validation"]["runtime_numeric"]
     case = policy["canonical_case"]
@@ -376,87 +822,65 @@ def run_runtime_validation(
     require(set(required_implementations) <= set(implementations),
             f"unknown runtime implementation policy for {actual_capability}")
 
-    references = {}
-    for causal in case["causal_modes"]:
-        with sdpa_kernel(SDPBackend.MATH):
-            references[causal] = functional.scaled_dot_product_attention(
-                q.float(), k.float(), v.float(), is_causal=causal)
+    runtime_image_ref = os.environ.get("RUNTIME_IMAGE_REF", "").strip()
+    require(bool(runtime_image_ref),
+            "RUNTIME_IMAGE_REF must contain the selected immutable image ref")
 
-    results = []
+    references: dict[bool, Any] = {}
+    reference_errors: dict[bool, dict[str, str]] = {}
+    for causal in case["causal_modes"]:
+        try:
+            with sdpa_kernel(SDPBackend.MATH):
+                references[causal] = functional.scaled_dot_product_attention(
+                    q.float(), k.float(), v.float(), is_causal=causal)
+            torch.cuda.synchronize()
+        except Exception as error:
+            reference_errors[causal] = _runtime_error("reference", error)
+
+    expected_output_shape = list(shape)
+    expected_output_dtype = case["dtype"]
+    results: list[dict[str, Any]] = []
     for implementation_name in required_implementations:
         implementation = implementations[implementation_name]
         for causal in case["causal_modes"]:
-            raw_actual = implementation(causal)
-            torch.cuda.synchronize()
-            require(
-                isinstance(raw_actual, torch.Tensor),
-                f"non-tensor output for {implementation_name}, causal={causal}",
-            )
-            require(
-                raw_actual.is_cuda,
-                f"non-CUDA output for {implementation_name}, causal={causal}",
-            )
-            output_shape = list(raw_actual.shape)
-            expected_output_shape = list(shape)
-            require(
-                output_shape == expected_output_shape,
-                f"output shape {output_shape} != {expected_output_shape} for "
-                f"{implementation_name}, causal={causal}",
-            )
-            output_dtype = str(raw_actual.dtype).removeprefix("torch.")
-            expected_output_dtype = case["dtype"]
-            require(
-                raw_actual.dtype == dtype,
-                f"output dtype {output_dtype} != {expected_output_dtype} for "
-                f"{implementation_name}, causal={causal}",
-            )
-            actual = raw_actual.float()
-            require(
-                bool(torch.isfinite(actual).all()),
-                f"non-finite output for {implementation_name}, causal={causal}",
-            )
-            reference_flat = references[causal].flatten()
-            actual_flat = actual.flatten()
-            cosine = float(
-                torch.dot(reference_flat, actual_flat)
-                / (torch.linalg.vector_norm(reference_flat)
-                   * torch.linalg.vector_norm(actual_flat)).clamp_min(1e-12)
-            )
-            relative_l2 = float(
-                torch.linalg.vector_norm(actual_flat - reference_flat)
-                / torch.linalg.vector_norm(reference_flat).clamp_min(1e-12)
-            )
-            require(
-                cosine >= policy["minimum_cosine_similarity"],
-                f"cosine {cosine:.6f} below threshold for "
-                f"{implementation_name}, causal={causal}",
-            )
-            require(
-                relative_l2 <= policy["maximum_relative_l2"],
-                f"relative L2 {relative_l2:.6f} above threshold for "
-                f"{implementation_name}, causal={causal}",
-            )
-            results.append({
-                "causal": causal,
-                "cosine_similarity": cosine,
-                "expected_output_dtype": expected_output_dtype,
-                "expected_output_shape": expected_output_shape,
-                "implementation": implementation_name,
-                "output_dtype": output_dtype,
-                "output_shape": output_shape,
-                "relative_l2": relative_l2,
-            })
+            if causal in reference_errors:
+                results.append({
+                    "causal": causal,
+                    "errors": [reference_errors[causal]],
+                    "expected_output_dtype": expected_output_dtype,
+                    "expected_output_shape": expected_output_shape,
+                    "implementation": implementation_name,
+                })
+                continue
+            results.append(_evaluate_runtime_case(
+                torch_module=torch,
+                implementation=implementation,
+                implementation_name=implementation_name,
+                causal=causal,
+                reference=references[causal],
+                expected_output_dtype=expected_output_dtype,
+                expected_output_shape=expected_output_shape,
+                expected_dtype=dtype,
+                policy=policy,
+            ))
 
-    runtime_image_ref = os.environ.get("RUNTIME_IMAGE_REF", "").strip()
-    require(bool(runtime_image_ref), "RUNTIME_IMAGE_REF must contain the selected immutable image ref")
+    failures = [
+        {
+            "causal": result["causal"],
+            "errors": result["errors"],
+            "implementation": result["implementation"],
+        }
+        for result in results
+        if result.get("errors")
+    ]
     report = {
         "build_id": build["id"],
-        "status": "pass",
+        "status": "fail" if failures else "pass",
         "wheel_asset": artifact["asset"],
         "wheel_sha256": artifact["sha256"],
         "expected_compute_capability": expected_capability,
         "actual_compute_capability": actual_capability,
-        "cuda_device_name": torch.cuda.get_device_name(0),
+        "cuda_device_name": cuda_device_name,
         "compiled_modules": compiled_modules,
         "expected_runtime_image": build["comfyui_runtime_image"],
         "runtime_image_ref": runtime_image_ref,
@@ -467,14 +891,18 @@ def run_runtime_validation(
         "torch_version": str(torch.__version__),
         "sageattention_version": build["wheel_version"],
     }
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = report_path.with_name(f".{report_path.name}.tmp")
-    temporary.write_text(
-        json.dumps(report, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-        newline="\n",
-    )
-    os.replace(temporary, report_path)
+    if failures:
+        report["failures"] = failures
+    _write_json_atomic(report_path, report)
+    if failures:
+        first = failures[0]
+        first_error = first["errors"][0]["message"]
+        raise ValidationError(
+            f"runtime numerical validation failed for {len(failures)} of "
+            f"{len(results)} outcomes; diagnostic report: {report_path}; "
+            f"first failure: {first['implementation']}, causal={first['causal']}: "
+            f"{first_error}"
+        )
     return report
 
 
@@ -559,6 +987,7 @@ def validate(
             "cgroup_peak",
             "elapsed_seconds",
             "matrix_sha256",
+            "memory_peak",
             "memory_policy",
             "patch_sha256",
             "resource_end",

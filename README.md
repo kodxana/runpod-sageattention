@@ -21,6 +21,11 @@ SageAttention source + Python ABI + PyTorch version + CUDA variant + GPU cubins
 | `cu128` | CPython 3.12 | `2.10.0+cu128` | CUDA 12.8 | SM 80, 86, 89, 90a, 120 |
 | `cu130` | CPython 3.12 | `2.10.0+cu130` | CUDA 13.0 | SM 80, 86, 89, 90a, 120 |
 
+Both variants carry the downstream `sm90fix1` revision. Their exact local
+versions are `2.2.0+torch2.10.0.cu128.sm90fix1` and
+`2.2.0+torch2.10.0.cu130.sm90fix1`; this prevents the corrected wheels from
+colliding with previously built v2.2.0 artifacts.
+
 SageAttention 2.2.0 does not implement the SM10x paths used by B200 (SM100) and
 B300 (SM103). Both are therefore deliberately excluded rather than advertised
 based on an untested PTX fallback. The supported Blackwell target here is
@@ -68,6 +73,13 @@ safe native-SASS target list:
 | `_qattn_sm90` | 90a only |
 | `_fused` | 80, 86, 89, 90a, 120 |
 
+The patch also backports upstream commit
+[`d9704247a5139ab4c03bf7fc6b35cc0e2cbb5ea4`](https://github.com/thu-ml/SageAttention/commit/d9704247a5139ab4c03bf7fc6b35cc0e2cbb5ea4).
+The v2.2.0 tag gives the SM90 fake implementation the same Python name as the
+real custom op, replacing the eager-call binding and returning an uninitialized
+output buffer without launching the Hopper kernel. The upstream one-line rename
+keeps fake-tensor registration separate from the callable CUDA op.
+
 ## Build resources
 
 The factory attaches a GPU because builders run on GPU Pods, but compilation
@@ -94,6 +106,16 @@ build entrypoint uses the smaller of a finite cgroup limit and the exact,
 receipt-backed Runpod API assignment. It lowers concurrency—and forces one
 Ninja job and one extension at a time for an ambiguous cgroup root—rather than
 trusting host-wide `/proc/meminfo`, host CPU counts, or GPU VRAM.
+
+If Runpod exposes no readable memory-cgroup membership counter, a release build
+is allowed only on the full recommended 64 GiB-or-larger verified assignment.
+That restricted path serializes both forms of compiler parallelism and records
+a 100 ms process-group RSS peak. A supervisor launches the exact wheel command
+in a dedicated session, proves that its leader and a native compiler were
+observed, and forwards SSH cancellation with bounded TERM-to-KILL cleanup. The
+manifest explicitly states that this is not a kernel limit and does not include
+unrelated Pod processes or most filesystem cache; the normal reserve must still
+fit above the sampled peak.
 
 ## Safety properties
 
