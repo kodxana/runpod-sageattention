@@ -1,0 +1,567 @@
+name: Build and GPU-validate wheels
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Git ref or full commit containing the reviewed factory source
+        required: true
+        default: main
+        type: string
+      builder_image_cu128:
+        description: CUDA 12.8 builder image (immutable Docker Hub digest)
+        required: true
+        default: "madiatorlabs/sageattention-wheel-builder@sha256:556979b41a98e5331ad38a1ae599161cb37a78cb09bec34e3f982978b84816d0"
+        type: string
+      builder_image_cu130:
+        description: CUDA 13.0 builder image (immutable Docker Hub digest)
+        required: true
+        default: "madiatorlabs/sageattention-wheel-builder@sha256:bed84f32bf76ba292728faf9fbe446d5d7f84d194444b2b6d006e663cccba906"
+        type: string
+      runtime_image_cu128:
+        description: ComfyUI-compatible cu128 test image (prefer @sha256:digest)
+        required: true
+        type: string
+      runtime_image_cu130:
+        description: ComfyUI-compatible cu130 test image (prefer @sha256:digest)
+        required: true
+        type: string
+      gpu_id_sm80:
+        description: Exact Runpod gpuId for one SM 8.0 representative
+        required: true
+        type: string
+      gpu_id_sm86:
+        description: Exact Runpod gpuId for one SM 8.6 representative
+        required: true
+        type: string
+      gpu_id_sm89:
+        description: Exact Runpod gpuId for one SM 8.9 representative
+        required: true
+        type: string
+      gpu_id_sm90:
+        description: Exact Runpod gpuId for one SM 9.0 representative
+        required: true
+        type: string
+      gpu_id_sm120:
+        description: Exact Runpod gpuId for one SM 12.0 representative
+        required: true
+        type: string
+      cloud_type:
+        description: Runpod capacity pool
+        required: true
+        default: COMMUNITY
+        type: choice
+        options:
+          - COMMUNITY
+          - SECURE
+      registry_auth_id:
+        description: Optional Runpod registry-auth id for private/rate-limited images
+        required: false
+        default: ""
+        type: string
+      container_disk_gb:
+        description: Ephemeral container disk for each Pod (80 GB minimum)
+        required: true
+        default: 80
+        type: number
+      cpu_flavor_ids:
+        description: Ordered CPU flavor ids; cpu3g provides 4 GB RAM per vCPU
+        required: true
+        default: cpu3g
+        type: string
+      cpu_vcpu_count:
+        description: CPU build Pod vCPUs (16 with cpu3g targets 64 GB RAM)
+        required: true
+        default: 16
+        type: number
+      cpu_min_memory_gb:
+        description: Minimum returned CPU Pod RAM accepted before build
+        required: true
+        default: 32
+        type: number
+      timeout_seconds:
+        description: Hard per-Pod orchestration timeout
+        required: true
+        default: 14400
+        type: number
+      gpu_max_parallel:
+        description: Maximum simultaneously billed GPU validation Pods
+        required: true
+        default: 2
+        type: number
+      enforce_image_digests:
+        description: Require every builder/runtime image to end in @sha256:<64 hex>
+        required: true
+        default: true
+        type: boolean
+      confirm_paid_pods:
+        description: I approve creation of billed Runpod CPU and GPU Pods
+        required: true
+        default: false
+        type: boolean
+  workflow_call:
+    inputs:
+      source_ref:
+        required: true
+        type: string
+      builder_image_cu128:
+        required: false
+        default: "madiatorlabs/sageattention-wheel-builder@sha256:556979b41a98e5331ad38a1ae599161cb37a78cb09bec34e3f982978b84816d0"
+        type: string
+      builder_image_cu130:
+        required: false
+        default: "madiatorlabs/sageattention-wheel-builder@sha256:bed84f32bf76ba292728faf9fbe446d5d7f84d194444b2b6d006e663cccba906"
+        type: string
+      runtime_image_cu128:
+        required: true
+        type: string
+      runtime_image_cu130:
+        required: true
+        type: string
+      gpu_id_sm80:
+        required: true
+        type: string
+      gpu_id_sm86:
+        required: true
+        type: string
+      gpu_id_sm89:
+        required: true
+        type: string
+      gpu_id_sm90:
+        required: true
+        type: string
+      gpu_id_sm120:
+        required: true
+        type: string
+      cloud_type:
+        required: false
+        default: COMMUNITY
+        type: string
+      registry_auth_id:
+        required: false
+        default: ""
+        type: string
+      container_disk_gb:
+        required: false
+        default: 80
+        type: number
+      cpu_flavor_ids:
+        required: false
+        default: cpu3g
+        type: string
+      cpu_vcpu_count:
+        required: false
+        default: 16
+        type: number
+      cpu_min_memory_gb:
+        required: false
+        default: 32
+        type: number
+      timeout_seconds:
+        required: false
+        default: 14400
+        type: number
+      gpu_max_parallel:
+        required: false
+        default: 2
+        type: number
+      enforce_image_digests:
+        required: false
+        default: true
+        type: boolean
+      confirm_paid_pods:
+        required: true
+        type: boolean
+    secrets:
+      RUNPOD_API_KEY:
+        required: true
+      RUNPOD_SSH_PRIVATE_KEY:
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wheel-factory-${{ inputs.source_ref }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Resolve reviewed matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      builds: ${{ steps.plan.outputs.builds }}
+      gpu-tests: ${{ steps.plan.outputs.gpu-tests }}
+      source_sha: ${{ steps.source.outputs.source_sha }}
+    steps:
+      - name: Check out requested source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_ref }}
+
+      - name: Freeze checked-out source commit
+        id: source
+        shell: bash
+        run: |
+          source_sha="$(git rev-parse --verify HEAD^{commit})"
+          [[ "${source_sha}" =~ ^[0-9a-f]{40}$ ]]
+          echo "source_sha=${source_sha}" >> "${GITHUB_OUTPUT}"
+
+      - name: Generate build and representative-GPU plans
+        id: plan
+        shell: bash
+        env:
+          BUILDER_CU128: ${{ inputs.builder_image_cu128 }}
+          BUILDER_CU130: ${{ inputs.builder_image_cu130 }}
+          RUNTIME_CU128: ${{ inputs.runtime_image_cu128 }}
+          RUNTIME_CU130: ${{ inputs.runtime_image_cu130 }}
+          GPU_SM80: ${{ inputs.gpu_id_sm80 }}
+          GPU_SM86: ${{ inputs.gpu_id_sm86 }}
+          GPU_SM89: ${{ inputs.gpu_id_sm89 }}
+          GPU_SM90: ${{ inputs.gpu_id_sm90 }}
+          GPU_SM120: ${{ inputs.gpu_id_sm120 }}
+          ENFORCE_DIGESTS: ${{ inputs.enforce_image_digests }}
+          CONFIRM_PAID_PODS: ${{ inputs.confirm_paid_pods }}
+          CONTAINER_DISK_GB: ${{ inputs.container_disk_gb }}
+          CPU_FLAVOR_IDS: ${{ inputs.cpu_flavor_ids }}
+          CPU_VCPU_COUNT: ${{ inputs.cpu_vcpu_count }}
+          CPU_MIN_MEMORY_GB: ${{ inputs.cpu_min_memory_gb }}
+          TIMEOUT_SECONDS: ${{ inputs.timeout_seconds }}
+          GPU_MAX_PARALLEL: ${{ inputs.gpu_max_parallel }}
+        run: |
+          python3.12 - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          source = json.loads(Path("matrix.json").read_text())
+          expected_build_ids = {
+              "cp312-torch2.10.0-cu128",
+              "cp312-torch2.10.0-cu130",
+          }
+          actual_build_ids = [build.get("id") for build in source.get("builds", [])]
+          if set(actual_build_ids) != expected_build_ids or len(actual_build_ids) != 2:
+              raise SystemExit(f"unexpected build matrix: {actual_build_ids!r}")
+          if source.get("platform", {}).get("architecture") != "x86_64":
+              raise SystemExit("only the reviewed Linux x86-64 wheel platform is allowed")
+          if os.environ["CONFIRM_PAID_PODS"].lower() != "true":
+              raise SystemExit(
+                  "paid Pods were not confirmed; dispatch again with "
+                  "confirm_paid_pods=true"
+              )
+          disk = int(os.environ["CONTAINER_DISK_GB"])
+          cpu_vcpus = int(os.environ["CPU_VCPU_COUNT"])
+          cpu_min_memory = int(os.environ["CPU_MIN_MEMORY_GB"])
+          cpu_flavors = [
+              item.strip() for item in os.environ["CPU_FLAVOR_IDS"].split(",")
+              if item.strip()
+          ]
+          timeout = int(os.environ["TIMEOUT_SECONDS"])
+          max_parallel = int(os.environ["GPU_MAX_PARALLEL"])
+          if not 80 <= disk <= 200:
+              raise SystemExit("container_disk_gb must be between 80 and 200")
+          allowed_cpu_flavors = {
+              "cpu3c", "cpu3g", "cpu3m", "cpu5c", "cpu5g", "cpu5m"
+          }
+          if not cpu_flavors or not set(cpu_flavors) <= allowed_cpu_flavors:
+              raise SystemExit(
+                  f"cpu_flavor_ids must use documented exact ids; got {cpu_flavors!r}"
+              )
+          resources = source["resources"]
+          if not resources["minimum_cpus"] <= cpu_vcpus <= 64:
+              raise SystemExit(
+                  f"cpu_vcpu_count must be {resources['minimum_cpus']}..64"
+              )
+          if not resources["minimum_memory_gib"] <= cpu_min_memory <= 256:
+              raise SystemExit(
+                  "cpu_min_memory_gb must meet the matrix minimum and be <=256"
+              )
+          if not 600 <= timeout <= 14_400:
+              raise SystemExit("timeout_seconds must be between 600 and 14400")
+          if not 1 <= max_parallel <= 5:
+              raise SystemExit("gpu_max_parallel must be between 1 and 5")
+          image_by_cuda = {
+              "12.8": (os.environ["BUILDER_CU128"], os.environ["RUNTIME_CU128"]),
+              "13.0": (os.environ["BUILDER_CU130"], os.environ["RUNTIME_CU130"]),
+          }
+          gpu_ids = {
+              "8.0": os.environ["GPU_SM80"],
+              "8.6": os.environ["GPU_SM86"],
+              "8.9": os.environ["GPU_SM89"],
+              "9.0": os.environ["GPU_SM90"],
+              "12.0": os.environ["GPU_SM120"],
+          }
+          digest_ref = re.compile(r"^\S+@sha256:[0-9a-fA-F]{64}$")
+          enforce = os.environ["ENFORCE_DIGESTS"].lower() == "true"
+          for label, value in {**{f"gpu {k}": v for k, v in gpu_ids.items()},
+                               **{f"image {k} {n}": v for k, pair in image_by_cuda.items()
+                                  for n, v in zip(("builder", "runtime"), pair)}}.items():
+              if not value or "\n" in value or "\r" in value:
+                  raise SystemExit(f"missing or malformed {label} input")
+          for cuda, pair in image_by_cuda.items():
+              for image in pair:
+                  if any(character.isspace() for character in image):
+                      raise SystemExit(f"CUDA {cuda} image contains whitespace: {image!r}")
+          if enforce:
+              for cuda, pair in image_by_cuda.items():
+                  for image in pair:
+                      if not digest_ref.fullmatch(image):
+                          raise SystemExit(
+                              f"CUDA {cuda} image is not immutable: {image!r}; "
+                              "supply registry/repository@sha256:<64 hex>"
+                          )
+
+          required_caps = [
+              item["compute_capability"]
+              for item in source["validation"]["representative_gpu_capabilities"]
+              if item.get("required")
+          ]
+          if set(required_caps) != set(gpu_ids):
+              raise SystemExit(
+                  f"workflow GPU inputs {sorted(gpu_ids)} do not match matrix "
+                  f"requirements {sorted(required_caps)}"
+              )
+
+          builds = []
+          tests = []
+          for build in source["builds"]:
+              cuda = build["cuda_version"]
+              if cuda not in image_by_cuda:
+                  raise SystemExit(f"workflow has no image input for CUDA {cuda}")
+              builder, runtime = image_by_cuda[cuda]
+              entry = {
+                  "build_id": build["id"],
+                  "builder_image": builder,
+                  "runtime_image": runtime,
+                  "min_cuda": build["minimum_cuda_scheduler_version"],
+                  "artifact_name": f"wheel-{build['id']}",
+              }
+              builds.append(entry)
+              for capability in required_caps:
+                  sm = "sm" + capability.replace(".", "")
+                  tests.append({
+                      **entry,
+                      "capability": capability,
+                      "sm": sm,
+                      "gpu_id": gpu_ids[capability],
+                      "result_artifact": f"runtime-{build['id']}-{sm}",
+                  })
+
+          output = Path(os.environ["GITHUB_OUTPUT"])
+          with output.open("a", encoding="utf-8") as handle:
+              handle.write("builds=" + json.dumps({"include": builds}, separators=(",", ":")) + "\n")
+              handle.write("gpu-tests=" + json.dumps({"include": tests}, separators=(",", ":")) + "\n")
+          PY
+
+  build:
+    name: CPU build / ${{ matrix.build_id }}
+    needs: plan
+    runs-on: ubuntu-24.04
+    environment: runpod-paid
+    timeout-minutes: 270
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.builds) }}
+    steps:
+      - name: Check out requested source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.source_sha }}
+
+      - name: Install checksum-pinned runpodctl
+        shell: bash
+        env:
+          RUNPODCTL_VERSION: v2.3.0
+          RUNPODCTL_SHA256: 908f2210571e8a26a1cba6fb45f09556b34dcad3e1b20dd502df2adf7a57c169
+        run: |
+          curl -fsSL --proto '=https' --tlsv1.2 \
+            "https://github.com/runpod/runpodctl/releases/download/${RUNPODCTL_VERSION}/runpodctl-linux-amd64.tar.gz" \
+            -o "${RUNNER_TEMP}/runpodctl.tar.gz"
+          echo "${RUNPODCTL_SHA256}  ${RUNNER_TEMP}/runpodctl.tar.gz" | sha256sum -c -
+          sudo tar -xzf "${RUNNER_TEMP}/runpodctl.tar.gz" -C /usr/local/bin runpodctl
+          runpodctl version
+
+      - name: Materialize ephemeral SSH identity
+        shell: bash
+        env:
+          PRIVATE_KEY: ${{ secrets.RUNPOD_SSH_PRIVATE_KEY }}
+        run: |
+          install -d -m 0700 "${RUNNER_TEMP}/runpod-ssh"
+          printf '%s\n' "${PRIVATE_KEY}" > "${RUNNER_TEMP}/runpod-ssh/id"
+          chmod 0600 "${RUNNER_TEMP}/runpod-ssh/id"
+          ssh-keygen -y -f "${RUNNER_TEMP}/runpod-ssh/id" \
+            > "${RUNNER_TEMP}/runpod-ssh/id.pub"
+          echo "RUNPOD_SSH_PUBLIC_KEY=$(cat "${RUNNER_TEMP}/runpod-ssh/id.pub")" \
+            >> "${GITHUB_ENV}"
+
+      - name: Compile wheel on CPU Pod
+        shell: bash
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          BUILD_ID: ${{ matrix.build_id }}
+          BUILDER_IMAGE: ${{ matrix.builder_image }}
+          CLOUD_TYPE: ${{ inputs.cloud_type }}
+          REGISTRY_AUTH_ID: ${{ inputs.registry_auth_id }}
+          DISK_GB: ${{ inputs.container_disk_gb }}
+          HARD_TIMEOUT: ${{ inputs.timeout_seconds }}
+          CPU_FLAVOR_IDS: ${{ inputs.cpu_flavor_ids }}
+          CPU_VCPU_COUNT: ${{ inputs.cpu_vcpu_count }}
+          CPU_MIN_MEMORY_GB: ${{ inputs.cpu_min_memory_gb }}
+        run: |
+          registry_args=()
+          if [[ -n "${REGISTRY_AUTH_ID}" ]]; then
+            registry_args+=(--registry-auth-id "${REGISTRY_AUTH_ID}")
+          fi
+          printf -v builder_ref_q '%q' "${BUILDER_IMAGE}"
+          remote_command="install -d -m 0700 /work/tmp /work/sageattention-wheel-builds; TMPDIR=/work/tmp SAGEATTN_WORK_ROOT=/work/sageattention-wheel-builds BUILDER_IMAGE_REF=${builder_ref_q} bash scripts/build-wheel.sh --build-id ${BUILD_ID} --output-dir dist/${BUILD_ID}"
+          python3.12 tools/runpod_job.py \
+            --allow-paid-pod \
+            --mode cpu \
+            --image "${BUILDER_IMAGE}" \
+            --name "sage-build-${BUILD_ID}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --cloud-type "${CLOUD_TYPE}" \
+            --container-disk-gb "${DISK_GB}" \
+            --cpu-flavor-ids "${CPU_FLAVOR_IDS}" \
+            --cpu-vcpu-count "${CPU_VCPU_COUNT}" \
+            --cpu-min-memory-gb "${CPU_MIN_MEMORY_GB}" \
+            --ssh-key "${RUNNER_TEMP}/runpod-ssh/id" \
+            --repo "${GITHUB_WORKSPACE}" \
+            --remote-dir /work/sageattention-factory \
+            --timeout-seconds "${HARD_TIMEOUT}" \
+            --terminate-grace-seconds 900 \
+            --command "${remote_command}" \
+            --artifact "dist/${BUILD_ID}" \
+            --artifact-output "${RUNNER_TEMP}/runpod-output" \
+            "${registry_args[@]}"
+
+      - name: Verify transferred checksums
+        shell: bash
+        env:
+          BUILD_ID: ${{ matrix.build_id }}
+        run: |
+          artifact_dir="${RUNNER_TEMP}/runpod-output/dist/${BUILD_ID}"
+          test -f "${artifact_dir}/manifest.json"
+          test -f "${artifact_dir}/SHA256SUMS"
+          wheel_count=$(find "${artifact_dir}" -maxdepth 1 -type f -name '*.whl' | wc -l)
+          test "${wheel_count}" -eq 1
+          (cd "${artifact_dir}" && sha256sum -c SHA256SUMS)
+
+      - name: Upload immutable build payload
+        if: ${{ always() }}
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ runner.temp }}/runpod-output/dist/${{ matrix.build_id }}
+          # The preceding checksum step is the success gate. On a failed
+          # compile this best-effort upload preserves partial diagnostics.
+          if-no-files-found: warn
+          retention-days: 14
+
+  gpu-test:
+    name: GPU test / ${{ matrix.build_id }} / ${{ matrix.sm }}
+    needs:
+      - plan
+      - build
+    runs-on: ubuntu-24.04
+    environment: runpod-paid
+    timeout-minutes: 270
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ inputs.gpu_max_parallel }}
+      matrix: ${{ fromJSON(needs.plan.outputs.gpu-tests) }}
+    steps:
+      - name: Check out requested source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.source_sha }}
+
+      - name: Download exact wheel payload
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.build_id }}
+
+      - name: Verify pre-test checksums
+        shell: bash
+        env:
+          BUILD_ID: ${{ matrix.build_id }}
+        run: (cd "dist/${BUILD_ID}" && sha256sum -c SHA256SUMS)
+
+      - name: Install checksum-pinned runpodctl
+        shell: bash
+        env:
+          RUNPODCTL_VERSION: v2.3.0
+          RUNPODCTL_SHA256: 908f2210571e8a26a1cba6fb45f09556b34dcad3e1b20dd502df2adf7a57c169
+        run: |
+          curl -fsSL --proto '=https' --tlsv1.2 \
+            "https://github.com/runpod/runpodctl/releases/download/${RUNPODCTL_VERSION}/runpodctl-linux-amd64.tar.gz" \
+            -o "${RUNNER_TEMP}/runpodctl.tar.gz"
+          echo "${RUNPODCTL_SHA256}  ${RUNNER_TEMP}/runpodctl.tar.gz" | sha256sum -c -
+          sudo tar -xzf "${RUNNER_TEMP}/runpodctl.tar.gz" -C /usr/local/bin runpodctl
+          runpodctl version
+
+      - name: Materialize ephemeral SSH identity
+        shell: bash
+        env:
+          PRIVATE_KEY: ${{ secrets.RUNPOD_SSH_PRIVATE_KEY }}
+        run: |
+          install -d -m 0700 "${RUNNER_TEMP}/runpod-ssh"
+          printf '%s\n' "${PRIVATE_KEY}" > "${RUNNER_TEMP}/runpod-ssh/id"
+          chmod 0600 "${RUNNER_TEMP}/runpod-ssh/id"
+          ssh-keygen -y -f "${RUNNER_TEMP}/runpod-ssh/id" \
+            > "${RUNNER_TEMP}/runpod-ssh/id.pub"
+          echo "RUNPOD_SSH_PUBLIC_KEY=$(cat "${RUNNER_TEMP}/runpod-ssh/id.pub")" \
+            >> "${GITHUB_ENV}"
+
+      - name: Install and numerically validate on representative GPU
+        shell: bash
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          BUILD_ID: ${{ matrix.build_id }}
+          RUNTIME_IMAGE: ${{ matrix.runtime_image }}
+          GPU_ID: ${{ matrix.gpu_id }}
+          CAPABILITY: ${{ matrix.capability }}
+          SM: ${{ matrix.sm }}
+          MIN_CUDA: ${{ matrix.min_cuda }}
+          CLOUD_TYPE: ${{ inputs.cloud_type }}
+          REGISTRY_AUTH_ID: ${{ inputs.registry_auth_id }}
+          DISK_GB: ${{ inputs.container_disk_gb }}
+          HARD_TIMEOUT: ${{ inputs.timeout_seconds }}
+        run: |
+          registry_args=()
+          if [[ -n "${REGISTRY_AUTH_ID}" ]]; then
+            registry_args+=(--registry-auth-id "${REGISTRY_AUTH_ID}")
+          fi
+          prepare="mkdir -p runtime-results/${BUILD_ID}; set -- dist/${BUILD_ID}/*.whl; test \"\$#\" -eq 1; python3.12 -m pip install --no-deps --force-reinstall \"\$1\""
+          printf -v runtime_ref_q '%q' "${RUNTIME_IMAGE}"
+          validate="set -- dist/${BUILD_ID}/*.whl; RUNTIME_IMAGE_REF=${runtime_ref_q} python3.12 scripts/validate-wheel.py --matrix matrix.json --build-id ${BUILD_ID} --wheel \"\$1\" --manifest dist/${BUILD_ID}/manifest.json --checksums dist/${BUILD_ID}/SHA256SUMS --runtime --expected-capability ${CAPABILITY} --runtime-report runtime-results/${BUILD_ID}/${SM}.json"
+          python3.12 tools/runpod_job.py \
+            --allow-paid-pod \
+            --mode gpu \
+            --gpu-id "${GPU_ID}" \
+            --min-cuda-version "${MIN_CUDA}" \
+            --image "${RUNTIME_IMAGE}" \
+            --name "sage-test-${BUILD_ID}-${SM}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --cloud-type "${CLOUD_TYPE}" \
+            --container-disk-gb "${DISK_GB}" \
+            --ssh-key "${RUNNER_TEMP}/runpod-ssh/id" \
+            --repo "${GITHUB_WORKSPACE}" \
+            --remote-dir /workspace \
+            --timeout-seconds "${HARD_TIMEOUT}" \
+            --terminate-grace-seconds 900 \
+            --command "${prepare}" \
+            --command "${validate}" \
+            --artifact "runtime-results/${BUILD_ID}" \
+            --artifact-output "${RUNNER_TEMP}/runtime-output" \
+            "${registry_args[@]}"
+
+      - name: Upload per-GPU validation evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: ${{ matrix.result_artifact }}
+          path: ${{ runner.temp }}/runtime-output/runtime-results/${{ matrix.build_id }}/${{ matrix.sm }}.json
+          if-no-files-found: warn
+          retention-days: 14

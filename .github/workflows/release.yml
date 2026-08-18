@@ -1,0 +1,494 @@
+name: Gated release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing immutable Git tag to build and release
+        required: true
+        type: string
+      builder_image_cu128:
+        description: Immutable CUDA 12.8 builder image (@sha256 required)
+        required: true
+        default: "madiatorlabs/sageattention-wheel-builder@sha256:556979b41a98e5331ad38a1ae599161cb37a78cb09bec34e3f982978b84816d0"
+        type: string
+      builder_image_cu130:
+        description: Immutable CUDA 13.0 builder image (@sha256 required)
+        required: true
+        default: "madiatorlabs/sageattention-wheel-builder@sha256:bed84f32bf76ba292728faf9fbe446d5d7f84d194444b2b6d006e663cccba906"
+        type: string
+      runtime_image_cu128:
+        description: Immutable ComfyUI-compatible cu128 image (@sha256 required)
+        required: true
+        type: string
+      runtime_image_cu130:
+        description: Immutable ComfyUI-compatible cu130 image (@sha256 required)
+        required: true
+        type: string
+      gpu_id_sm80:
+        description: Exact Runpod gpuId for one SM 8.0 representative
+        required: true
+        type: string
+      gpu_id_sm86:
+        description: Exact Runpod gpuId for one SM 8.6 representative
+        required: true
+        type: string
+      gpu_id_sm89:
+        description: Exact Runpod gpuId for one SM 8.9 representative
+        required: true
+        type: string
+      gpu_id_sm90:
+        description: Exact Runpod gpuId for one SM 9.0 representative
+        required: true
+        type: string
+      gpu_id_sm120:
+        description: Exact Runpod gpuId for one SM 12.0 representative
+        required: true
+        type: string
+      cloud_type:
+        description: Runpod capacity pool
+        required: true
+        default: COMMUNITY
+        type: choice
+        options:
+          - COMMUNITY
+          - SECURE
+      registry_auth_id:
+        description: Optional Runpod registry-auth id
+        required: false
+        default: ""
+        type: string
+      container_disk_gb:
+        description: Ephemeral container disk for each Pod (80 GB minimum)
+        required: true
+        default: 80
+        type: number
+      cpu_flavor_ids:
+        description: Ordered CPU flavor ids (cpu3g recommended)
+        required: true
+        default: cpu3g
+        type: string
+      cpu_vcpu_count:
+        description: CPU build Pod vCPUs (16 with cpu3g targets 64 GB RAM)
+        required: true
+        default: 16
+        type: number
+      cpu_min_memory_gb:
+        description: Minimum returned CPU Pod RAM accepted before build
+        required: true
+        default: 32
+        type: number
+      timeout_seconds:
+        description: Hard per-Pod orchestration timeout
+        required: true
+        default: 14400
+        type: number
+      gpu_max_parallel:
+        description: Maximum simultaneously billed GPU validation Pods
+        required: true
+        default: 2
+        type: number
+      confirm_paid_pods:
+        description: I approve the billed Runpod build and validation matrix
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: release-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Freeze release tag before paid work
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      source_sha: ${{ steps.resolve.outputs.source_sha }}
+    steps:
+      - name: Check out workflow source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Resolve tag to its peeled commit
+        id: resolve
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          if [[ "${RELEASE_TAG}" == -* ]]; then
+            echo "release_tag must not start with '-'" >&2
+            exit 1
+          fi
+          git check-ref-format "refs/tags/${RELEASE_TAG}"
+          git fetch --no-tags origin \
+            "+refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          source_sha="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
+          [[ "${source_sha}" =~ ^[0-9a-f]{40}$ ]]
+          echo "source_sha=${source_sha}" >> "${GITHUB_OUTPUT}"
+
+  factory:
+    needs: preflight
+    uses: ./.github/workflows/build.yml
+    with:
+      source_ref: ${{ needs.preflight.outputs.source_sha }}
+      builder_image_cu128: ${{ inputs.builder_image_cu128 }}
+      builder_image_cu130: ${{ inputs.builder_image_cu130 }}
+      runtime_image_cu128: ${{ inputs.runtime_image_cu128 }}
+      runtime_image_cu130: ${{ inputs.runtime_image_cu130 }}
+      gpu_id_sm80: ${{ inputs.gpu_id_sm80 }}
+      gpu_id_sm86: ${{ inputs.gpu_id_sm86 }}
+      gpu_id_sm89: ${{ inputs.gpu_id_sm89 }}
+      gpu_id_sm90: ${{ inputs.gpu_id_sm90 }}
+      gpu_id_sm120: ${{ inputs.gpu_id_sm120 }}
+      cloud_type: ${{ inputs.cloud_type }}
+      registry_auth_id: ${{ inputs.registry_auth_id }}
+      container_disk_gb: ${{ inputs.container_disk_gb }}
+      cpu_flavor_ids: ${{ inputs.cpu_flavor_ids }}
+      cpu_vcpu_count: ${{ inputs.cpu_vcpu_count }}
+      cpu_min_memory_gb: ${{ inputs.cpu_min_memory_gb }}
+      timeout_seconds: ${{ inputs.timeout_seconds }}
+      gpu_max_parallel: ${{ inputs.gpu_max_parallel }}
+      enforce_image_digests: true
+      confirm_paid_pods: ${{ inputs.confirm_paid_pods }}
+    secrets: inherit
+
+  publish:
+    name: Publish only after every GPU test passes
+    needs:
+      - preflight
+      - factory
+    runs-on: ubuntu-24.04
+    environment: sageattention-release
+    timeout-minutes: 20
+    steps:
+      - name: Check out the frozen release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.source_sha }}
+
+      - name: Verify checkout and immutable image inputs
+        shell: bash
+        env:
+          RESOLVED_SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
+          BUILDER_CU128: ${{ inputs.builder_image_cu128 }}
+          BUILDER_CU130: ${{ inputs.builder_image_cu130 }}
+          RUNTIME_CU128: ${{ inputs.runtime_image_cu128 }}
+          RUNTIME_CU130: ${{ inputs.runtime_image_cu130 }}
+        run: |
+          test "$(git rev-parse --verify HEAD^{commit})" = "${RESOLVED_SOURCE_SHA}"
+          python3.12 - <<'PY'
+          import os
+          import re
+
+          pattern = re.compile(r"^\S+@sha256:[0-9a-fA-F]{64}$")
+          for name in ("BUILDER_CU128", "BUILDER_CU130", "RUNTIME_CU128", "RUNTIME_CU130"):
+              value = os.environ[name]
+              if not pattern.fullmatch(value):
+                  raise SystemExit(f"release image {name} is not immutable: {value!r}")
+          PY
+
+      - name: Download tested wheel payloads
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          pattern: wheel-*
+          path: downloaded-wheels
+
+      - name: Download all representative-GPU evidence
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          pattern: runtime-*
+          path: downloaded-runtime
+
+      - name: Reverify and stage release assets
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          BUILDER_CU128: ${{ inputs.builder_image_cu128 }}
+          BUILDER_CU130: ${{ inputs.builder_image_cu130 }}
+          RUNTIME_CU128: ${{ inputs.runtime_image_cu128 }}
+          RUNTIME_CU130: ${{ inputs.runtime_image_cu130 }}
+          GPU_SM80: ${{ inputs.gpu_id_sm80 }}
+          GPU_SM86: ${{ inputs.gpu_id_sm86 }}
+          GPU_SM89: ${{ inputs.gpu_id_sm89 }}
+          GPU_SM90: ${{ inputs.gpu_id_sm90 }}
+          GPU_SM120: ${{ inputs.gpu_id_sm120 }}
+          CPU_FLAVOR_IDS: ${{ inputs.cpu_flavor_ids }}
+          CPU_VCPU_COUNT: ${{ inputs.cpu_vcpu_count }}
+          CPU_MIN_MEMORY_GB: ${{ inputs.cpu_min_memory_gb }}
+          RESOLVED_SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
+        run: |
+          python3.12 - <<'PY'
+          import hashlib
+          import json
+          import math
+          import os
+          import shutil
+          import subprocess
+          from pathlib import Path
+
+          matrix = json.loads(Path("matrix.json").read_text())
+          destination = Path("release-assets")
+          destination.mkdir()
+          runtime_by_cuda = {
+              "12.8": os.environ["RUNTIME_CU128"],
+              "13.0": os.environ["RUNTIME_CU130"],
+          }
+          builder_by_cuda = {
+              "12.8": os.environ["BUILDER_CU128"],
+              "13.0": os.environ["BUILDER_CU130"],
+          }
+          wheel_by_build = {}
+          for build in matrix["builds"]:
+              build_id = build["id"]
+              source = Path("downloaded-wheels") / f"wheel-{build_id}"
+              if not source.is_dir():
+                  raise SystemExit(f"missing wheel artifact for {build_id}")
+              subprocess.run(
+                  ["sha256sum", "-c", "SHA256SUMS"],
+                  cwd=source,
+                  check=True,
+              )
+              wheels = list(source.glob("*.whl"))
+              if len(wheels) != 1:
+                  raise SystemExit(f"expected one wheel for {build_id}, got {wheels}")
+              wheel_by_build[build_id] = {
+                  "asset": wheels[0].name,
+                  "sha256": hashlib.sha256(wheels[0].read_bytes()).hexdigest(),
+              }
+              manifest = json.loads((source / "manifest.json").read_text())
+              artifacts = manifest.get("artifacts")
+              if not isinstance(artifacts, list) or len(artifacts) != 1:
+                  raise SystemExit(f"invalid per-build manifest for {build_id}")
+              recorded_builder = (
+                  artifacts[0].get("build_evidence", {})
+                  .get("builder_image", {})
+                  .get("ref")
+              )
+              expected_builder = builder_by_cuda[build["cuda_version"]]
+              if recorded_builder != expected_builder:
+                  raise SystemExit(
+                      f"builder image binding mismatch for {build_id}: "
+                      f"expected {expected_builder!r}, got {recorded_builder!r}"
+                  )
+              shutil.copy2(wheels[0], destination / wheels[0].name)
+              shutil.copy2(source / "manifest.json", destination / f"{build_id}.manifest.json")
+              shutil.copy2(source / "SHA256SUMS", destination / f"{build_id}.SHA256SUMS")
+
+          required_caps = [
+              item["compute_capability"]
+              for item in matrix["validation"]["representative_gpu_capabilities"]
+              if item.get("required")
+          ]
+          expected = {
+              f"runtime-{build['id']}-sm{cap.replace('.', '')}": (build, cap)
+              for build in matrix["builds"]
+              for cap in required_caps
+          }
+          present = {path.name for path in Path("downloaded-runtime").iterdir() if path.is_dir()}
+          if present != set(expected):
+              raise SystemExit(
+                  f"GPU evidence set mismatch; missing={sorted(set(expected)-present)}, "
+                  f"unexpected={sorted(present-set(expected))}"
+              )
+          numeric_policy = matrix["validation"]["runtime_numeric"]
+          for artifact, (build, capability) in expected.items():
+              reports = list((Path("downloaded-runtime") / artifact).glob("*.json"))
+              if len(reports) != 1:
+                  raise SystemExit(f"expected one runtime report in {artifact}, got {reports}")
+              report = json.loads(reports[0].read_text())
+              wheel = wheel_by_build[build["id"]]
+              exact_fields = {
+                  "build_id": build["id"],
+                  "status": "pass",
+                  "wheel_asset": wheel["asset"],
+                  "wheel_sha256": wheel["sha256"],
+                  "expected_compute_capability": capability,
+                  "actual_compute_capability": capability,
+                  "torch_version": build["torch_version"],
+                  "torch_cuda_version": build["torch_cuda_version"],
+                  "sageattention_version": build["wheel_version"],
+                  "expected_runtime_image": build["comfyui_runtime_image"],
+                  "runtime_image_ref": runtime_by_cuda[build["cuda_version"]],
+              }
+              mismatches = {
+                  key: {"expected": value, "actual": report.get(key)}
+                  for key, value in exact_fields.items()
+                  if report.get(key) != value
+              }
+              if mismatches:
+                  raise SystemExit(
+                      f"runtime report binding mismatch in {reports[0]}: "
+                      f"{json.dumps(mismatches, sort_keys=True)}"
+                  )
+              results = report.get("results")
+              implementations = numeric_policy["implementations_by_capability"][capability]
+              expected_pairs = {
+                  (implementation, causal)
+                  for implementation in implementations
+                  for causal in numeric_policy["canonical_case"]["causal_modes"]
+              }
+              actual_pairs = {
+                  (item.get("implementation"), item.get("causal"))
+                  for item in results
+              } if isinstance(results, list) else set()
+              if (
+                  not isinstance(results, list)
+                  or len(results) != len(expected_pairs)
+                  or actual_pairs != expected_pairs
+              ):
+                  raise SystemExit(
+                      f"runtime report implementation coverage mismatch in {reports[0]}: "
+                      f"expected {sorted(expected_pairs, key=repr)!r}, "
+                      f"got {sorted(actual_pairs, key=repr)!r}"
+                  )
+              canonical_case = numeric_policy["canonical_case"]
+              expected_shape = [
+                  canonical_case["batch_size"],
+                  canonical_case["query_heads"],
+                  canonical_case["sequence_length"],
+                  canonical_case["head_dimension"],
+              ]
+              expected_dtype = canonical_case["dtype"]
+              for result in results:
+                  tensor_fields = {
+                      "output_shape": expected_shape,
+                      "expected_output_shape": expected_shape,
+                      "output_dtype": expected_dtype,
+                      "expected_output_dtype": expected_dtype,
+                  }
+                  tensor_mismatches = {
+                      key: {"expected": value, "actual": result.get(key)}
+                      for key, value in tensor_fields.items()
+                      if result.get(key) != value
+                  }
+                  if tensor_mismatches:
+                      raise SystemExit(
+                          f"runtime output tensor mismatch in {reports[0]}: "
+                          f"{json.dumps(tensor_mismatches, sort_keys=True)}"
+                      )
+                  cosine = result.get("cosine_similarity")
+                  relative_l2 = result.get("relative_l2")
+                  if not isinstance(cosine, (int, float)) or not math.isfinite(cosine):
+                      raise SystemExit(f"invalid cosine metric in {reports[0]}")
+                  if not isinstance(relative_l2, (int, float)) or not math.isfinite(relative_l2):
+                      raise SystemExit(f"invalid relative-L2 metric in {reports[0]}")
+                  if cosine < numeric_policy["minimum_cosine_similarity"]:
+                      raise SystemExit(f"cosine threshold failure in {reports[0]}")
+                  if relative_l2 > numeric_policy["maximum_relative_l2"]:
+                      raise SystemExit(f"relative-L2 threshold failure in {reports[0]}")
+
+          checkout_commit = subprocess.check_output(
+              ["git", "rev-parse", "HEAD"], text=True
+          ).strip()
+          if checkout_commit != os.environ["RESOLVED_SOURCE_SHA"]:
+              raise SystemExit(
+                  f"release checkout drifted: expected "
+                  f"{os.environ['RESOLVED_SOURCE_SHA']}, got {checkout_commit}"
+              )
+          provenance = {
+              "schema_version": 1,
+              "release_tag": os.environ["RELEASE_TAG"],
+              "source_commit": os.environ["RESOLVED_SOURCE_SHA"],
+              "github_run": {
+                  "repository": os.environ["GITHUB_REPOSITORY"],
+                  "run_id": os.environ["GITHUB_RUN_ID"],
+                  "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              },
+              "builder_images": {
+                  "cu128": os.environ["BUILDER_CU128"],
+                  "cu130": os.environ["BUILDER_CU130"],
+              },
+              "runtime_images": {
+                  "cu128": os.environ["RUNTIME_CU128"],
+                  "cu130": os.environ["RUNTIME_CU130"],
+              },
+              "representative_gpu_ids": {
+                  "8.0": os.environ["GPU_SM80"],
+                  "8.6": os.environ["GPU_SM86"],
+                  "8.9": os.environ["GPU_SM89"],
+                  "9.0": os.environ["GPU_SM90"],
+                  "12.0": os.environ["GPU_SM120"],
+              },
+              "cpu_placement": {
+                  "flavor_ids": [
+                      item.strip()
+                      for item in os.environ["CPU_FLAVOR_IDS"].split(",")
+                      if item.strip()
+                  ],
+                  "vcpu_count": int(os.environ["CPU_VCPU_COUNT"]),
+                  "minimum_memory_gb": int(os.environ["CPU_MIN_MEMORY_GB"]),
+              },
+          }
+          (destination / "release-inputs.json").write_text(
+              json.dumps(provenance, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          mapfile -t manifests < <(find downloaded-wheels -type f -name manifest.json | sort)
+          test "${#manifests[@]}" -eq 2
+          python3.12 scripts/merge-manifests.py \
+            --output release-assets/manifest.json \
+            --checksums release-assets/SHA256SUMS \
+            "${manifests[@]}"
+          (cd release-assets && sha256sum -c SHA256SUMS)
+          tar -czf release-assets/gpu-validation-evidence.tar.gz downloaded-runtime
+
+      - name: Generate concise release notes
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          python3.12 - <<'PY' > release-notes.md
+          import json
+          from pathlib import Path
+
+          matrix = json.loads(Path("matrix.json").read_text())
+          print("SageAttention wheel factory release.")
+          print()
+          print("Every attached wheel was compiled on a bounded Runpod CPU Pod and passed")
+          print("import and numerical validation on one configured GPU for each required")
+          print("compute capability before this release was created.")
+          print()
+          print("Build variants:")
+          for build in matrix["builds"]:
+              print(f"- {build['id']}: {build['wheel_filename']}")
+          print()
+          print("Do not select a wheel by its standard Python tag alone; use the exact")
+          print("Python + PyTorch + CUDA tuple recorded in its adjacent manifest.")
+          PY
+
+      - name: Create immutable GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RESOLVED_SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
+        run: |
+          git check-ref-format "refs/tags/${RELEASE_TAG}"
+          tag_ref="refs/tags/${RELEASE_TAG}"
+          remote_refs="$(git ls-remote --exit-code origin \
+            "${tag_ref}" "${tag_ref}^{}")"
+          tag_object=""
+          peeled_commit=""
+          while read -r object ref; do
+            if [[ "${ref}" == "${tag_ref}" ]]; then
+              tag_object="${object}"
+            elif [[ "${ref}" == "${tag_ref}^{}" ]]; then
+              peeled_commit="${object}"
+            fi
+          done <<< "${remote_refs}"
+          current_commit="${peeled_commit:-${tag_object}}"
+          if [[ -z "${current_commit}" || "${current_commit}" != "${RESOLVED_SOURCE_SHA}" ]]; then
+            echo "release tag changed after preflight: expected ${RESOLVED_SOURCE_SHA}, got ${current_commit:-missing}" >&2
+            exit 1
+          fi
+          gh release create "${RELEASE_TAG}" release-assets/* \
+            --verify-tag \
+            --title "${RELEASE_TAG}" \
+            --notes-file release-notes.md

@@ -1,0 +1,43 @@
+#!/bin/sh
+# Apply the meminfo compatibility library only to the three presentation
+# tools it was designed for.  Keep the real programs at their distro paths.
+set -eu
+
+tool=${0##*/}
+case "$tool" in
+    free|htop|top) ;;
+    *)
+        echo "podproc-wrapper: invoke through free, htop, or top" >&2
+        exit 64
+        ;;
+esac
+
+real_tool=
+for candidate in "/usr/bin/$tool" "/bin/$tool"; do
+    if [ -x "$candidate" ]; then
+        real_tool=$candidate
+        break
+    fi
+done
+
+if [ -z "$real_tool" ]; then
+    echo "podproc-wrapper: real $tool executable not found" >&2
+    exit 127
+fi
+
+library=${PODPROC_LIBRARY:-/usr/local/lib/libpodproc.so}
+case "${PODPROC_DISABLE:-}" in
+    ''|0|false|FALSE|no|NO|off|OFF)
+        if [ -r "$library" ]; then
+            if [ -n "${LD_PRELOAD:-}" ]; then
+                LD_PRELOAD="$library:$LD_PRELOAD"
+            else
+                LD_PRELOAD=$library
+            fi
+            export LD_PRELOAD
+        fi
+        ;;
+esac
+
+exec "$real_tool" "$@"
+

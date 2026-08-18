@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  local-validation:
+    name: Local validation (no paid Pods)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Compile Python sources
+        run: python3.12 -m compileall -q scripts tools tests
+
+      - name: Check shell syntax
+        shell: bash
+        run: |
+          bash -n scripts/*.sh docker/*.sh docker/resource-shim/*.sh \
+            docker/resource-shim/podproc-wrapper
+
+      - name: Run cgroup resource-planner unit tests
+        run: python3.12 -m unittest discover -s tests -p 'test_pod_resources.py' -v
+
+      - name: Compile and smoke-test scoped resource shim
+        run: sh docker/resource-shim/smoke-test.sh
+
+      - name: Run unit tests
+        run: python3.12 -m unittest discover -s tests -p 'test_*.py' -v
+
+      - name: Validate matrix invariants
+        shell: bash
+        run: |
+          python3.12 - <<'PY'
+          import json
+          from pathlib import Path
+
+          matrix = json.loads(Path("matrix.json").read_text())
+          builds = matrix.get("builds", [])
+          ids = [build.get("id") for build in builds]
+          expected = {
+              "cp312-torch2.10.0-cu128",
+              "cp312-torch2.10.0-cu130",
+          }
+          if set(ids) != expected or len(ids) != len(set(ids)):
+              raise SystemExit(f"unexpected or duplicate build ids: {ids}")
+          capabilities = {
+              item["compute_capability"]
+              for item in matrix["validation"]["representative_gpu_capabilities"]
+              if item.get("required")
+          }
+          if capabilities != {"8.0", "8.6", "8.9", "9.0", "12.0"}:
+              raise SystemExit(f"unexpected required GPU capabilities: {capabilities}")
+          if matrix["platform"]["architecture"] != "x86_64":
+              raise SystemExit("only the reviewed Linux x86-64 wheel platform is allowed")
+          PY
+
+      - name: Parse workflow YAML
+        shell: bash
+        run: |
+          ruby -e 'require "yaml"; ARGV.each { |path| abort("empty YAML: #{path}") unless YAML.parse_file(path) }' \
+            .github/workflows/*.yml
+
+      # This workflow intentionally has no Runpod credentials, environment,
+      # runpodctl installation, or --allow-paid-pod invocation.

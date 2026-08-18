@@ -1,0 +1,9 @@
+SageAttention Wheel Factory
+
+This product applies downstream build-system modifications to SageAttention,
+which is Copyright (c) 2024 SageAttention team and licensed under the Apache
+License, Version 2.0.
+
+SageAttention source is fetched from its upstream repository at build time and
+is not vendored here. The exact source commit is recorded in matrix.json and in
+every generated wheel manifest.

@@ -1,0 +1,20 @@
+[project]
+name = "sageattention-wheel-factory"
+version = "0.1.0"
+description = "Reproducible SageAttention wheels for Runpod ComfyUI images"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+

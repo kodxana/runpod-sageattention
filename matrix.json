@@ -1,0 +1,198 @@
+{
+  "schema_version": 1,
+  "package": {
+    "distribution": "sageattention",
+    "upstream_version": "2.2.0",
+    "source_url": "https://github.com/thu-ml/SageAttention.git",
+    "source_commit": "eb615cf6cf4d221338033340ee2de1c37fbdba4a",
+    "source_date_epoch": 1761613216
+  },
+  "platform": {
+    "base_image": "ubuntu:24.04",
+    "os": "linux",
+    "architecture": "x86_64",
+    "platform_tag": "linux_x86_64",
+    "python_version": "3.12",
+    "python_tag": "cp312",
+    "abi_tag": "cp312"
+  },
+  "cuda_policy": {
+    "native_sass_only": true,
+    "include_ptx": false,
+    "torch_cuda_arch_list": "8.0;8.6;8.9;9.0;12.0",
+    "compute_capabilities": [
+      "8.0",
+      "8.6",
+      "8.9",
+      "9.0",
+      "12.0"
+    ],
+    "extension_compile_targets": {
+      "sageattention._qattn_sm80": [
+        "sm_80",
+        "sm_86",
+        "sm_89",
+        "sm_90a",
+        "sm_120"
+      ],
+      "sageattention._qattn_sm89": [
+        "sm_89",
+        "sm_90a",
+        "sm_120"
+      ],
+      "sageattention._qattn_sm90": [
+        "sm_90a"
+      ],
+      "sageattention._fused": [
+        "sm_80",
+        "sm_86",
+        "sm_89",
+        "sm_90a",
+        "sm_120"
+      ]
+    },
+    "extension_cubin_architectures": {
+      "sageattention._qattn_sm80": [
+        "sm_80",
+        "sm_86",
+        "sm_89",
+        "sm_90",
+        "sm_120"
+      ],
+      "sageattention._qattn_sm89": [
+        "sm_89",
+        "sm_90",
+        "sm_120"
+      ],
+      "sageattention._qattn_sm90": [
+        "sm_90"
+      ],
+      "sageattention._fused": [
+        "sm_80",
+        "sm_86",
+        "sm_89",
+        "sm_90",
+        "sm_120"
+      ]
+    }
+  },
+  "resources": {
+    "gpu_required": false,
+    "minimum_cpus": 4,
+    "minimum_memory_gib": 32,
+    "recommended_memory_gib": 64,
+    "minimum_free_disk_gib": 20,
+    "compiler_memory_per_job_mib": 8192,
+    "default_max_jobs": 2,
+    "default_extension_parallelism": 1
+  },
+  "validation": {
+    "minimum_wheel_size_bytes": 1000000,
+    "maximum_wheel_size_bytes": 1073741824,
+    "runtime_numeric": {
+      "reference": "torch.nn.functional.scaled_dot_product_attention",
+      "minimum_cosine_similarity": 0.995,
+      "maximum_relative_l2": 0.1,
+      "implementations_by_capability": {
+        "8.0": [
+          "sageattn_dispatch",
+          "qattn_sm80_cuda"
+        ],
+        "8.6": [
+          "sageattn_dispatch",
+          "qattn_sm80_cuda"
+        ],
+        "8.9": [
+          "sageattn_dispatch",
+          "qattn_sm80_cuda",
+          "qattn_sm89_cuda"
+        ],
+        "9.0": [
+          "sageattn_dispatch",
+          "qattn_sm80_cuda",
+          "qattn_sm89_cuda",
+          "qattn_sm90_cuda"
+        ],
+        "12.0": [
+          "sageattn_dispatch",
+          "qattn_sm80_cuda",
+          "qattn_sm89_cuda"
+        ]
+      },
+      "canonical_case": {
+        "seed": 2026,
+        "batch_size": 1,
+        "query_heads": 8,
+        "key_value_heads": 8,
+        "sequence_length": 512,
+        "head_dimension": 64,
+        "dtype": "float16",
+        "tensor_layout": "HND",
+        "causal_modes": [false, true]
+      }
+    },
+    "required_extensions": [
+      "sageattention._qattn_sm80",
+      "sageattention._qattn_sm89",
+      "sageattention._qattn_sm90",
+      "sageattention._fused"
+    ],
+    "representative_gpu_capabilities": [
+      {
+        "compute_capability": "8.0",
+        "required": true,
+        "representative_gpus": ["A100"]
+      },
+      {
+        "compute_capability": "8.6",
+        "required": true,
+        "representative_gpus": ["A40", "RTX 3090"]
+      },
+      {
+        "compute_capability": "8.9",
+        "required": true,
+        "representative_gpus": ["L40S", "RTX 4090"]
+      },
+      {
+        "compute_capability": "9.0",
+        "required": true,
+        "representative_gpus": ["H100", "H200"]
+      },
+      {
+        "compute_capability": "12.0",
+        "required": true,
+        "representative_gpus": ["RTX 5090"]
+      }
+    ]
+  },
+  "builds": [
+    {
+      "id": "cp312-torch2.10.0-cu128",
+      "cuda_version": "12.8",
+      "cuda_package_suffix": "12-8",
+      "torch_version": "2.10.0+cu128",
+      "torch_cuda_version": "12.8",
+      "torch_index_url": "https://download.pytorch.org/whl/cu128",
+      "wheel_version": "2.2.0+torch2.10.0.cu128",
+      "wheel_filename": "sageattention-2.2.0+torch2.10.0.cu128-cp312-cp312-linux_x86_64.whl",
+      "comfyui_runtime_image": "runpod/comfyui:cuda12.8",
+      "minimum_cuda_scheduler_version": "12.8",
+      "builder_image": "madiatorlabs/sageattention-wheel-builder@sha256:556979b41a98e5331ad38a1ae599161cb37a78cb09bec34e3f982978b84816d0",
+      "builder_target": "builder-cu128"
+    },
+    {
+      "id": "cp312-torch2.10.0-cu130",
+      "cuda_version": "13.0",
+      "cuda_package_suffix": "13-0",
+      "torch_version": "2.10.0+cu130",
+      "torch_cuda_version": "13.0",
+      "torch_index_url": "https://download.pytorch.org/whl/cu130",
+      "wheel_version": "2.2.0+torch2.10.0.cu130",
+      "wheel_filename": "sageattention-2.2.0+torch2.10.0.cu130-cp312-cp312-linux_x86_64.whl",
+      "comfyui_runtime_image": "runpod/comfyui:cuda13.0",
+      "minimum_cuda_scheduler_version": "13.0",
+      "builder_image": "madiatorlabs/sageattention-wheel-builder@sha256:bed84f32bf76ba292728faf9fbe446d5d7f84d194444b2b6d006e663cccba906",
+      "builder_target": "builder-cu130"
+    }
+  ]
+}
