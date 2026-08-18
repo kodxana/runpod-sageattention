@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -413,6 +419,83 @@ class PodResourcesTests(unittest.TestCase):
             self.assertTrue(result.build.forced_single_job)
             self.assertEqual(result.build.suggested_jobs, 1)
 
+    def test_verified_assignment_without_cgroup_counter_selects_rss_fallback(
+        self,
+    ) -> None:
+        with self.fixture_root() as raw_root:
+            root = Path(raw_root)
+            write(root, "/proc/meminfo", host_meminfo(128, 112))
+            write(root, "/proc/self/cgroup", "")
+            write(root, "/proc/self/mountinfo", "")
+            write_verified_assignment(root, gib(64))
+
+            result = pr.collect_resources(
+                filesystem_root=root,
+                env={"RUNPOD_ASSIGNED_MEMORY_BYTES": str(gib(64))},
+                affinity_count=8,
+                host_cpu_count=8,
+            )
+
+            self.assertEqual(
+                result.memory.capacity_source, "runpod-api-assignment"
+            )
+            self.assertEqual(result.memory.capacity_bytes, gib(64))
+            self.assertIsNone(result.memory.usage_current_bytes)
+            self.assertEqual(result.memory.usage_source, "")
+            self.assertEqual(result.memory.usage_scope, "unavailable")
+            self.assertFalse(result.memory.usage_trustworthy)
+            self.assertFalse(result.memory.usage_peak_eligible)
+            self.assertEqual(
+                result.memory.peak_evidence_mode, "process-group-rss"
+            )
+            self.assertTrue(result.build.forced_single_job)
+            self.assertEqual(result.build.suggested_jobs, 1)
+
+    def test_readable_usage_over_assignment_cannot_select_rss_fallback(
+        self,
+    ) -> None:
+        with self.fixture_root() as raw_root:
+            root = Path(raw_root)
+            leaf = setup_v2_leaf(root, "/pod")
+            (leaf / "memory.max").write_text("max\n", encoding="ascii")
+            (leaf / "memory.current").write_text(str(gib(33)), encoding="ascii")
+            (leaf / "memory.stat").write_text("inactive_file 0\n", encoding="ascii")
+            write_verified_assignment(root, gib(32))
+
+            result = pr.collect_resources(
+                filesystem_root=root,
+                env={"RUNPOD_ASSIGNED_MEMORY_BYTES": str(gib(32))},
+                affinity_count=8,
+                host_cpu_count=8,
+            )
+
+            self.assertEqual(result.memory.usage_current_bytes, gib(33))
+            self.assertNotEqual(result.memory.usage_source, "")
+            self.assertEqual(result.memory.peak_evidence_mode, "unavailable")
+            self.assertFalse(result.memory.usage_peak_eligible)
+            self.assertTrue(result.build.forced_single_job)
+
+    def test_malformed_usage_counter_cannot_select_rss_fallback(self) -> None:
+        with self.fixture_root() as raw_root:
+            root = Path(raw_root)
+            leaf = setup_v2_leaf(root, "/pod")
+            (leaf / "memory.max").write_text("max\n", encoding="ascii")
+            (leaf / "memory.current").write_text("not-a-counter\n", encoding="ascii")
+            write_verified_assignment(root, gib(64))
+
+            result = pr.collect_resources(
+                filesystem_root=root,
+                env={"RUNPOD_ASSIGNED_MEMORY_BYTES": str(gib(64))},
+                affinity_count=8,
+                host_cpu_count=8,
+            )
+
+            self.assertIsNone(result.memory.usage_current_bytes)
+            self.assertEqual(result.memory.peak_evidence_mode, "unavailable")
+            self.assertTrue(
+                any("counter is malformed" in warning for warning in result.warnings)
+            )
+
     def test_smaller_finite_cgroup_limit_wins_over_assignment(self) -> None:
         with self.fixture_root() as raw_root:
             root = Path(raw_root)
@@ -596,6 +679,233 @@ class PodResourcesTests(unittest.TestCase):
         self.assertIsNone(pr.parse_cpuset(""))
         self.assertIsNone(pr.parse_cpuset("3-1"))
 
+    def test_process_group_rss_sum_is_conservative_and_handles_spaced_comm(
+        self,
+    ) -> None:
+        with self.fixture_root() as raw_root:
+            proc_root = Path(raw_root)
+            for pid, group, pages, command in (
+                (101, 77, 10, "python worker"),
+                (102, 77, 20, "compiler (phase)"),
+                (103, 88, 99, "unrelated"),
+            ):
+                process = proc_root / str(pid)
+                process.mkdir()
+                (process / "stat").write_text(
+                    f"{pid} ({command}) S 1 {group} 0 0\n", encoding="ascii"
+                )
+                (process / "statm").write_text(
+                    f"100 {pages} 0 0 0 0 0\n", encoding="ascii"
+                )
+
+            rss_bytes, process_count = pr.collect_process_group_rss(
+                77, proc_root=proc_root, page_size=4096
+            )
+
+            self.assertEqual(rss_bytes, 30 * 4096)
+            self.assertEqual(process_count, 2)
+
+    @unittest.skipUnless(os.name == "posix" and Path("/proc").is_dir(), "Linux /proc")
+    def test_process_group_supervisor_binds_compiler_and_writes_evidence(self) -> None:
+        with self.fixture_root() as raw_root:
+            root = Path(raw_root)
+            output = root / "rss.json"
+            compiler = root / "c++"
+            shutil.copy2("/bin/sleep", compiler)
+            compiler.chmod(0o755)
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(pr.__file__).resolve()),
+                    "--monitor-process-group",
+                    str(output),
+                    "--sample-interval-ms",
+                    "100",
+                    "--",
+                    sys.executable,
+                    "-c",
+                    (
+                        "import subprocess,sys; "
+                        "raise SystemExit(subprocess.run([sys.argv[1], '.5']).returncode)"
+                    ),
+                    str(compiler),
+                ],
+                check=False,
+                timeout=5,
+            )
+            self.assertEqual(completed.returncode, 0)
+
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertTrue(payload["complete"])
+            self.assertEqual(payload["schema_version"], 2)
+            self.assertEqual(payload["method"], "proc-process-group-rss-sum")
+            self.assertEqual(payload["scope"], "build-process-group")
+            self.assertEqual(payload["source"], "/proc/*/statm")
+            self.assertEqual(payload["leader_pid"], payload["process_group_id"])
+            self.assertTrue(payload["leader_observed"])
+            self.assertTrue(payload["observed_compiler_executable"])
+            self.assertIn("c++", payload["observed_compiler_executables"])
+            self.assertEqual(payload["child_returncode"], 0)
+            self.assertEqual(payload["build_exit_status"], 0)
+            self.assertIsNone(payload["forwarded_signal"])
+            self.assertFalse(payload["forced_kill"])
+            self.assertGreaterEqual(payload["sample_count"], 2)
+            self.assertGreaterEqual(payload["maximum_process_count"], 2)
+            self.assertGreater(payload["peak_bytes"], 0)
+            self.assertGreater(payload["end_bytes"], 0)
+            self.assertGreater(
+                payload["finished_monotonic_ns"], payload["started_monotonic_ns"]
+            )
+
+    @unittest.skipUnless(os.name == "posix" and Path("/proc").is_dir(), "Linux /proc")
+    def test_process_group_supervisor_returns_exact_child_failure(self) -> None:
+        with self.fixture_root() as raw_root:
+            for label, exit_status, program in (
+                ("sampled", 7, "import time; time.sleep(.25); raise SystemExit(7)"),
+                ("immediate", 23, "raise SystemExit(23)"),
+            ):
+                with self.subTest(label=label):
+                    output = Path(raw_root) / f"{label}.json"
+                    completed = subprocess.run(
+                        [
+                            sys.executable,
+                            str(Path(pr.__file__).resolve()),
+                            "--monitor-process-group",
+                            str(output),
+                            "--",
+                            sys.executable,
+                            "-c",
+                            program,
+                        ],
+                        check=False,
+                        timeout=5,
+                    )
+                    self.assertEqual(completed.returncode, exit_status)
+                    payload = json.loads(output.read_text(encoding="utf-8"))
+                    self.assertTrue(payload["complete"])
+                    self.assertEqual(payload["child_returncode"], exit_status)
+                    self.assertEqual(payload["build_exit_status"], exit_status)
+
+    @unittest.skipUnless(os.name == "posix" and Path("/proc").is_dir(), "Linux /proc")
+    def test_process_group_supervisor_rejects_success_without_compiler(self) -> None:
+        with self.fixture_root() as raw_root:
+            output = Path(raw_root) / "rss.json"
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(pr.__file__).resolve()),
+                    "--monitor-process-group",
+                    str(output),
+                    "--",
+                    sys.executable,
+                    "-c",
+                    "import time; time.sleep(.25)",
+                ],
+                check=False,
+                timeout=5,
+            )
+            self.assertEqual(completed.returncode, 70)
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertFalse(payload["complete"])
+            self.assertEqual(payload["child_returncode"], 0)
+            self.assertFalse(payload["observed_compiler_executable"])
+            self.assertIn("no compiler executable", payload["monitor_error"])
+
+    @unittest.skipUnless(os.name == "posix" and Path("/proc").is_dir(), "Linux /proc")
+    def test_process_group_supervisor_forwards_hup_int_and_term(self) -> None:
+        for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+            with self.subTest(signal=signal.Signals(signum).name), self.fixture_root() as raw_root:
+                output = Path(raw_root) / "rss.json"
+                supervisor = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(Path(pr.__file__).resolve()),
+                        "--monitor-process-group",
+                        str(output),
+                        "--termination-grace-seconds",
+                        "1",
+                        "--",
+                        sys.executable,
+                        "-c",
+                        "import time; time.sleep(30)",
+                    ],
+                    stderr=subprocess.DEVNULL,
+                )
+                try:
+                    for _attempt in range(100):
+                        if output.is_file():
+                            break
+                        if supervisor.poll() is not None:
+                            self.fail("supervisor exited before initial evidence")
+                        time.sleep(0.02)
+                    else:
+                        self.fail("supervisor did not write initial evidence")
+                    supervisor.send_signal(signum)
+                    self.assertEqual(supervisor.wait(timeout=5), 128 + signum)
+                finally:
+                    if supervisor.poll() is None:
+                        supervisor.kill()
+                        supervisor.wait(timeout=5)
+
+                payload = json.loads(output.read_text(encoding="utf-8"))
+                self.assertTrue(payload["complete"])
+                self.assertEqual(
+                    payload["forwarded_signal"], signal.Signals(signum).name
+                )
+                self.assertFalse(payload["forced_kill"])
+                with self.assertRaises(ProcessLookupError):
+                    os.killpg(payload["process_group_id"], 0)
+
+    @unittest.skipUnless(os.name == "posix" and Path("/proc").is_dir(), "Linux /proc")
+    def test_process_group_supervisor_bounds_forced_shutdown(self) -> None:
+        with self.fixture_root() as raw_root:
+            output = Path(raw_root) / "rss.json"
+            supervisor = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(Path(pr.__file__).resolve()),
+                    "--monitor-process-group",
+                    str(output),
+                    "--termination-grace-seconds",
+                    "1",
+                    "--",
+                    sys.executable,
+                    "-c",
+                    (
+                        "import signal,time; "
+                        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                        "time.sleep(30)"
+                    ),
+                ]
+            )
+            try:
+                for _attempt in range(100):
+                    if output.is_file():
+                        break
+                    if supervisor.poll() is not None:
+                        self.fail("supervisor exited before initial evidence")
+                    time.sleep(0.02)
+                else:
+                    self.fail("supervisor did not write initial evidence")
+                time.sleep(0.15)
+                started = time.monotonic()
+                supervisor.terminate()
+                self.assertEqual(supervisor.wait(timeout=5), 137)
+                self.assertLess(time.monotonic() - started, 4)
+            finally:
+                if supervisor.poll() is None:
+                    supervisor.kill()
+                    supervisor.wait(timeout=5)
+
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertTrue(payload["complete"])
+            self.assertEqual(payload["forwarded_signal"], "SIGTERM")
+            self.assertTrue(payload["forced_kill"])
+            self.assertEqual(payload["child_returncode"], -signal.SIGKILL)
+            self.assertEqual(payload["build_exit_status"], 137)
+            with self.assertRaises(ProcessLookupError):
+                os.killpg(payload["process_group_id"], 0)
+
     def test_json_and_shell_cli_outputs(self) -> None:
         with self.fixture_root() as raw_root:
             root = Path(raw_root)
@@ -624,6 +934,7 @@ class PodResourcesTests(unittest.TestCase):
             self.assertIn("POD_MEMORY_LIMIT_BYTES=17179869184", shell)
             self.assertIn("POD_MEMORY_CAPACITY_BYTES=17179869184", shell)
             self.assertIn("POD_MEMORY_USAGE_PEAK_ELIGIBLE=1", shell)
+            self.assertIn("POD_MEMORY_PEAK_EVIDENCE_MODE=cgroup", shell)
             self.assertIn("POD_BUILD_JOBS=", shell)
 
             output = io.StringIO()

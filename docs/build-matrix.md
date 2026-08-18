@@ -4,14 +4,20 @@ This repository produces two deliberately separate SageAttention 2.2.0 wheels fo
 
 | Build ID | Builder toolkit | Exact PyTorch | Wheel version | Matching ComfyUI line |
 | --- | --- | --- | --- | --- |
-| `cp312-torch2.10.0-cu128` | CUDA 12.8 | `2.10.0+cu128` | `2.2.0+torch2.10.0.cu128` | `runpod/comfyui:cuda12.8` |
-| `cp312-torch2.10.0-cu130` | CUDA 13.0 | `2.10.0+cu130` | `2.2.0+torch2.10.0.cu130` | `runpod/comfyui:cuda13.0` |
+| `cp312-torch2.10.0-cu128` | CUDA 12.8 | `2.10.0+cu128` | `2.2.0+torch2.10.0.cu128.sm90fix1` | `runpod/comfyui:cuda12.8` |
+| `cp312-torch2.10.0-cu130` | CUDA 13.0 | `2.10.0+cu130` | `2.2.0+torch2.10.0.cu130.sm90fix1` | `runpod/comfyui:cuda13.0` |
 
 The table shows the human-readable ComfyUI release lines. `matrix.json` and the
 workflow defaults pin the currently reviewed OCI index digests so a mutable tag
 cannot change the runtime used by a build or release run.
 
-Both target Ubuntu 24.04, Linux x86-64, and CPython 3.12 (`cp312-cp312-linux_x86_64`). The source is pinned to SageAttention commit `eb615cf6cf4d221338033340ee2de1c37fbdba4a`. `matrix.json` is the machine-readable source of truth for these values, output names, resources, scheduler requirements, validation thresholds, and representative GPUs.
+Both target Ubuntu 24.04, Linux x86-64, and CPython 3.12 (`cp312-cp312-linux_x86_64`). The source is pinned to SageAttention commit `eb615cf6cf4d221338033340ee2de1c37fbdba4a`. The downstream patch backports the exact one-line SM90 binding fix from upstream commit [`d9704247a5139ab4c03bf7fc6b35cc0e2cbb5ea4`](https://github.com/thu-ml/SageAttention/commit/d9704247a5139ab4c03bf7fc6b35cc0e2cbb5ea4). `matrix.json` records both commits and is the machine-readable source of truth for these values, output names, resources, scheduler requirements, validation thresholds, and representative GPUs.
+
+The backport renames only the registered SM90 fake implementation. In the
+v2.2.0 tag it overwrites the real Python custom-op binding, so eager dispatch
+returns the untouched `torch.empty` output without launching the Hopper cubin.
+The `sm90fix1` local-version suffix makes corrected artifacts distinct from any
+wheel produced before this backport.
 
 ## Native-code policy
 
@@ -83,6 +89,16 @@ The uploaded `tools/pod_resources.py` provides the authoritative cgroup-aware CP
 
 The factory schedules compilation on a GPU Pod by default, but `build-wheel.sh` exports `CUDA_VISIBLE_DEVICES=""`; the attached accelerator and its VRAM do not compile the wheel. Host-system resources are authoritative. Build policy requires at least 4 effective vCPUs, a receipt-backed Runpod assignment that establishes at least 32 GiB usable capacity, and an 80 GB container disk; 16 vCPUs and 64 GB system RAM are recommended. A smaller finite cgroup hard limit wins when present. On hosts exposing an unlimited/private cgroup root, the verified assignment supplies the capacity ceiling while the resolved cgroup counter supplies bounded usage and peak evidence; ambiguous roots force one Ninja job and one extension at a time. The in-Pod preflight also requires enough current headroom for the reserve plus one job and 20 GiB free on both work and output filesystems. The reviewed default is two compiler jobs and one extension at a time. The live 2-by-2 proof peaked near 29.65 GiB, so higher parallelism should only be enabled with new peak evidence on a larger assignment.
 
+If no cgroup membership counter is readable at all, the only accepted fallback
+uses a verified assignment at or above the 64 GiB recommendation, forces
+`MAX_JOBS=1` and `EXT_PARALLEL=1`, and samples build-process-group RSS every
+100 ms. A dedicated-session supervisor binds the sampled PGID to the build
+leader, observes a native compiler, and provides bounded HUP/INT/TERM cleanup.
+Its manifest records that this sampling is neither kernel nor whole-Pod
+enforcement, nor complete Pod/cache accounting, and requires sampled peak plus
+reserve to fit the assignment. Conflicting readable cgroup usage still fails
+closed.
+
 The matrix field `resources.gpu_required=false` describes the build command's compute behavior, not the default Runpod provisioning backend. It remains false because compilation never launches a GPU kernel.
 
 The cu128 and cu130 builders run sequentially. Their ordered Runpod build
@@ -93,7 +109,7 @@ the container can start. Before source upload, orchestration verifies the exact
 selected GPU assignment, the matrix floor of 4 effective vCPUs, 32 GB system
 RAM, and an 80 GB container disk; 16 vCPUs and 64 GB system RAM remain
 recommended. The in-Pod assignment/cgroup preflight then independently verifies
-usable capacity, current headroom, and peak accounting.
+usable capacity and the applicable cgroup or restricted RSS peak policy.
 
 Run one matrix entry inside its matching builder:
 
@@ -108,11 +124,11 @@ The output directory must initially be empty. It receives exactly:
 - the exact wheel named by `matrix.json`;
 - `manifest.json` with compatibility, cubin coverage, hashes, tool versions,
   matrix and patch hashes, image identity, resource snapshots, selected
-  parallelism, elapsed time, cgroup peak evidence, and the selected exact build
+  parallelism, elapsed time, typed memory-peak evidence, and the selected exact build
   `gpuId` for GPU-backed builds (JSON `null` for CPU fallback builds);
 - `SHA256SUMS` containing exactly that wheel.
 
-The system-resource preflight requires the exact, receipt-backed Runpod API assignment for every release build; a smaller finite cgroup hard limit remains the selected capacity. The uploaded repository helper is preferred over an older copy installed in the builder image. Ambiguous `/` cgroup roots can supply bounded peak/headroom evidence but force `MAX_JOBS=1` and `EXT_PARALLEL=1`. Missing peak evidence, insufficient CPU, less than 32 GiB capacity, and insufficient actual disk are hard failures; `ALLOW_LOW_RESOURCES=1` cannot mask them. The build script is the sole authority for its cgroup-aware `MAX_JOBS` default; the SSH entrypoint does not precompute it. Values above the reviewed `MAX_JOBS=2` and `EXT_PARALLEL=1` caps are rejected unless `ALLOW_UNSAFE_PARALLELISM=1` is explicitly set on a larger Pod. Set `BUILDER_IMAGE_REF` and `BUILDER_IMAGE_DIGEST` in release jobs so the immutable builder identity is captured.
+The system-resource preflight requires the exact, receipt-backed Runpod API assignment for every release build; a smaller finite cgroup hard limit remains the selected capacity. The uploaded repository helper is preferred over an older copy installed in the builder image. Ambiguous `/` cgroup roots can supply bounded peak/headroom evidence but force `MAX_JOBS=1` and `EXT_PARALLEL=1`. A genuinely absent counter may use the restricted 64-GiB-or-larger process-group RSS path above; conflicting counters, insufficient CPU or capacity, and insufficient actual disk are hard failures. `ALLOW_LOW_RESOURCES=1` cannot mask them and is forbidden in the RSS fallback. The build script is the sole authority for its cgroup-aware `MAX_JOBS` default; the SSH entrypoint does not precompute it. Values above the reviewed `MAX_JOBS=2` and `EXT_PARALLEL=1` caps are rejected unless `ALLOW_UNSAFE_PARALLELISM=1` is explicitly set on a larger Pod; that override is also forbidden in the RSS fallback. Set `BUILDER_IMAGE_REF` and `BUILDER_IMAGE_DIGEST` in release jobs so the immutable builder identity is captured.
 
 ## Static and GPU validation
 
@@ -122,7 +138,7 @@ Static validation does not launch the attached GPU and checks the exact filename
 python3.12 scripts/validate-wheel.py \
   --matrix matrix.json \
   --build-id cp312-torch2.10.0-cu128 \
-  --wheel dist/cp312-torch2.10.0-cu128/sageattention-2.2.0+torch2.10.0.cu128-cp312-cp312-linux_x86_64.whl \
+  --wheel dist/cp312-torch2.10.0-cu128/sageattention-2.2.0+torch2.10.0.cu128.sm90fix1-cp312-cp312-linux_x86_64.whl \
   --manifest dist/cp312-torch2.10.0-cu128/manifest.json \
   --checksums dist/cp312-torch2.10.0-cu128/SHA256SUMS
 ```

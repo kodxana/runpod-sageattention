@@ -14,13 +14,17 @@ root privileges, or a particular cgroup version.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import posixpath
 import re
 import shlex
+import signal
 import stat
+import subprocess
 import sys
+import time
 from dataclasses import dataclass, replace
 from fractions import Fraction
 from pathlib import Path
@@ -35,6 +39,10 @@ DEFAULT_MAX_JOBS = 4
 UNLIMITED_THRESHOLD = 1 << 60
 SCHEMA_VERSION = 2
 VERIFIED_MEMORY_RECEIPT = "/run/sageattention/verified-memory-bytes-v1"
+PROCESS_GROUP_RSS_SCHEMA_VERSION = 2
+DEFAULT_PROCESS_GROUP_SAMPLE_INTERVAL_MS = 100
+DEFAULT_PROCESS_GROUP_CHECKPOINT_INTERVAL_MS = 5000
+DEFAULT_PROCESS_GROUP_TERMINATION_GRACE_SECONDS = 10
 
 
 @dataclass(frozen=True)
@@ -86,6 +94,7 @@ class MemorySnapshot:
     usage_trustworthy: bool = False
     usage_peak_eligible: bool = False
     usage_scope: str = "unavailable"
+    peak_evidence_mode: str = "unavailable"
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -110,6 +119,7 @@ class MemorySnapshot:
             "usage_trustworthy": self.usage_trustworthy,
             "usage_peak_eligible": self.usage_peak_eligible,
             "usage_scope": self.usage_scope,
+            "peak_evidence_mode": self.peak_evidence_mode,
         }
 
 
@@ -220,6 +230,7 @@ class ResourceSnapshot:
                 self.memory.usage_peak_eligible
             ),
             "POD_MEMORY_USAGE_SCOPE": self.memory.usage_scope,
+            "POD_MEMORY_PEAK_EVIDENCE_MODE": self.memory.peak_evidence_mode,
             "POD_CPU_COUNT": self.cpu.effective_count,
             "POD_CPU_HOST_COUNT": self.cpu.host_count,
             "POD_CPU_AFFINITY_COUNT": self.cpu.affinity_count or 0,
@@ -669,7 +680,13 @@ def apply_assigned_memory_capacity(
         return memory
 
     if memory.limited and memory.limit_bytes <= assigned:
-        return replace(memory, assigned_capacity_bytes=assigned)
+        return replace(
+            memory,
+            assigned_capacity_bytes=assigned,
+            peak_evidence_mode=(
+                "cgroup" if memory.usage_peak_eligible else "unavailable"
+            ),
+        )
 
     warnings.append(
         "memory capacity comes from the verified Runpod API assignment, not a "
@@ -679,7 +696,15 @@ def apply_assigned_memory_capacity(
     inactive = 0
     usage_source = ""
     usage_trustworthy = False
+    rss_fallback_eligible = False
     if location is not None:
+        usage_name, _, _ = _memory_filenames(location.version)
+        try:
+            raw_leaf_usage: str | None = (location.current_dir / usage_name).read_text(
+                encoding="ascii"
+            )
+        except (OSError, UnicodeError):
+            raw_leaf_usage = None
         current, inactive, usage_source, usage_readable, usage_scoped = (
             _read_leaf_usage(location)
         )
@@ -688,8 +713,13 @@ def apply_assigned_memory_capacity(
         )
         usage_trustworthy = usage_within_assignment and usage_scoped
         usage_peak_eligible = usage_within_assignment
+        rss_fallback_eligible = (
+            not usage_readable and current is None and raw_leaf_usage is None
+        )
         if not usage_readable:
-            if usage_scoped:
+            if raw_leaf_usage is not None:
+                warnings.append("resolved cgroup memory usage counter is malformed")
+            elif usage_scoped:
                 warnings.append("cannot read pod-scoped leaf memory usage")
             else:
                 warnings.append(
@@ -711,6 +741,7 @@ def apply_assigned_memory_capacity(
     else:
         usage_peak_eligible = False
         usage_scoped = False
+        rss_fallback_eligible = True
         warnings.append("cannot locate a pod-scoped memory cgroup for usage evidence")
 
     if usage_peak_eligible and current is not None:
@@ -725,6 +756,20 @@ def apply_assigned_memory_capacity(
         inactive = 0
         free = 0
         available = 0
+
+    peak_evidence_mode = (
+        "cgroup"
+        if usage_peak_eligible
+        else "process-group-rss"
+        if rss_fallback_eligible and current is None and not usage_source
+        else "unavailable"
+    )
+    if peak_evidence_mode == "process-group-rss":
+        warnings.append(
+            "cgroup memory accounting is unavailable; release builds require "
+            "serialized process-group RSS sampling, which excludes unrelated "
+            "Pod processes and most filesystem cache"
+        )
 
     return replace(
         memory,
@@ -749,6 +794,7 @@ def apply_assigned_memory_capacity(
             if usage_peak_eligible
             else "unavailable"
         ),
+        peak_evidence_mode=peak_evidence_mode,
     )
 
 
@@ -790,6 +836,7 @@ def collect_memory(
                 usage_trustworthy=False,
                 usage_peak_eligible=False,
                 usage_scope="unavailable",
+                peak_evidence_mode="unavailable",
             ),
             None,
         )
@@ -846,6 +893,7 @@ def collect_memory(
                     if leaf_readable
                     else "unavailable"
                 ),
+                peak_evidence_mode=("cgroup" if leaf_readable else "unavailable"),
             ),
             location,
         )
@@ -922,6 +970,7 @@ def collect_memory(
             usage_trustworthy=current_known,
             usage_peak_eligible=current_known,
             usage_scope="cgroup-capacity" if current_known else "unavailable",
+            peak_evidence_mode="cgroup" if current_known else "unavailable",
         ),
         location,
     )
@@ -1210,6 +1259,430 @@ def _shell_output(snapshot: ResourceSnapshot) -> str:
     return "\n".join(lines)
 
 
+def _process_group_from_stat(text: str) -> int | None:
+    """Return Linux /proc/<pid>/stat field 5 without trusting comm spacing."""
+
+    closing_parenthesis = text.rfind(")")
+    if closing_parenthesis < 0:
+        return None
+    fields = text[closing_parenthesis + 1 :].split()
+    if len(fields) < 3:
+        return None
+    try:
+        process_group = int(fields[2], 10)
+    except ValueError:
+        return None
+    return process_group if process_group > 0 else None
+
+
+def collect_process_group_rss(
+    process_group: int,
+    *,
+    proc_root: Path = Path("/proc"),
+    page_size: int | None = None,
+) -> tuple[int, int]:
+    """Conservatively sum resident pages for one Linux process group.
+
+    Shared resident pages can occur in more than one member's ``statm`` and are
+    intentionally counted more than once.  Processes that disappear while the
+    snapshot is collected are skipped.
+    """
+
+    rss_bytes, process_count, _, _ = _collect_process_group_details(
+        process_group,
+        proc_root=proc_root,
+        page_size=page_size,
+        leader_pid=None,
+    )
+    return rss_bytes, process_count
+
+
+def _is_compiler_executable(name: str) -> bool:
+    lowered = name.lower()
+    return (
+        lowered in {"c++", "cc1plus", "nvcc", "ptxas"}
+        or "nvcc" in lowered
+        or "ptxas" in lowered
+        or "g++" in lowered
+        or lowered.endswith("-c++")
+    )
+
+
+def _collect_process_group_details(
+    process_group: int,
+    *,
+    proc_root: Path,
+    page_size: int | None,
+    leader_pid: int | None,
+) -> tuple[int, int, bool, set[str]]:
+    if process_group <= 0:
+        raise ValueError("process group must be positive")
+    if page_size is None:
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+    if page_size <= 0:
+        raise ValueError("page size must be positive")
+
+    resident_pages = 0
+    process_count = 0
+    leader_observed = False
+    compiler_executables: set[str] = set()
+    try:
+        entries = proc_root.iterdir()
+    except OSError as error:
+        raise ValueError(f"cannot enumerate {proc_root}") from error
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat_text = (entry / "stat").read_text(encoding="ascii")
+            if _process_group_from_stat(stat_text) != process_group:
+                continue
+        except (OSError, UnicodeError):
+            continue
+        try:
+            statm_fields = (entry / "statm").read_text(encoding="ascii").split()
+            if len(statm_fields) < 2:
+                continue
+            pages = int(statm_fields[1], 10)
+        except (OSError, UnicodeError, ValueError):
+            continue
+        if pages < 0:
+            continue
+        pid = int(entry.name, 10)
+        if leader_pid is not None and pid == leader_pid:
+            leader_observed = True
+        try:
+            executable = os.path.basename(os.readlink(entry / "exe"))
+        except OSError:
+            executable = ""
+        if executable and _is_compiler_executable(executable):
+            compiler_executables.add(executable)
+        resident_pages += pages
+        process_count += 1
+    return (
+        resident_pages * page_size,
+        process_count,
+        leader_observed,
+        compiler_executables,
+    )
+
+
+def _atomic_write_json(path: Path, payload: Mapping[str, object]) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    os.replace(temporary, path)
+
+
+def _shell_exit_status(returncode: int) -> int:
+    return returncode if returncode >= 0 else 128 + (-returncode)
+
+
+def _signal_process_group(process_group: int, signum: int) -> bool:
+    try:
+        os.killpg(process_group, signum)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _process_group_exists(process_group: int) -> bool:
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _terminate_process_group_bounded(
+    child: subprocess.Popen[bytes],
+    process_group: int,
+    grace_seconds: int,
+) -> tuple[int, bool]:
+    """Terminate a dedicated child group, escalating within a fixed deadline."""
+
+    _signal_process_group(process_group, signal.SIGTERM)
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        returncode = child.poll()
+        if returncode is not None and not _process_group_exists(process_group):
+            return returncode, False
+        time.sleep(0.05)
+    return _kill_process_group_bounded(child, process_group)
+
+
+def _kill_process_group_bounded(
+    child: subprocess.Popen[bytes],
+    process_group: int,
+) -> tuple[int, bool]:
+    """Kill a dedicated group and verify that the leader and descendants exit."""
+
+    _signal_process_group(process_group, signal.SIGKILL)
+    try:
+        returncode = child.poll()
+        if returncode is None:
+            returncode = child.wait(timeout=2)
+    except subprocess.TimeoutExpired as error:
+        raise ValueError("build process group did not exit after SIGKILL") from error
+    kill_deadline = time.monotonic() + 2
+    while _process_group_exists(process_group) and time.monotonic() < kill_deadline:
+        time.sleep(0.05)
+    if _process_group_exists(process_group):
+        raise ValueError("build descendants remained after process-group SIGKILL")
+    return returncode, True
+
+
+def supervise_process_group_rss(
+    output_path: Path,
+    command: Sequence[str],
+    *,
+    interval_ms: int = DEFAULT_PROCESS_GROUP_SAMPLE_INTERVAL_MS,
+    checkpoint_interval_ms: int = DEFAULT_PROCESS_GROUP_CHECKPOINT_INTERVAL_MS,
+    termination_grace_seconds: int = DEFAULT_PROCESS_GROUP_TERMINATION_GRACE_SECONDS,
+    proc_root: Path = Path("/proc"),
+) -> int:
+    """Run a command in an isolated session and sample that exact process group."""
+
+    if os.name != "posix" or not hasattr(os, "killpg"):
+        raise ValueError("process-group supervision requires POSIX")
+    if not command:
+        raise ValueError("process-group supervision requires a command")
+    if interval_ms < 50 or interval_ms > 1000:
+        raise ValueError("process-group RSS sample interval must be 50..1000 ms")
+    if checkpoint_interval_ms < 1000 or checkpoint_interval_ms > 60000:
+        raise ValueError("process-group checkpoint interval must be 1000..60000 ms")
+    if termination_grace_seconds < 1 or termination_grace_seconds > 60:
+        raise ValueError("process-group termination grace must be 1..60 seconds")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    signal_state: dict[str, int | None] = {"requested": None}
+
+    def request_shutdown(signum: int, _frame: object) -> None:
+        if signal_state["requested"] is None:
+            signal_state["requested"] = signum
+
+    handled_signals = [signal.SIGINT, signal.SIGTERM]
+    if hasattr(signal, "SIGHUP"):
+        handled_signals.append(signal.SIGHUP)
+    previous_handlers = {
+        signum: signal.signal(signum, request_shutdown)
+        for signum in handled_signals
+    }
+
+    started_monotonic_ns = time.monotonic_ns()
+    command_sha256 = hashlib.sha256(
+        json.dumps(list(command), ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    try:
+        child = subprocess.Popen(list(command), start_new_session=True)
+    except BaseException:
+        for signum, previous_handler in previous_handlers.items():
+            signal.signal(signum, previous_handler)
+        raise
+    leader_pid = child.pid
+    # subprocess completes setsid() before exec when start_new_session=True, so
+    # PGID is the leader PID even if a fast failing child exits before the
+    # parent can query /proc or os.getpgid(). Successful builds additionally
+    # prove this binding by observing the leader inside the sampled group.
+    process_group = leader_pid
+
+    sample_count = 0
+    peak_bytes = 0
+    maximum_process_count = 0
+    start_bytes: int | None = None
+    end_bytes: int | None = None
+    leader_observed = False
+    observed_compiler_executables: set[str] = set()
+    forwarded_signal: int | None = None
+    forced_kill = False
+    monitor_error: str | None = None
+    child_returncode: int | None = None
+    next_checkpoint = time.monotonic() + checkpoint_interval_ms / 1000
+    termination_deadline: float | None = None
+
+    def payload(*, complete: bool) -> dict[str, object]:
+        finished_monotonic_ns = time.monotonic_ns() if complete else None
+        return {
+            "build_exit_status": (
+                _shell_exit_status(child_returncode)
+                if child_returncode is not None
+                else None
+            ),
+            "child_returncode": child_returncode,
+            "checkpoint_interval_ms": checkpoint_interval_ms,
+            "command_sha256": command_sha256,
+            "complete": complete,
+            "covers_other_pod_processes": False,
+            "duration_ms": (
+                (finished_monotonic_ns - started_monotonic_ns) // 1_000_000
+                if finished_monotonic_ns is not None
+                else None
+            ),
+            "end_bytes": end_bytes,
+            "finished_monotonic_ns": finished_monotonic_ns,
+            "forced_kill": forced_kill,
+            "forwarded_signal": (
+                signal.Signals(forwarded_signal).name
+                if forwarded_signal is not None
+                else None
+            ),
+            "includes_file_cache": False,
+            "leader_observed": leader_observed,
+            "leader_pid": leader_pid,
+            "maximum_process_count": maximum_process_count,
+            "method": "proc-process-group-rss-sum",
+            "monitor_error": monitor_error,
+            "observed_compiler_executable": bool(observed_compiler_executables),
+            "observed_compiler_executables": sorted(observed_compiler_executables),
+            "peak_bytes": peak_bytes,
+            "process_group_id": process_group,
+            "sample_count": sample_count,
+            "sample_interval_ms": interval_ms,
+            "schema_version": PROCESS_GROUP_RSS_SCHEMA_VERSION,
+            "scope": "build-process-group",
+            "shared_pages_may_be_double_counted": True,
+            "source": "/proc/*/statm",
+            "start_bytes": start_bytes,
+            "started_monotonic_ns": started_monotonic_ns,
+            "termination_grace_seconds": termination_grace_seconds,
+            "whole_pod_enforced": False,
+        }
+
+    def sample() -> bool:
+        nonlocal sample_count, peak_bytes, maximum_process_count
+        nonlocal start_bytes, end_bytes, leader_observed
+        rss_bytes, process_count, saw_leader, compiler_executables = (
+            _collect_process_group_details(
+                process_group,
+                proc_root=proc_root,
+                page_size=None,
+                leader_pid=leader_pid,
+            )
+        )
+        if process_count <= 0 or rss_bytes <= 0:
+            return False
+        sample_count += 1
+        if start_bytes is None:
+            start_bytes = rss_bytes
+        end_bytes = rss_bytes
+        peak_bytes = max(peak_bytes, rss_bytes)
+        maximum_process_count = max(maximum_process_count, process_count)
+        leader_observed = leader_observed or saw_leader
+        observed_compiler_executables.update(compiler_executables)
+        return True
+
+    try:
+        # Establish the PGID/leader binding before reporting initial evidence.
+        initial_deadline = time.monotonic() + 2
+        while True:
+            requested_signal = signal_state["requested"]
+            if requested_signal is not None and forwarded_signal is None:
+                forwarded_signal = requested_signal
+                _signal_process_group(process_group, requested_signal)
+                termination_deadline = time.monotonic() + termination_grace_seconds
+            if sample():
+                break
+            child_returncode = child.poll()
+            if child_returncode is not None:
+                if child_returncode == 0:
+                    monitor_error = (
+                        "successful isolated command exited before /proc sampling"
+                    )
+                break
+            if time.monotonic() >= initial_deadline:
+                monitor_error = "isolated build leader was not observable in /proc"
+                break
+            time.sleep(0.01)
+        _atomic_write_json(output_path, payload(complete=False))
+
+        while monitor_error is None:
+            requested_signal = signal_state["requested"]
+            if requested_signal is not None and forwarded_signal is None:
+                forwarded_signal = requested_signal
+                _signal_process_group(process_group, requested_signal)
+                termination_deadline = time.monotonic() + termination_grace_seconds
+
+            child_returncode = child.poll()
+            if child_returncode is not None:
+                if not _process_group_exists(process_group):
+                    break
+                if termination_deadline is None:
+                    monitor_error = (
+                        "build descendants outlived the isolated group leader"
+                    )
+                    break
+
+            if termination_deadline is not None and time.monotonic() >= termination_deadline:
+                child_returncode, forced_kill = _kill_process_group_bounded(
+                    child, process_group
+                )
+                break
+
+            if not sample():
+                child_returncode = child.poll()
+                if child_returncode is not None and not _process_group_exists(
+                    process_group
+                ):
+                    break
+                monitor_error = "running build process group disappeared from /proc"
+                break
+            now = time.monotonic()
+            if now >= next_checkpoint:
+                _atomic_write_json(output_path, payload(complete=False))
+                next_checkpoint = now + checkpoint_interval_ms / 1000
+            time.sleep(interval_ms / 1000)
+
+        if monitor_error is not None and (
+            child.poll() is None or _process_group_exists(process_group)
+        ):
+            child_returncode, forced_kill = _terminate_process_group_bounded(
+                child, process_group, termination_grace_seconds
+            )
+        elif child_returncode is None:
+            child_returncode = child.wait(timeout=2)
+        if _process_group_exists(process_group):
+            monitor_error = "isolated build process group remained after leader exit"
+            child_returncode, forced_kill = _terminate_process_group_bounded(
+                child, process_group, termination_grace_seconds
+            )
+
+        # A successful command must be demonstrably bound to the sampled PGID
+        # and must have exposed at least one native compiler/build executable.
+        if child_returncode == 0:
+            if sample_count < 2:
+                monitor_error = "successful build produced fewer than two RSS samples"
+            elif not leader_observed:
+                monitor_error = "successful build leader was never observed in sampled PGID"
+            elif not observed_compiler_executables:
+                monitor_error = "successful build exposed no compiler executable in sampled PGID"
+
+        _atomic_write_json(
+            output_path,
+            payload(complete=monitor_error is None),
+        )
+    except BaseException:
+        if child.poll() is None or _process_group_exists(process_group):
+            _terminate_process_group_bounded(
+                child, process_group, termination_grace_seconds
+            )
+        raise
+    finally:
+        for signum, previous_handler in previous_handlers.items():
+            signal.signal(signum, previous_handler)
+
+    if monitor_error is not None:
+        return 70
+    assert child_returncode is not None
+    return _shell_exit_status(child_returncode)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Report cgroup-aware memory, CPU, and safe build parallelism."
@@ -1221,6 +1694,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--suggested-jobs",
         action="store_true",
         help="print only the conservative build job count",
+    )
+    output.add_argument(
+        "--monitor-process-group",
+        type=Path,
+        metavar="PATH",
+        help="run COMMAND in an isolated group and record its RSS to PATH",
     )
     parser.add_argument("--pretty", action="store_true", help="pretty-print JSON")
     parser.add_argument(
@@ -1239,6 +1718,23 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="memory kept outside compiler jobs (default max(4 GiB, 15%%))",
     )
+    parser.add_argument(
+        "--sample-interval-ms",
+        type=int,
+        default=DEFAULT_PROCESS_GROUP_SAMPLE_INTERVAL_MS,
+        help="process-group RSS sampling interval (50..1000 ms; default 100)",
+    )
+    parser.add_argument(
+        "--termination-grace-seconds",
+        type=int,
+        default=DEFAULT_PROCESS_GROUP_TERMINATION_GRACE_SECONDS,
+        help="seconds before an interrupted child group is killed (default 10)",
+    )
+    parser.add_argument(
+        "command",
+        nargs=argparse.REMAINDER,
+        help="command following -- for --monitor-process-group",
+    )
     return parser
 
 
@@ -1248,6 +1744,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit("--memory-per-job-mib must be positive")
     if args.reserve_mib is not None and args.reserve_mib < 0:
         raise SystemExit("--reserve-mib cannot be negative")
+    if args.monitor_process_group is not None:
+        if args.filesystem_root != "/":
+            raise SystemExit(
+                "--monitor-process-group requires the live /proc filesystem"
+            )
+        if args.memory_per_job_mib is not None or args.reserve_mib is not None:
+            raise SystemExit(
+                "resource recommendation options cannot be used with "
+                "--monitor-process-group"
+            )
+        command = list(args.command)
+        if command and command[0] == "--":
+            command.pop(0)
+        return supervise_process_group_rss(
+            args.monitor_process_group,
+            command,
+            interval_ms=args.sample_interval_ms,
+            termination_grace_seconds=args.termination_grace_seconds,
+        )
+    if args.command:
+        raise SystemExit("COMMAND requires --monitor-process-group")
 
     snapshot = collect_resources(
         filesystem_root=args.filesystem_root,

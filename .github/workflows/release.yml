@@ -271,6 +271,185 @@ jobs:
                   )
               return values
 
+          def validate_runtime_report(
+              report,
+              report_path,
+              build,
+              capability,
+              wheel,
+              numeric_policy,
+              required_modules,
+              runtime_image_ref,
+          ):
+              if not isinstance(report, dict):
+                  raise SystemExit(f"runtime report is not an object: {report_path}")
+              schema_version = report.get("schema_version")
+              if type(schema_version) is not int or schema_version != 1:
+                  raise SystemExit(
+                      f"runtime report schema mismatch in {report_path}: "
+                      f"expected 1, got {schema_version!r}"
+                  )
+              exact_fields = {
+                  "build_id": build["id"],
+                  "status": "pass",
+                  "wheel_asset": wheel["asset"],
+                  "wheel_sha256": wheel["sha256"],
+                  "expected_compute_capability": capability,
+                  "actual_compute_capability": capability,
+                  "torch_version": build["torch_version"],
+                  "torch_cuda_version": build["torch_cuda_version"],
+                  "sageattention_version": build["wheel_version"],
+                  "expected_runtime_image": build["comfyui_runtime_image"],
+                  "runtime_image_ref": runtime_image_ref,
+              }
+              mismatches = {
+                  key: {"expected": value, "actual": report.get(key)}
+                  for key, value in exact_fields.items()
+                  if report.get(key) != value
+              }
+              if mismatches:
+                  raise SystemExit(
+                      f"runtime report binding mismatch in {report_path}: "
+                      f"{json.dumps(mismatches, sort_keys=True)}"
+                  )
+              if "failures" in report:
+                  raise SystemExit(
+                      f"passing runtime report contains failures in {report_path}"
+                  )
+
+              compiled_modules = report.get("compiled_modules")
+              actual_modules = (
+                  set(compiled_modules) if isinstance(compiled_modules, dict) else set()
+              )
+              invalid_module_paths = (
+                  sorted(
+                      name
+                      for name, path in compiled_modules.items()
+                      if not isinstance(path, str) or not path.strip()
+                  )
+                  if isinstance(compiled_modules, dict)
+                  else []
+              )
+              if (
+                  not isinstance(compiled_modules, dict)
+                  or actual_modules != required_modules
+                  or invalid_module_paths
+              ):
+                  raise SystemExit(
+                      f"runtime compiled module mismatch in {report_path}: "
+                      f"expected={sorted(required_modules)!r}, "
+                      f"actual={sorted(actual_modules)!r}, "
+                      f"invalid_paths={invalid_module_paths!r}"
+                  )
+              cuda_device_name = report.get("cuda_device_name")
+              if not isinstance(cuda_device_name, str) or not cuda_device_name.strip():
+                  raise SystemExit(
+                      f"runtime report has no CUDA device name in {report_path}"
+                  )
+
+              try:
+                  reported_policy = json.dumps(
+                      report.get("runtime_numeric_policy"),
+                      allow_nan=False,
+                      separators=(",", ":"),
+                      sort_keys=True,
+                  )
+                  expected_policy = json.dumps(
+                      numeric_policy,
+                      allow_nan=False,
+                      separators=(",", ":"),
+                      sort_keys=True,
+                  )
+              except (TypeError, ValueError) as error:
+                  raise SystemExit(
+                      f"runtime numeric policy is invalid in {report_path}: {error}"
+                  ) from error
+              if reported_policy != expected_policy:
+                  raise SystemExit(
+                      f"runtime numeric policy mismatch in {report_path}"
+                  )
+
+              results = report.get("results")
+              implementations = numeric_policy["implementations_by_capability"][
+                  capability
+              ]
+              expected_pairs = {
+                  (implementation, causal)
+                  for implementation in implementations
+                  for causal in numeric_policy["canonical_case"]["causal_modes"]
+              }
+              malformed_results = (
+                  not isinstance(results, list)
+                  or any(
+                      not isinstance(item, dict)
+                      or not isinstance(item.get("implementation"), str)
+                      or type(item.get("causal")) is not bool
+                      for item in results
+                  )
+              )
+              actual_pairs = (
+                  {
+                      (item["implementation"], item["causal"])
+                      for item in results
+                  }
+                  if not malformed_results
+                  else set()
+              )
+              if (
+                  malformed_results
+                  or len(results) != len(expected_pairs)
+                  or actual_pairs != expected_pairs
+              ):
+                  raise SystemExit(
+                      f"runtime report implementation coverage mismatch in "
+                      f"{report_path}: expected "
+                      f"{sorted(expected_pairs, key=repr)!r}, "
+                      f"got {sorted(actual_pairs, key=repr)!r}"
+                  )
+              canonical_case = numeric_policy["canonical_case"]
+              expected_shape = [
+                  canonical_case["batch_size"],
+                  canonical_case["query_heads"],
+                  canonical_case["sequence_length"],
+                  canonical_case["head_dimension"],
+              ]
+              expected_dtype = canonical_case["dtype"]
+              for result in results:
+                  if "errors" in result:
+                      raise SystemExit(
+                          f"passing runtime result contains errors in {report_path}: "
+                          f"{result['implementation']}, causal={result['causal']}"
+                      )
+                  tensor_fields = {
+                      "output_shape": expected_shape,
+                      "expected_output_shape": expected_shape,
+                      "output_dtype": expected_dtype,
+                      "expected_output_dtype": expected_dtype,
+                  }
+                  tensor_mismatches = {
+                      key: {"expected": value, "actual": result.get(key)}
+                      for key, value in tensor_fields.items()
+                      if result.get(key) != value
+                  }
+                  if tensor_mismatches:
+                      raise SystemExit(
+                          f"runtime output tensor mismatch in {report_path}: "
+                          f"{json.dumps(tensor_mismatches, sort_keys=True)}"
+                      )
+                  cosine = result.get("cosine_similarity")
+                  relative_l2 = result.get("relative_l2")
+                  if type(cosine) not in (int, float) or not math.isfinite(cosine):
+                      raise SystemExit(f"invalid cosine metric in {report_path}")
+                  if (
+                      type(relative_l2) not in (int, float)
+                      or not math.isfinite(relative_l2)
+                  ):
+                      raise SystemExit(f"invalid relative-L2 metric in {report_path}")
+                  if cosine < numeric_policy["minimum_cosine_similarity"]:
+                      raise SystemExit(f"cosine threshold failure in {report_path}")
+                  if relative_l2 > numeric_policy["maximum_relative_l2"]:
+                      raise SystemExit(f"relative-L2 threshold failure in {report_path}")
+
           matrix = json.loads(Path("matrix.json").read_text())
           destination = Path("release-assets")
           destination.mkdir()
@@ -356,91 +535,23 @@ jobs:
                   f"unexpected={sorted(present-set(expected))}"
               )
           numeric_policy = matrix["validation"]["runtime_numeric"]
+          required_modules = set(matrix["validation"]["required_extensions"])
           for artifact, (build, capability) in expected.items():
               reports = list((Path("downloaded-runtime") / artifact).glob("*.json"))
               if len(reports) != 1:
                   raise SystemExit(f"expected one runtime report in {artifact}, got {reports}")
               report = json.loads(reports[0].read_text())
               wheel = wheel_by_build[build["id"]]
-              exact_fields = {
-                  "build_id": build["id"],
-                  "status": "pass",
-                  "wheel_asset": wheel["asset"],
-                  "wheel_sha256": wheel["sha256"],
-                  "expected_compute_capability": capability,
-                  "actual_compute_capability": capability,
-                  "torch_version": build["torch_version"],
-                  "torch_cuda_version": build["torch_cuda_version"],
-                  "sageattention_version": build["wheel_version"],
-                  "expected_runtime_image": build["comfyui_runtime_image"],
-                  "runtime_image_ref": runtime_by_cuda[build["cuda_version"]],
-              }
-              mismatches = {
-                  key: {"expected": value, "actual": report.get(key)}
-                  for key, value in exact_fields.items()
-                  if report.get(key) != value
-              }
-              if mismatches:
-                  raise SystemExit(
-                      f"runtime report binding mismatch in {reports[0]}: "
-                      f"{json.dumps(mismatches, sort_keys=True)}"
-                  )
-              results = report.get("results")
-              implementations = numeric_policy["implementations_by_capability"][capability]
-              expected_pairs = {
-                  (implementation, causal)
-                  for implementation in implementations
-                  for causal in numeric_policy["canonical_case"]["causal_modes"]
-              }
-              actual_pairs = {
-                  (item.get("implementation"), item.get("causal"))
-                  for item in results
-              } if isinstance(results, list) else set()
-              if (
-                  not isinstance(results, list)
-                  or len(results) != len(expected_pairs)
-                  or actual_pairs != expected_pairs
-              ):
-                  raise SystemExit(
-                      f"runtime report implementation coverage mismatch in {reports[0]}: "
-                      f"expected {sorted(expected_pairs, key=repr)!r}, "
-                      f"got {sorted(actual_pairs, key=repr)!r}"
-                  )
-              canonical_case = numeric_policy["canonical_case"]
-              expected_shape = [
-                  canonical_case["batch_size"],
-                  canonical_case["query_heads"],
-                  canonical_case["sequence_length"],
-                  canonical_case["head_dimension"],
-              ]
-              expected_dtype = canonical_case["dtype"]
-              for result in results:
-                  tensor_fields = {
-                      "output_shape": expected_shape,
-                      "expected_output_shape": expected_shape,
-                      "output_dtype": expected_dtype,
-                      "expected_output_dtype": expected_dtype,
-                  }
-                  tensor_mismatches = {
-                      key: {"expected": value, "actual": result.get(key)}
-                      for key, value in tensor_fields.items()
-                      if result.get(key) != value
-                  }
-                  if tensor_mismatches:
-                      raise SystemExit(
-                          f"runtime output tensor mismatch in {reports[0]}: "
-                          f"{json.dumps(tensor_mismatches, sort_keys=True)}"
-                      )
-                  cosine = result.get("cosine_similarity")
-                  relative_l2 = result.get("relative_l2")
-                  if not isinstance(cosine, (int, float)) or not math.isfinite(cosine):
-                      raise SystemExit(f"invalid cosine metric in {reports[0]}")
-                  if not isinstance(relative_l2, (int, float)) or not math.isfinite(relative_l2):
-                      raise SystemExit(f"invalid relative-L2 metric in {reports[0]}")
-                  if cosine < numeric_policy["minimum_cosine_similarity"]:
-                      raise SystemExit(f"cosine threshold failure in {reports[0]}")
-                  if relative_l2 > numeric_policy["maximum_relative_l2"]:
-                      raise SystemExit(f"relative-L2 threshold failure in {reports[0]}")
+              validate_runtime_report(
+                  report,
+                  reports[0],
+                  build,
+                  capability,
+                  wheel,
+                  numeric_policy,
+                  required_modules,
+                  runtime_by_cuda[build["cuda_version"]],
+              )
 
           checkout_commit = subprocess.check_output(
               ["git", "rev-parse", "HEAD"], text=True

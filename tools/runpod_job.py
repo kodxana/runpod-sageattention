@@ -251,6 +251,8 @@ def _is_capacity_unavailable_error(error: CommandError) -> bool:
             "there are no longer any instances available with the requested "
             "specifications",
             "there are no instances available with the requested specifications",
+            "this machine does not have the resources to deploy your pod. "
+            "please try a different machine",
         )
     )
 
