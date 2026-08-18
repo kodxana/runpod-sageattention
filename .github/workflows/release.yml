@@ -652,7 +652,7 @@ jobs:
           print("Python + PyTorch + CUDA tuple recorded in its adjacent manifest.")
           PY
 
-      - name: Create immutable GitHub release
+      - name: Create or publish immutable GitHub release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -677,7 +677,155 @@ jobs:
             echo "release tag changed after preflight: expected ${RESOLVED_SOURCE_SHA}, got ${current_commit:-missing}" >&2
             exit 1
           fi
-          gh release create "${RELEASE_TAG}" release-assets/* \
-            --verify-tag \
+
+          repo_owner="${GITHUB_REPOSITORY%%/*}"
+          repo_name="${GITHUB_REPOSITORY#*/}"
+          release_query='query($owner: String!, $name: String!, $tag: String!) {
+            repository(owner: $owner, name: $name) {
+              release(tagName: $tag) {
+                tagName
+                isDraft
+                isPrerelease
+                publishedAt
+                releaseAssets(first: 100) {
+                  totalCount
+                  nodes {
+                    name
+                    digest
+                    size
+                  }
+                }
+              }
+            }
+          }'
+
+          fetch_release_json() {
+            local response
+            if ! response="$(gh api graphql \
+              -F owner="${repo_owner}" \
+              -F name="${repo_name}" \
+              -F tag="${RELEASE_TAG}" \
+              -f query="${release_query}")"; then
+              echo "GitHub release lookup failed" >&2
+              return 1
+            fi
+            if jq -e '(.errors // []) | length > 0' \
+              >/dev/null <<< "${response}"; then
+              echo "GitHub release lookup returned GraphQL errors" >&2
+              return 1
+            fi
+            if ! jq -e '.data.repository != null' \
+              >/dev/null <<< "${response}"; then
+              echo "GitHub repository was unavailable during release lookup" >&2
+              return 1
+            fi
+            jq -c '.data.repository.release' <<< "${response}"
+          }
+
+          assert_empty_draft() {
+            local release_json="$1"
+            if [[ "${release_json}" == null ]]; then
+              echo "release disappeared before upload" >&2
+              return 1
+            fi
+            if jq -e '.isDraft == false' \
+              >/dev/null <<< "${release_json}"; then
+              echo "release ${RELEASE_TAG@Q} is already published; refusing to overwrite it" >&2
+              return 1
+            fi
+            if ! jq -e --arg tag "${RELEASE_TAG}" '
+              .tagName == $tag and
+              .isDraft == true and
+              .isPrerelease == false and
+              .releaseAssets.totalCount == 0
+            ' >/dev/null <<< "${release_json}"; then
+              echo "existing release is not an empty, non-prerelease draft" >&2
+              return 1
+            fi
+          }
+
+          shopt -s nullglob
+          release_asset_paths=(release-assets/*)
+          if (( ${#release_asset_paths[@]} == 0 )); then
+            echo "no staged release assets were found" >&2
+            exit 1
+          fi
+          for asset_path in "${release_asset_paths[@]}"; do
+            if [[ ! -f "${asset_path}" ]]; then
+              echo "release asset is not a regular file: ${asset_path}" >&2
+              exit 1
+            fi
+          done
+          expected_assets_json="$(
+            python3.12 - <<'PY' "${release_asset_paths[@]}"
+          import hashlib
+          import json
+          import sys
+          from pathlib import Path
+
+          assets = []
+          for raw_path in sys.argv[1:]:
+              path = Path(raw_path)
+              with path.open("rb") as stream:
+                  digest = hashlib.file_digest(stream, "sha256").hexdigest()
+              assets.append(
+                  {
+                      "name": path.name,
+                      "digest": f"sha256:{digest}",
+                      "size": path.stat().st_size,
+                  }
+              )
+          print(json.dumps(sorted(assets, key=lambda asset: asset["name"])))
+          PY
+          )"
+
+          release_json="$(fetch_release_json)"
+          if [[ "${release_json}" == null ]]; then
+            gh release create "${RELEASE_TAG}" \
+              --draft \
+              --verify-tag \
+              --title "${RELEASE_TAG}" \
+              --notes-file release-notes.md
+            release_json="$(fetch_release_json)"
+          fi
+          assert_empty_draft "${release_json}"
+
+          # Never delete or replace an existing release asset.
+          gh release upload "${RELEASE_TAG}" "${release_asset_paths[@]}"
+
+          release_json="$(fetch_release_json)"
+          if ! jq -e \
+            --arg tag "${RELEASE_TAG}" \
+            --argjson expected "${expected_assets_json}" '
+              .tagName == $tag and
+              .isDraft == true and
+              .isPrerelease == false and
+              .releaseAssets.totalCount == ($expected | length) and
+              ([.releaseAssets.nodes[] | {name, digest, size}] | sort_by(.name)) ==
+                $expected
+            ' >/dev/null <<< "${release_json}"; then
+            echo "draft release state or uploaded asset set is inconsistent; refusing to publish" >&2
+            exit 1
+          fi
+
+          gh release edit "${RELEASE_TAG}" \
             --title "${RELEASE_TAG}" \
-            --notes-file release-notes.md
+            --notes-file release-notes.md \
+            --prerelease=false \
+            --draft=false
+
+          release_json="$(fetch_release_json)"
+          if ! jq -e \
+            --arg tag "${RELEASE_TAG}" \
+            --argjson expected "${expected_assets_json}" '
+              .tagName == $tag and
+              .isDraft == false and
+              .isPrerelease == false and
+              .publishedAt != null and
+              .releaseAssets.totalCount == ($expected | length) and
+              ([.releaseAssets.nodes[] | {name, digest, size}] | sort_by(.name)) ==
+                $expected
+            ' >/dev/null <<< "${release_json}"; then
+            echo "published release postcondition failed" >&2
+            exit 1
+          fi

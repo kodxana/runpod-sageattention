@@ -125,6 +125,40 @@ class WorkflowSecretContractTests(unittest.TestCase):
                     job.index("- name: Install checksum-pinned runpodctl"),
                 )
 
+    def test_release_publishes_only_a_missing_or_safe_existing_draft(self) -> None:
+        publish = self.release.split(
+            "      - name: Create or publish immutable GitHub release\n", 1
+        )[1]
+        self.assertIn("gh api graphql", publish)
+        self.assertIn('if ! response="$(gh api graphql', publish)
+        self.assertIn("GitHub release lookup failed", publish)
+        self.assertIn("release(tagName: $tag)", publish)
+        self.assertIn(".data.repository != null", publish)
+        self.assertIn(".isDraft == false", publish)
+        self.assertIn("is already published; refusing to overwrite it", publish)
+        self.assertIn(".releaseAssets.totalCount == 0", publish)
+        self.assertIn("existing release is not an empty, non-prerelease draft", publish)
+        self.assertIn('gh release create "${RELEASE_TAG}"', publish)
+        self.assertIn("--draft", publish)
+        self.assertIn("--verify-tag", publish)
+        self.assertIn(
+            'gh release upload "${RELEASE_TAG}" "${release_asset_paths[@]}"',
+            publish,
+        )
+        self.assertNotIn("--clobber", publish)
+        self.assertIn("uploaded asset set is inconsistent; refusing to publish", publish)
+        self.assertIn("hashlib.file_digest(stream, \"sha256\")", publish)
+        self.assertIn('"digest": f"sha256:{digest}"', publish)
+        self.assertIn("[.releaseAssets.nodes[] | {name, digest, size}]", publish)
+        self.assertIn('gh release edit "${RELEASE_TAG}"', publish)
+        self.assertIn("--prerelease=false", publish)
+        self.assertIn("--draft=false", publish)
+        self.assertIn("published release postcondition failed", publish)
+        self.assertLess(
+            publish.index('gh release upload "${RELEASE_TAG}"'),
+            publish.index('gh release edit "${RELEASE_TAG}"'),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
