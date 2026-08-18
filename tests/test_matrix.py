@@ -399,14 +399,14 @@ def test_workflows_prefill_reviewed_runpod_gpu_ids() -> None:
         encoding="utf-8")
     release_workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
         encoding="utf-8")
+    env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
     defaults = (
         "NVIDIA A100 80GB PCIe,NVIDIA A100-SXM4-80GB,NVIDIA H100 PCIe,"
         "NVIDIA H100 80GB HBM3,NVIDIA H100 NVL,NVIDIA H200,"
         "NVIDIA GeForce RTX 5090,NVIDIA RTX PRO 6000 Blackwell Server Edition",
         "NVIDIA A100 80GB PCIe,NVIDIA A100-SXM4-80GB",
         "NVIDIA A40,NVIDIA RTX A6000,NVIDIA GeForce RTX 3090",
-        "NVIDIA L40S,NVIDIA RTX 6000 Ada Generation,"
-        "NVIDIA GeForce RTX 4090,NVIDIA L4",
+        "NVIDIA GeForce RTX 4090,NVIDIA RTX 6000 Ada Generation,NVIDIA L4",
         "NVIDIA H100 PCIe,NVIDIA H100 80GB HBM3,NVIDIA H100 NVL,NVIDIA H200",
         "NVIDIA GeForce RTX 5090,NVIDIA RTX PRO 6000 Blackwell Server Edition,"
         "NVIDIA RTX PRO 6000 Blackwell Workstation Edition,"
@@ -422,6 +422,14 @@ def test_workflows_prefill_reviewed_runpod_gpu_ids() -> None:
     assert "cross capability family" in build_workflow
     assert "NVIDIA RTX A4500" not in build_workflow
     assert "NVIDIA RTX A4500" not in release_workflow
+    assert 'default: "NVIDIA L40S' not in build_workflow
+    assert 'default: "NVIDIA L40S' not in release_workflow
+    assert 'RUNPOD_GPU_ID_SM89="NVIDIA GeForce RTX 4090"' in env_example
+    assert (
+        'RUNPOD_GPU_CANDIDATES_SM89="NVIDIA GeForce RTX 4090,'
+        'NVIDIA RTX 6000 Ada Generation,NVIDIA L4"'
+    ) in env_example
+    assert 'RUNPOD_GPU_ID_SM89="NVIDIA L40S"' not in env_example
     assert build_workflow.count("default: GPU") == 2
     assert release_workflow.count("default: GPU") == 1
     assert "max-parallel: 1" in build_workflow

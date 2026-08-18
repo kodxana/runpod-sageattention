@@ -6,9 +6,11 @@ from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timezone
 import json
 import subprocess
+import sys
 import tarfile
 import tempfile
 import textwrap
+import threading
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -811,6 +813,82 @@ class SSHSecurityTests(unittest.TestCase):
         self.assertEqual(extract[0], "ssh")
         self.assertIn("/work/sageattention-factory", extract[-1])
 
+    def test_long_command_streams_before_exit(self) -> None:
+        class SignalingStream(io.StringIO):
+            def __init__(self, marker: str, ready: threading.Event) -> None:
+                super().__init__()
+                self.marker = marker
+                self.ready = ready
+
+            def write(self, value: str) -> int:
+                written = super().write(value)
+                if self.marker in value:
+                    self.ready.set()
+                return written
+
+        with tempfile.TemporaryDirectory() as temp:
+            key = Path(temp) / "key"
+            key.write_text("private", encoding="utf-8")
+            transport = SSHTransport(key)
+            ready = threading.Event()
+            stdout = SignalingStream("stream-ready", ready)
+            stderr = io.StringIO()
+            failures: list[BaseException] = []
+
+            def run() -> None:
+                try:
+                    with mock.patch("sys.stdout", stdout), mock.patch(
+                        "sys.stderr", stderr
+                    ):
+                        transport._run_streaming(
+                            [
+                                sys.executable,
+                                "-u",
+                                "-c",
+                                "import time; print('stream-ready'); time.sleep(0.5)",
+                            ],
+                            timeout=5,
+                        )
+                except BaseException as exc:
+                    failures.append(exc)
+
+            worker = threading.Thread(target=run)
+            worker.start()
+            self.assertTrue(ready.wait(3), "child output was not forwarded live")
+            self.assertTrue(worker.is_alive(), "command exited before its output was observed")
+            worker.join(5)
+            transport.close()
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(failures, [])
+        self.assertIn("stream-ready", stdout.getvalue())
+
+    def test_long_command_streams_stderr_and_preserves_checked_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            key = Path(temp) / "key"
+            key.write_text("private", encoding="utf-8")
+            transport = SSHTransport(key)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            try:
+                with mock.patch("sys.stdout", stdout), mock.patch(
+                    "sys.stderr", stderr
+                ), self.assertRaisesRegex(CommandError, "remote failure"):
+                    transport._run_streaming(
+                        [
+                            sys.executable,
+                            "-u",
+                            "-c",
+                            "import sys; print('remote failure', file=sys.stderr); "
+                            "raise SystemExit(7)",
+                        ],
+                        timeout=5,
+                    )
+            finally:
+                transport.close()
+
+        self.assertIn("remote failure", stderr.getvalue())
+
 
 class WorkflowInvariantTests(unittest.TestCase):
     @classmethod
@@ -1585,15 +1663,28 @@ class RunJobCleanupTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp:
             ctl = FakeCtl()
-            result = run_job(
-                self._spec(Path(temp)),
-                ctl=ctl,  # type: ignore[arg-type]
-                transport=FakeTransport(),  # type: ignore[arg-type]
-                wait_fn=lambda *args, **kwargs: Endpoint("host", 2200),
-            )
+            output = io.StringIO()
+            with mock.patch("sys.stdout", output):
+                result = run_job(
+                    self._spec(Path(temp)),
+                    ctl=ctl,  # type: ignore[arg-type]
+                    transport=FakeTransport(),  # type: ignore[arg-type]
+                    wait_fn=lambda *args, **kwargs: Endpoint("host", 2200),
+                )
             self.assertEqual(result.pod_id, "pod-ok")
             self.assertEqual(result.endpoint.port, 2200)
             self.assertTrue(ctl.terminated)
+            messages = output.getvalue()
+            self.assertIn(
+                "Pod pod-ok: uploading repository to /work/sageattention-factory",
+                messages,
+            )
+            self.assertIn("Pod pod-ok: repository upload complete", messages)
+            self.assertIn("Pod pod-ok: starting remote command 1/1", messages)
+            self.assertIn("Pod pod-ok: remote command 1/1 complete", messages)
+            self.assertIn("Pod pod-ok: downloading requested artifacts", messages)
+            self.assertIn("Pod pod-ok: artifact download complete", messages)
+            self.assertIn("Pod pod-ok: terminated", messages)
 
 
 if __name__ == "__main__":

@@ -64,6 +64,10 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
             temporary.unlink(missing_ok=True)
 
 
+def _runtime_progress(message: str) -> None:
+    print(f"[sageattention-runtime] {message}", flush=True)
+
+
 def normalized_requirement(requirement: str) -> str:
     return re.sub(r"\s+", "", requirement.split(";", 1)[0]).lower()
 
@@ -726,6 +730,9 @@ def run_runtime_validation(
     expected_capability: str,
     report_path: Path,
 ) -> dict[str, Any]:
+    _runtime_progress(
+        f"setup-start build_id={build['id']} expected_capability={expected_capability}"
+    )
     import importlib.metadata
 
     import torch
@@ -770,6 +777,9 @@ def run_runtime_validation(
     require(actual_capability == expected_capability,
             f"scheduler GPU mismatch: expected {expected_capability}, got {actual_capability}")
     cuda_device_name = torch.cuda.get_device_name(0)
+    _runtime_progress(
+        f"setup-ready actual_capability={actual_capability} device={cuda_device_name!r}"
+    )
 
     policy = matrix["validation"]["runtime_numeric"]
     case = policy["canonical_case"]
@@ -787,9 +797,11 @@ def run_runtime_validation(
             "canonical runtime validator requires equal Q and KV head counts")
 
     torch.manual_seed(case["seed"])
+    _runtime_progress(f"tensor-allocation-start shape={list(shape)} dtype={case['dtype']}")
     q = torch.randn(shape, device="cuda", dtype=dtype)
     k = torch.randn(shape, device="cuda", dtype=dtype)
     v = torch.randn(shape, device="cuda", dtype=dtype)
+    _runtime_progress("tensor-allocation-pass")
     implementations = {
         "sageattn_dispatch": lambda causal: sageattn(
             q, k, v,
@@ -829,13 +841,19 @@ def run_runtime_validation(
     references: dict[bool, Any] = {}
     reference_errors: dict[bool, dict[str, str]] = {}
     for causal in case["causal_modes"]:
+        _runtime_progress(f"reference-start causal={str(causal).lower()}")
         try:
             with sdpa_kernel(SDPBackend.MATH):
                 references[causal] = functional.scaled_dot_product_attention(
                     q.float(), k.float(), v.float(), is_causal=causal)
             torch.cuda.synchronize()
+            _runtime_progress(f"reference-pass causal={str(causal).lower()}")
         except Exception as error:
             reference_errors[causal] = _runtime_error("reference", error)
+            _runtime_progress(
+                f"reference-fail causal={str(causal).lower()} "
+                f"error_type={type(error).__name__}"
+            )
 
     expected_output_shape = list(shape)
     expected_output_dtype = case["dtype"]
@@ -843,26 +861,46 @@ def run_runtime_validation(
     for implementation_name in required_implementations:
         implementation = implementations[implementation_name]
         for causal in case["causal_modes"]:
+            causal_text = str(causal).lower()
+            _runtime_progress(
+                f"case-start implementation={implementation_name} causal={causal_text}"
+            )
             if causal in reference_errors:
-                results.append({
+                result = {
                     "causal": causal,
                     "errors": [reference_errors[causal]],
                     "expected_output_dtype": expected_output_dtype,
                     "expected_output_shape": expected_output_shape,
                     "implementation": implementation_name,
-                })
-                continue
-            results.append(_evaluate_runtime_case(
-                torch_module=torch,
-                implementation=implementation,
-                implementation_name=implementation_name,
-                causal=causal,
-                reference=references[causal],
-                expected_output_dtype=expected_output_dtype,
-                expected_output_shape=expected_output_shape,
-                expected_dtype=dtype,
-                policy=policy,
-            ))
+                }
+            else:
+                result = _evaluate_runtime_case(
+                    torch_module=torch,
+                    implementation=implementation,
+                    implementation_name=implementation_name,
+                    causal=causal,
+                    reference=references[causal],
+                    expected_output_dtype=expected_output_dtype,
+                    expected_output_shape=expected_output_shape,
+                    expected_dtype=dtype,
+                    policy=policy,
+                )
+            results.append(result)
+            if result.get("errors"):
+                stages = ",".join(
+                    error["stage"] for error in result["errors"]
+                )
+                _runtime_progress(
+                    f"case-fail implementation={implementation_name} "
+                    f"causal={causal_text} stages={stages}"
+                )
+            else:
+                _runtime_progress(
+                    f"case-pass implementation={implementation_name} "
+                    f"causal={causal_text} "
+                    f"cosine={result['cosine_similarity']:.6f} "
+                    f"relative_l2={result['relative_l2']:.6f}"
+                )
 
     failures = [
         {
@@ -894,6 +932,9 @@ def run_runtime_validation(
     if failures:
         report["failures"] = failures
     _write_json_atomic(report_path, report)
+    _runtime_progress(
+        f"report-written status={report['status']} path={report_path}"
+    )
     if failures:
         first = failures[0]
         first_error = first["errors"][0]["message"]

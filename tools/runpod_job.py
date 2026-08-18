@@ -25,13 +25,14 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import uuid
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
-from typing import Callable, Iterable, Mapping, Sequence
+from typing import Callable, Iterable, Mapping, Sequence, TextIO
 
 
 class JobError(RuntimeError):
@@ -666,6 +667,93 @@ class SSHTransport:
             check=check,
         )
 
+    @staticmethod
+    def _forward_stream(
+        source: TextIO,
+        destination: TextIO,
+        captured: list[str],
+    ) -> None:
+        """Forward one subprocess text stream while retaining checked-error detail."""
+
+        try:
+            for chunk in iter(source.readline, ""):
+                captured.append(chunk)
+                destination.write(chunk)
+                destination.flush()
+        finally:
+            source.close()
+
+    def _run_streaming(
+        self,
+        argv: Sequence[str],
+        *,
+        timeout: float,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run a long command with live output and the same checked semantics."""
+
+        try:
+            process = subprocess.Popen(
+                list(argv),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+        except FileNotFoundError as exc:
+            raise CommandError(f"required executable is missing: {argv[0]}") from exc
+
+        if process.stdout is None or process.stderr is None:
+            process.kill()
+            process.wait()
+            raise CommandError(f"{argv[0]} did not provide captured output streams")
+
+        stdout: list[str] = []
+        stderr: list[str] = []
+        readers = (
+            threading.Thread(
+                target=self._forward_stream,
+                args=(process.stdout, sys.stdout, stdout),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=self._forward_stream,
+                args=(process.stderr, sys.stderr, stderr),
+                daemon=True,
+            ),
+        )
+        for reader in readers:
+            reader.start()
+
+        timed_out = False
+        try:
+            returncode = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            process.kill()
+            returncode = process.wait()
+        except BaseException:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            raise
+        finally:
+            for reader in readers:
+                reader.join()
+
+        completed = subprocess.CompletedProcess(
+            list(argv),
+            returncode,
+            "".join(stdout),
+            "".join(stderr),
+        )
+        if timed_out:
+            raise CommandError(f"{argv[0]} timed out after {timeout:.0f}s")
+        if check and completed.returncode != 0:
+            detail = _completed_text(completed) or f"exit code {completed.returncode}"
+            raise CommandError(f"{argv[0]} failed: {detail}")
+        return completed
+
     def upload_repo(
         self,
         endpoint: Endpoint,
@@ -734,24 +822,11 @@ class SSHTransport:
             f"cd {shlex.quote(remote_dir)}; "
             f"{script}"
         )
-        proc = self._run_remote(
-            endpoint,
-            wrapped,
+        command = "bash -lc " + shlex.quote(wrapped)
+        self._run_streaming(
+            [*self._ssh_prefix(endpoint), command],
             timeout=deadline.timeout(),
         )
-        if proc.stdout:
-            print(
-                proc.stdout,
-                end="" if proc.stdout.endswith("\n") else "\n",
-                flush=True,
-            )
-        if proc.stderr:
-            print(
-                proc.stderr,
-                file=sys.stderr,
-                end="" if proc.stderr.endswith("\n") else "\n",
-                flush=True,
-            )
 
     def download_artifacts(
         self,
@@ -1291,6 +1366,10 @@ def run_job(
         assert pod_id is not None and endpoint is not None
         if is_build_job and verified_build_assignment is None:
             raise JobError("build Pod assignment did not provide verified CPU/RAM")
+        print(
+            f"Pod {pod_id}: uploading repository to {spec.remote_dir}",
+            flush=True,
+        )
         transport.upload_repo(
             endpoint,
             spec.repo_root,
@@ -1298,7 +1377,14 @@ def run_job(
             deadline,
         )
         repo_uploaded = True
-        for command in spec.commands:
+        print(f"Pod {pod_id}: repository upload complete", flush=True)
+        command_count = len(spec.commands)
+        for command_number, command in enumerate(spec.commands, start=1):
+            print(
+                f"Pod {pod_id}: starting remote command "
+                f"{command_number}/{command_count}",
+                flush=True,
+            )
             remote_exports: list[tuple[str, str]] = []
             receipt_prefix = ""
             if is_build_job:
@@ -1333,6 +1419,11 @@ def run_job(
                 remote_command,
                 deadline,
             )
+            print(
+                f"Pod {pod_id}: remote command "
+                f"{command_number}/{command_count} complete",
+                flush=True,
+            )
     except Exception as exc:
         primary_error = exc
     finally:
@@ -1343,6 +1434,10 @@ def run_job(
             and deadline.seconds_left() > 1
         ):
             try:
+                print(
+                    f"Pod {pod_id}: downloading requested artifacts",
+                    flush=True,
+                )
                 transport.download_artifacts(
                     endpoint,
                     spec.remote_dir,
@@ -1350,6 +1445,7 @@ def run_job(
                     spec.artifact_output,
                     deadline,
                 )
+                print(f"Pod {pod_id}: artifact download complete", flush=True)
             except Exception as exc:
                 artifact_error = exc
         cleanup_error = _terminate_strictly(ctl, pod_id) if pod_id else None

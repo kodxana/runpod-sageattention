@@ -125,6 +125,37 @@ class WorkflowSecretContractTests(unittest.TestCase):
                     job.index("- name: Install checksum-pinned runpodctl"),
                 )
 
+    def test_gpu_validation_uses_a_fixed_short_budget(self) -> None:
+        build_job = self.build.split("  build:\n", 1)[1].split(
+            "\n  gpu-test:\n", 1
+        )[0]
+        gpu_test_job = self.build.split("  gpu-test:\n", 1)[1]
+
+        self.assertIn("timeout-minutes: 30", gpu_test_job)
+        self.assertIn("GPU_VALIDATION_TIMEOUT_SECONDS: 900", gpu_test_job)
+        self.assertIn("GPU_VALIDATION_TERMINATE_GRACE_SECONDS: 300", gpu_test_job)
+        self.assertIn(
+            '--timeout-seconds "${GPU_VALIDATION_TIMEOUT_SECONDS}"', gpu_test_job
+        )
+        self.assertIn(
+            '--terminate-grace-seconds "${GPU_VALIDATION_TERMINATE_GRACE_SECONDS}"',
+            gpu_test_job,
+        )
+        self.assertNotIn("HARD_TIMEOUT: ${{ inputs.timeout_seconds }}", gpu_test_job)
+        self.assertIn("HARD_TIMEOUT: ${{ inputs.timeout_seconds }}", build_job)
+        self.assertEqual(
+            self.build.count(
+                "description: Hard builder-Pod timeout; GPU validation is fixed at 900 seconds"
+            ),
+            2,
+        )
+        self.assertEqual(
+            self.release.count(
+                "description: Hard builder-Pod timeout; GPU validation is fixed at 900 seconds"
+            ),
+            1,
+        )
+
     def test_release_publishes_only_a_missing_or_safe_existing_draft(self) -> None:
         publish = self.release.split(
             "      - name: Create or publish immutable GitHub release\n", 1

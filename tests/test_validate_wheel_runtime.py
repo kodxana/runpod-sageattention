@@ -350,6 +350,28 @@ class RuntimeValidationReportTests(unittest.TestCase):
                 report,
             )
 
+    def test_runtime_progress_is_flushed_for_every_case(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            report_path = Path(directory) / "sm90.json"
+            with mock.patch("builtins.print") as emit:
+                self.run_fixture(inject_failures=False, report_path=report_path)
+
+        messages = [call.args[0] for call in emit.call_args_list]
+        case_starts = [
+            message for message in messages
+            if message.startswith("[sageattention-runtime] case-start ")
+        ]
+        case_passes = [
+            message for message in messages
+            if message.startswith("[sageattention-runtime] case-pass ")
+        ]
+        self.assertEqual(len(case_starts), 8)
+        self.assertEqual(len(case_passes), 8)
+        self.assertTrue(any("setup-start" in message for message in messages))
+        self.assertTrue(any("report-written status=pass" in message for message in messages))
+        for call in emit.call_args_list:
+            self.assertIs(call.kwargs.get("flush"), True)
+
     def test_output_type_shape_dtype_and_finite_checks_are_preserved(self) -> None:
         shape = [1, 8, 512, 64]
         torch = fake_torch_module(tuple(shape))

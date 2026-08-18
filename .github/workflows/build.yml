@@ -54,7 +54,7 @@ on:
       gpu_id_sm89:
         description: Ordered SM 8.9-only Runpod gpuId candidates
         required: true
-        default: "NVIDIA L40S,NVIDIA RTX 6000 Ada Generation,NVIDIA GeForce RTX 4090,NVIDIA L4"
+        default: "NVIDIA GeForce RTX 4090,NVIDIA RTX 6000 Ada Generation,NVIDIA L4"
         type: string
       gpu_id_sm90:
         description: Ordered SM 9.0-only Runpod gpuId candidates
@@ -100,7 +100,7 @@ on:
         default: 32
         type: number
       timeout_seconds:
-        description: Hard per-Pod orchestration timeout
+        description: Hard builder-Pod timeout; GPU validation is fixed at 900 seconds
         required: true
         default: 14400
         type: number
@@ -160,7 +160,7 @@ on:
         type: string
       gpu_id_sm89:
         required: false
-        default: "NVIDIA L40S,NVIDIA RTX 6000 Ada Generation,NVIDIA GeForce RTX 4090,NVIDIA L4"
+        default: "NVIDIA GeForce RTX 4090,NVIDIA RTX 6000 Ada Generation,NVIDIA L4"
         type: string
       gpu_id_sm90:
         required: false
@@ -195,6 +195,7 @@ on:
         default: 32
         type: number
       timeout_seconds:
+        description: Hard builder-Pod timeout; GPU validation is fixed at 900 seconds
         required: false
         default: 14400
         type: number
@@ -656,7 +657,12 @@ jobs:
       - build
     runs-on: ubuntu-24.04
     environment: runpod-paid
-    timeout-minutes: 270
+    # Validation only installs a finished wheel and launches the reviewed
+    # runtime cases. Keep its billed Pod budget independent from compilation.
+    timeout-minutes: 30
+    env:
+      GPU_VALIDATION_TIMEOUT_SECONDS: 900
+      GPU_VALIDATION_TERMINATE_GRACE_SECONDS: 300
     strategy:
       fail-fast: false
       max-parallel: ${{ fromJSON(needs.plan.outputs.gpu_max_parallel) }}
@@ -733,7 +739,6 @@ jobs:
           CLOUD_TYPE: ${{ inputs.cloud_type }}
           REGISTRY_AUTH_ID: ${{ inputs.registry_auth_id }}
           DISK_GB: ${{ inputs.container_disk_gb }}
-          HARD_TIMEOUT: ${{ inputs.timeout_seconds }}
         run: |
           registry_args=()
           if [[ -n "${REGISTRY_AUTH_ID}" ]]; then
@@ -765,8 +770,8 @@ jobs:
             --ssh-key "${RUNNER_TEMP}/runpod-ssh/id" \
             --repo "${GITHUB_WORKSPACE}" \
             --remote-dir /workspace \
-            --timeout-seconds "${HARD_TIMEOUT}" \
-            --terminate-grace-seconds 900 \
+            --timeout-seconds "${GPU_VALIDATION_TIMEOUT_SECONDS}" \
+            --terminate-grace-seconds "${GPU_VALIDATION_TERMINATE_GRACE_SECONDS}" \
             --command "${prepare}" \
             --command "${validate}" \
             --artifact "runtime-results/${BUILD_ID}" \

@@ -100,7 +100,7 @@ fuzzy display names and availability at dispatch time is not guaranteed:
 | Sequential builders | GPU hidden; capability unrestricted | `NVIDIA A100 80GB PCIe` → `NVIDIA A100-SXM4-80GB` → `NVIDIA H100 PCIe` → `NVIDIA H100 80GB HBM3` → `NVIDIA H100 NVL` → `NVIDIA H200` → `NVIDIA GeForce RTX 5090` → `NVIDIA RTX PRO 6000 Blackwell Server Edition` |
 | Runtime representative | SM 8.0 | `NVIDIA A100 80GB PCIe` → `NVIDIA A100-SXM4-80GB` |
 | Runtime representative | SM 8.6 | `NVIDIA A40` → `NVIDIA RTX A6000` → `NVIDIA GeForce RTX 3090` |
-| Runtime representative | SM 8.9 | `NVIDIA L40S` → `NVIDIA RTX 6000 Ada Generation` → `NVIDIA GeForce RTX 4090` → `NVIDIA L4` |
+| Runtime representative | SM 8.9 | `NVIDIA GeForce RTX 4090` → `NVIDIA RTX 6000 Ada Generation` → `NVIDIA L4` |
 | Runtime representative | SM 9.0 | `NVIDIA H100 PCIe` → `NVIDIA H100 80GB HBM3` → `NVIDIA H100 NVL` → `NVIDIA H200` |
 | Runtime representative | SM 12.0 | `NVIDIA GeForce RTX 5090` → `NVIDIA RTX PRO 6000 Blackwell Server Edition` → `NVIDIA RTX PRO 6000 Blackwell Workstation Edition` → `NVIDIA RTX PRO 4500 Blackwell Server Edition` → `NVIDIA RTX PRO 4500 Blackwell` |
 
@@ -111,6 +111,8 @@ must verify both the assigned `gpuId` and the actual CUDA capability before it
 accepts evidence. Candidate exhaustion fails the job; it must not silently
 substitute another architecture. MIG profiles and the RTX PRO 6000 Blackwell
 Max-Q Workstation Edition are intentionally absent from these defaults.
+L40S remains in the reviewed SM 8.9 allowlist for an explicit operator override,
+but is excluded from routine release defaults after observed assignment hangs.
 
 Fallback is deliberately narrow. The orchestrator makes at most two ordered
 placement rounds, with a five-second backoff before round two only when every
@@ -163,7 +165,11 @@ The two CUDA wheel variants build sequentially so only one billed builder and
 one high-memory NVCC workload run at a time. Runtime validation remains a
 reviewed ten-job matrix: two wheel variants multiplied by five capabilities.
 `gpu_max_parallel` limits simultaneously billed validation Pods; the default is
-two.
+two. The configurable `timeout_seconds` input applies only to builder Pods.
+Each install-and-runtime validation Pod instead has a fixed 900-second hard
+orchestration deadline and a 300-second platform termination grace period; its
+GitHub job has a 30-minute outer bound so artifact recovery and strict cleanup
+can finish.
 
 ## Build and validation flow
 
@@ -238,7 +244,9 @@ release workflow.
 
 7. Each GPU produces a separate `runtime-BUILD_ID-smNN` evidence artifact.
    Missing, skipped, wrong-capability, non-finite, or numerically failing tests
-   fail the job.
+   fail the job. Setup, reference generation, and every implementation/causal
+   case emit flushed progress lines so an active validation is distinguishable
+   from a stalled SSH session.
 
 CUDA scheduler floors come from the matching build entry in `matrix.json`:
 CUDA 12.8 for cu128 and CUDA 13.0 for cu130. GPU-backed builders and runtime
