@@ -25,6 +25,7 @@ from tools.runpod_job import (
     _extract_ssh_endpoint,
     _http_json,
     _make_repo_archive,
+    _parser,
     _rfc3339_after,
     _safe_extract,
     run_job,
@@ -160,11 +161,95 @@ class RunpodctlTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--gpu-count") + 1], "1")
         self.assertEqual(argv[argv.index("--min-cuda-version") + 1], "12.8")
         self.assertNotIn("--compute-type", argv)
+        self.assertNotIn("--volume-in-gb", argv)
         self.assertIn("--public-ip", argv)
         self.assertEqual(
             argv[argv.index("--terminate-after") + 1],
             "2026-08-18T05:00:00Z",
         )
+
+    def test_gpu_build_create_preserves_deadline_and_disables_volume(self) -> None:
+        executor = RecordingExecutor(completed('{"id":"pod-gpu-build"}'))
+        ctl = Runpodctl(executor=executor)
+        pod_id = ctl.create_pod(
+            PodRequest(
+                image="registry.invalid/builder@sha256:" + "e" * 64,
+                name="gpu-build",
+                public_key="ssh-ed25519 AAAA test",
+                compute_type="GPU",
+                gpu_id="NVIDIA A100 80GB PCIe",
+                min_cuda_version="12.8",
+                gpu_workload="BUILD",
+                gpu_min_vcpu_count=4,
+                gpu_min_memory_gb=32,
+                container_disk_gb=80,
+            ),
+            terminate_after="2026-08-18T05:00:00Z",
+            self_terminate_seconds=15_300,
+        )
+
+        self.assertEqual(pod_id, "pod-gpu-build")
+        argv = executor.calls[0][0]
+        self.assertEqual(
+            argv[argv.index("--gpu-id") + 1], "NVIDIA A100 80GB PCIe"
+        )
+        self.assertEqual(argv[argv.index("--container-disk-in-gb") + 1], "80")
+        self.assertEqual(argv[argv.index("--volume-in-gb") + 1], "0")
+        self.assertEqual(
+            argv[argv.index("--terminate-after") + 1],
+            "2026-08-18T05:00:00Z",
+        )
+
+    def test_gpu_build_request_enforces_compilation_minima(self) -> None:
+        request = PodRequest(
+            image="registry.invalid/builder",
+            name="gpu-build",
+            public_key="ssh-ed25519 AAAA test",
+            compute_type="GPU",
+            gpu_id="NVIDIA A100 80GB PCIe",
+            gpu_workload="BUILD",
+        )
+        for field, value, message in (
+            ("gpu_min_vcpu_count", 3, "at least 4 vCPUs"),
+            ("gpu_min_memory_gb", 31, "at least 32 GB system RAM"),
+            ("container_disk_gb", 79, "at least 80 GB container disk"),
+        ):
+            with self.subTest(field=field), self.assertRaisesRegex(
+                ValueError, message
+            ):
+                replace(request, **{field: value}).validate()
+
+    def test_gpu_build_resource_flags_are_exposed_by_cli(self) -> None:
+        args = _parser().parse_args(
+            [
+                "--image",
+                "registry.invalid/builder",
+                "--name",
+                "gpu-build",
+                "--mode",
+                "gpu",
+                "--gpu-id",
+                "NVIDIA A100 80GB PCIe",
+                "--gpu-workload",
+                "build",
+                "--gpu-min-vcpu-count",
+                "24",
+                "--gpu-min-memory-gb",
+                "64",
+                "--ssh-key",
+                "id_ed25519",
+                "--command",
+                "true",
+            ]
+        )
+        self.assertEqual(args.gpu_workload, "build")
+        self.assertEqual(args.gpu_min_vcpu_count, 24)
+        self.assertEqual(args.gpu_min_memory_gb, 64)
+        parser = _parser()
+        self.assertEqual(parser.get_default("gpu_min_vcpu_count"), 4)
+        help_text = " ".join(parser.format_help().split())
+        self.assertIn("4 required; 16 recommended", help_text)
+        self.assertIn("32 GB required; 64 GB recommended", help_text)
 
     def test_nonzero_runpodctl_result_is_an_error(self) -> None:
         ctl = Runpodctl(executor=RecordingExecutor(completed(stderr="denied", code=1)))
@@ -374,6 +459,130 @@ class AssignmentTests(unittest.TestCase):
                     Deadline(10),
                 )
 
+    def test_gpu_validation_assignment_retains_light_contract(self) -> None:
+        class FakeCtl:
+            def assignment_details(self, pod_id, timeout):
+                return {
+                    "image": "registry.invalid/runtime@sha256:" + "b" * 64,
+                }
+
+        verify_pod_assignment(
+            FakeCtl(),  # type: ignore[arg-type]
+            "pod-validation",
+            PodRequest(
+                image="registry.invalid/runtime@sha256:" + "b" * 64,
+                name="gpu-validation",
+                public_key="ssh-ed25519 AAAA test",
+                compute_type="GPU",
+                gpu_id="NVIDIA RTX 4090",
+            ),
+            Deadline(10),
+        )
+
+    def test_gpu_build_assignment_accepts_both_gpu_id_shapes(self) -> None:
+        base = {
+            "image": "registry.invalid/builder@sha256:" + "e" * 64,
+            "vcpuCount": 4,
+            "memoryInGb": 32,
+            "containerDiskInGb": 80,
+            "volumeInGb": 0,
+        }
+        request = PodRequest(
+            image=base["image"],
+            name="gpu-build",
+            public_key="ssh-ed25519 AAAA test",
+            compute_type="GPU",
+            gpu_id="NVIDIA A100 80GB PCIe",
+            gpu_workload="BUILD",
+        )
+
+        class FakeCtl:
+            def __init__(self, details):
+                self.details = details
+
+            def assignment_details(self, pod_id, timeout):
+                return self.details
+
+        for gpu_fields in (
+            {"gpuTypeId": "NVIDIA A100 80GB PCIe"},
+            {"gpu": {"id": "NVIDIA A100 80GB PCIe"}},
+        ):
+            with self.subTest(gpu_fields=gpu_fields):
+                verify_pod_assignment(
+                    FakeCtl({**base, **gpu_fields}),  # type: ignore[arg-type]
+                    "pod-gpu-build",
+                    request,
+                    Deadline(10),
+                )
+
+    def test_gpu_build_assignment_fails_closed_on_resource_drift(self) -> None:
+        base = {
+            "imageName": "registry.invalid/builder@sha256:" + "e" * 64,
+            "gpuTypeId": "NVIDIA A100 80GB PCIe",
+            "vcpuCount": 4,
+            "memoryInGb": 32,
+            "containerDiskInGb": 80,
+            "volumeInGb": 0,
+        }
+        request = PodRequest(
+            image=base["imageName"],
+            name="gpu-build",
+            public_key="ssh-ed25519 AAAA test",
+            compute_type="GPU",
+            gpu_id="NVIDIA A100 80GB PCIe",
+            gpu_workload="BUILD",
+        )
+
+        class FakeCtl:
+            def __init__(self, details):
+                self.details = details
+
+            def assignment_details(self, pod_id, timeout):
+                return self.details
+
+        cases = (
+            ({**base, "imageName": "wrong-image"}, "Pod image mismatch"),
+            ({**base, "gpuTypeId": "NVIDIA A100-SXM4-80GB"}, "GPU type mismatch"),
+            (
+                {key: value for key, value in base.items() if key != "gpuTypeId"},
+                "GPU type mismatch",
+            ),
+            ({**base, "vcpuCount": 3}, "GPU build CPU count mismatch"),
+            (
+                {key: value for key, value in base.items() if key != "vcpuCount"},
+                "GPU build CPU count mismatch",
+            ),
+            ({**base, "memoryInGb": 31}, "GPU build memory mismatch"),
+            (
+                {key: value for key, value in base.items() if key != "memoryInGb"},
+                "GPU build memory mismatch",
+            ),
+            ({**base, "containerDiskInGb": 79}, "container disk mismatch"),
+            (
+                {
+                    key: value
+                    for key, value in base.items()
+                    if key != "containerDiskInGb"
+                },
+                "container disk mismatch",
+            ),
+            ({**base, "volumeInGb": 20}, "unexpected paid Pod volume"),
+            (
+                {key: value for key, value in base.items() if key != "volumeInGb"},
+                "unexpected paid Pod volume",
+            ),
+        )
+        for details, message in cases:
+            with self.subTest(message=message), self.assertRaisesRegex(
+                JobError, message
+            ):
+                verify_pod_assignment(
+                    FakeCtl(details),  # type: ignore[arg-type]
+                    "pod-gpu-build",
+                    request,
+                    Deadline(10),
+                )
+
 
 class ArtifactSafetyTests(unittest.TestCase):
     def test_safe_extract_accepts_regular_file(self) -> None:
@@ -565,6 +774,74 @@ class RunJobCleanupTests(unittest.TestCase):
             spec = replace(self._spec(Path(temp)), remote_dir="/workspace")
             with self.assertRaisesRegex(ValueError, "directory below /work"):
                 spec.validate()
+
+    def test_gpu_build_checkout_must_be_below_work(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            pod = PodRequest(
+                image="registry.invalid/builder@sha256:" + "e" * 64,
+                name="gpu-build",
+                public_key="ssh-ed25519 AAAA test",
+                compute_type="GPU",
+                gpu_id="NVIDIA A100 80GB PCIe",
+                gpu_workload="BUILD",
+            )
+            spec = replace(self._spec(root), pod=pod, remote_dir="/workspace")
+            with self.assertRaisesRegex(ValueError, "directory below /work"):
+                spec.validate()
+
+    def test_gpu_build_assignment_failure_terminates_before_upload(self) -> None:
+        class FakeCtl:
+            def __init__(self):
+                self.terminated: list[str] = []
+
+            def check_auth(self, timeout):
+                return None
+
+            def create_pod(
+                self, request, terminate_after, self_terminate_seconds, timeout
+            ):
+                self.terminate_after = terminate_after
+                return "pod-gpu-build"
+
+            def assignment_details(self, pod_id, timeout):
+                return {
+                    "image": "registry.invalid/builder@sha256:" + "e" * 64,
+                    "gpu": {"id": "NVIDIA A100 80GB PCIe"},
+                    "vcpuCount": 3,
+                    "memoryInGb": 64,
+                    "containerDiskInGb": 80,
+                    "volumeInGb": 0,
+                }
+
+            def terminate_pod(self, pod_id, timeout):
+                self.terminated.append(pod_id)
+
+        class NoUploadTransport:
+            def upload_repo(self, *args):
+                raise AssertionError("resource drift must fail before source upload")
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            pod = PodRequest(
+                image="registry.invalid/builder@sha256:" + "e" * 64,
+                name="gpu-build",
+                public_key="ssh-ed25519 AAAA test",
+                compute_type="GPU",
+                gpu_id="NVIDIA A100 80GB PCIe",
+                gpu_workload="BUILD",
+            )
+            spec = replace(self._spec(root), pod=pod)
+            ctl = FakeCtl()
+            with self.assertRaisesRegex(JobError, "GPU build CPU count mismatch"):
+                run_job(
+                    spec,
+                    ctl=ctl,  # type: ignore[arg-type]
+                    transport=NoUploadTransport(),  # type: ignore[arg-type]
+                    wait_fn=lambda *args, **kwargs: Endpoint("host", 2200),
+                )
+            self.assertRegex(ctl.terminate_after, r"Z$")
+            self.assertEqual(ctl.terminated, ["pod-gpu-build"])
 
     def test_command_failure_still_downloads_debug_artifacts_and_terminates(self) -> None:
         class FakeCtl:

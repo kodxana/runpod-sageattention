@@ -7,6 +7,19 @@ on:
         description: Existing immutable Git tag to build and release
         required: true
         type: string
+      build_backend:
+        description: Builder backend (GPU default; 16 vCPU / 64 GB RAM recommended)
+        required: true
+        default: GPU
+        type: choice
+        options:
+          - GPU
+          - CPU
+      build_gpu_id:
+        description: Exact Runpod gpuId used only for GPU-backed compilation
+        required: true
+        default: "NVIDIA A100 80GB PCIe"
+        type: string
       builder_image_cu128:
         description: Immutable CUDA 12.8 builder image (@sha256 required)
         required: true
@@ -20,30 +33,37 @@ on:
       runtime_image_cu128:
         description: Immutable ComfyUI-compatible cu128 image (@sha256 required)
         required: true
+        default: "runpod/comfyui@sha256:ce5e842ca0c7233a983ff76a83739b445172259c77a43a117453ef7e6a64d0b7"
         type: string
       runtime_image_cu130:
         description: Immutable ComfyUI-compatible cu130 image (@sha256 required)
         required: true
+        default: "runpod/comfyui@sha256:0bf75436da591e0f26d299af3741e07cb8ce8ce36566d1a7d8d78aae458e5d67"
         type: string
       gpu_id_sm80:
         description: Exact Runpod gpuId for one SM 8.0 representative
         required: true
+        default: "NVIDIA A100 80GB PCIe"
         type: string
       gpu_id_sm86:
         description: Exact Runpod gpuId for one SM 8.6 representative
         required: true
+        default: "NVIDIA GeForce RTX 3090"
         type: string
       gpu_id_sm89:
         description: Exact Runpod gpuId for one SM 8.9 representative
         required: true
+        default: "NVIDIA GeForce RTX 4090"
         type: string
       gpu_id_sm90:
         description: Exact Runpod gpuId for one SM 9.0 representative
         required: true
+        default: "NVIDIA H100 PCIe"
         type: string
       gpu_id_sm120:
         description: Exact Runpod gpuId for one SM 12.0 representative
         required: true
+        default: "NVIDIA GeForce RTX 5090"
         type: string
       cloud_type:
         description: Runpod capacity pool
@@ -137,6 +157,8 @@ jobs:
     uses: ./.github/workflows/build.yml
     with:
       source_ref: ${{ needs.preflight.outputs.source_sha }}
+      build_backend: ${{ inputs.build_backend }}
+      build_gpu_id: ${{ inputs.build_gpu_id }}
       builder_image_cu128: ${{ inputs.builder_image_cu128 }}
       builder_image_cu130: ${{ inputs.builder_image_cu130 }}
       runtime_image_cu128: ${{ inputs.runtime_image_cu128 }}
@@ -209,6 +231,8 @@ jobs:
         shell: bash
         env:
           RELEASE_TAG: ${{ inputs.release_tag }}
+          BUILD_BACKEND: ${{ inputs.build_backend }}
+          BUILD_GPU_ID: ${{ inputs.build_gpu_id }}
           BUILDER_CU128: ${{ inputs.builder_image_cu128 }}
           BUILDER_CU130: ${{ inputs.builder_image_cu130 }}
           RUNTIME_CU128: ${{ inputs.runtime_image_cu128 }}
@@ -395,6 +419,12 @@ jobs:
               "schema_version": 1,
               "release_tag": os.environ["RELEASE_TAG"],
               "source_commit": os.environ["RESOLVED_SOURCE_SHA"],
+              "build_backend": os.environ["BUILD_BACKEND"],
+              "build_gpu_id": (
+                  os.environ["BUILD_GPU_ID"]
+                  if os.environ["BUILD_BACKEND"] == "GPU"
+                  else None
+              ),
               "github_run": {
                   "repository": os.environ["GITHUB_REPOSITORY"],
                   "run_id": os.environ["GITHUB_RUN_ID"],
@@ -415,15 +445,19 @@ jobs:
                   "9.0": os.environ["GPU_SM90"],
                   "12.0": os.environ["GPU_SM120"],
               },
-              "cpu_placement": {
-                  "flavor_ids": [
-                      item.strip()
-                      for item in os.environ["CPU_FLAVOR_IDS"].split(",")
-                      if item.strip()
-                  ],
-                  "vcpu_count": int(os.environ["CPU_VCPU_COUNT"]),
-                  "minimum_memory_gb": int(os.environ["CPU_MIN_MEMORY_GB"]),
-              },
+              "cpu_placement": (
+                  {
+                      "flavor_ids": [
+                          item.strip()
+                          for item in os.environ["CPU_FLAVOR_IDS"].split(",")
+                          if item.strip()
+                      ],
+                      "vcpu_count": int(os.environ["CPU_VCPU_COUNT"]),
+                      "minimum_memory_gb": int(os.environ["CPU_MIN_MEMORY_GB"]),
+                  }
+                  if os.environ["BUILD_BACKEND"] == "CPU"
+                  else None
+              ),
           }
           (destination / "release-inputs.json").write_text(
               json.dumps(provenance, indent=2, sort_keys=True) + "\n",
@@ -443,15 +477,18 @@ jobs:
         shell: bash
         env:
           RELEASE_TAG: ${{ inputs.release_tag }}
+          BUILD_BACKEND: ${{ inputs.build_backend }}
         run: |
           python3.12 - <<'PY' > release-notes.md
           import json
+          import os
           from pathlib import Path
 
           matrix = json.loads(Path("matrix.json").read_text())
           print("SageAttention wheel factory release.")
           print()
-          print("Every attached wheel was compiled on a bounded Runpod CPU Pod and passed")
+          backend = os.environ["BUILD_BACKEND"]
+          print(f"Every attached wheel was compiled on a bounded Runpod {backend} Pod and passed")
           print("import and numerical validation on one configured GPU for each required")
           print("compute capability before this release was created.")
           print()

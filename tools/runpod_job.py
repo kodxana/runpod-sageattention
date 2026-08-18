@@ -84,11 +84,21 @@ class PodRequest:
     cloud_type: str = "COMMUNITY"
     container_disk_gb: int = 80
     min_cuda_version: str | None = None
+    gpu_workload: str = "VALIDATION"
+    gpu_min_vcpu_count: int = 4
+    gpu_min_memory_gb: int = 32
     registry_auth_id: str | None = None
     data_center_ids: str | None = None
     cpu_flavor_ids: tuple[str, ...] = ("cpu3g",)
     cpu_vcpu_count: int = 16
     cpu_min_memory_gb: int = 32
+
+    @property
+    def is_gpu_build(self) -> bool:
+        return (
+            self.compute_type.upper() == "GPU"
+            and self.gpu_workload.upper() == "BUILD"
+        )
 
     def validate(self) -> None:
         if not self.image.strip():
@@ -103,6 +113,8 @@ class PodRequest:
         if mode == "GPU" and not (self.gpu_id or "").strip():
             raise ValueError("an exact gpu_id is required for GPU Pods")
         if mode == "CPU":
+            if self.gpu_workload.upper() != "VALIDATION":
+                raise ValueError("gpu_workload applies only to GPU Pods")
             if not self.cpu_flavor_ids or any(
                 not value.strip() for value in self.cpu_flavor_ids
             ):
@@ -113,8 +125,21 @@ class PodRequest:
                 raise ValueError("CPU build Pods require at least 32 GB RAM")
             if self.container_disk_gb < 80:
                 raise ValueError("CPU build Pods require at least 80 GB container disk")
-        elif self.container_disk_gb < 10:
-            raise ValueError("GPU Pod container_disk_gb must be at least 10")
+        else:
+            workload = self.gpu_workload.upper()
+            if workload not in {"VALIDATION", "BUILD"}:
+                raise ValueError("gpu_workload must be VALIDATION or BUILD")
+            if workload == "BUILD":
+                if self.gpu_min_vcpu_count < 4:
+                    raise ValueError("GPU build Pods require at least 4 vCPUs")
+                if self.gpu_min_memory_gb < 32:
+                    raise ValueError("GPU build Pods require at least 32 GB system RAM")
+                if self.container_disk_gb < 80:
+                    raise ValueError(
+                        "GPU build Pods require at least 80 GB container disk"
+                    )
+            elif self.container_disk_gb < 10:
+                raise ValueError("GPU validation Pod container_disk_gb must be at least 10")
 
 
 @dataclass(frozen=True)
@@ -145,10 +170,10 @@ class JobSpec:
                 f"SSH private key does not exist: {self.ssh_private_key}"
             )
         _validate_remote_dir(self.remote_dir)
-        if self.pod.compute_type.upper() == "CPU":
+        if self.pod.compute_type.upper() == "CPU" or self.pod.is_gpu_build:
             remote_parts = PurePosixPath(self.remote_dir).parts
             if len(remote_parts) < 3 or remote_parts[:2] != ("/", "work"):
-                raise ValueError("CPU build remote_dir must be a directory below /work")
+                raise ValueError("build remote_dir must be a directory below /work")
         if not self.commands:
             raise ValueError("at least one remote command is required")
         for path in self.artifact_paths:
@@ -327,6 +352,11 @@ class Runpodctl:
                 separators=(",", ":"),
             ),
         ]
+        if request.is_gpu_build:
+            # Keep compilation on the explicitly sized ephemeral container
+            # disk.  The pinned CLI path is retained so --terminate-after is
+            # still a platform-side backstop even if the runner disappears.
+            args.extend(["--volume-in-gb", "0"])
         if request.data_center_ids:
             args.extend(["--data-center-ids", request.data_center_ids])
         if request.registry_auth_id:
@@ -592,8 +622,8 @@ class SSHTransport:
         )
         try:
             # Place both the transfer archive and extracted checkout on the
-            # caller-selected filesystem.  CPU build jobs select /work, which
-            # is the explicitly sized ephemeral container disk rather than a
+            # caller-selected filesystem. Build jobs select /work, which is
+            # the explicitly sized ephemeral container disk rather than a
             # small image-default /workspace volume.
             self._run_remote(
                 endpoint,
@@ -808,13 +838,27 @@ def _number(details: Mapping[str, object], name: str) -> float | None:
         return None
 
 
+def _gpu_type_id(details: Mapping[str, object]) -> str | None:
+    """Read the exact requested GPU id from either documented response shape."""
+
+    direct = details.get("gpuTypeId")
+    if isinstance(direct, str) and direct:
+        return direct
+    gpu = details.get("gpu")
+    if isinstance(gpu, Mapping):
+        nested = gpu.get("id")
+        if isinstance(nested, str) and nested:
+            return nested
+    return None
+
+
 def verify_pod_assignment(
     ctl: Runpodctl,
     pod_id: str,
     request: PodRequest,
     deadline: Deadline,
 ) -> None:
-    """Refuse image or CPU resource drift before uploading source code."""
+    """Refuse image, placement, or build-resource drift before source upload."""
 
     details = _assignment_payload(
         ctl.assignment_details(pod_id, timeout=deadline.timeout(30))
@@ -824,7 +868,47 @@ def verify_pod_assignment(
         raise JobError(
             f"Pod image mismatch: expected {request.image!r}, got {actual_image!r}"
         )
-    if request.compute_type.upper() != "CPU":
+    if request.compute_type.upper() == "GPU":
+        if not request.is_gpu_build:
+            return
+
+        gpu_type_id = _gpu_type_id(details)
+        if gpu_type_id != request.gpu_id:
+            raise JobError(
+                f"GPU type mismatch: expected exact gpuId {request.gpu_id!r}, "
+                f"got {gpu_type_id!r}"
+            )
+        vcpus = _number(details, "vcpuCount")
+        if vcpus is None or vcpus < request.gpu_min_vcpu_count:
+            raise JobError(
+                f"GPU build CPU count mismatch: required at least "
+                f"{request.gpu_min_vcpu_count}, got {details.get('vcpuCount')!r}"
+            )
+        memory = _number(details, "memoryInGb")
+        if memory is None or memory < request.gpu_min_memory_gb:
+            raise JobError(
+                f"GPU build memory mismatch: required at least "
+                f"{request.gpu_min_memory_gb} GB, "
+                f"got {details.get('memoryInGb')!r}"
+            )
+        container_disk = _number(details, "containerDiskInGb")
+        if container_disk is None or container_disk < request.container_disk_gb:
+            raise JobError(
+                f"container disk mismatch: requested at least "
+                f"{request.container_disk_gb} GB, "
+                f"got {details.get('containerDiskInGb')!r}"
+            )
+        pod_volume = _number(details, "volumeInGb")
+        if pod_volume != 0:
+            raise JobError(
+                "unexpected paid Pod volume: requested 0 GB, "
+                f"got {details.get('volumeInGb')!r}"
+            )
+        print(
+            f"Pod {pod_id}: verified image, gpu_id={gpu_type_id}, "
+            f"vcpus={vcpus:g}, memory={memory:g} GB, "
+            f"container_disk={container_disk:g} GB, pod_volume=0 GB"
+        )
         return
 
     flavor = details.get("cpuFlavorId")
@@ -1008,6 +1092,24 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", choices=("cpu", "gpu"), required=True)
     parser.add_argument("--gpu-id", help="exact Runpod gpuId; required in GPU mode")
     parser.add_argument("--min-cuda-version")
+    parser.add_argument(
+        "--gpu-workload",
+        choices=("validation", "build"),
+        default="validation",
+        help="GPU Pod contract; build enables strict compilation resource checks",
+    )
+    parser.add_argument(
+        "--gpu-min-vcpu-count",
+        type=int,
+        default=4,
+        help="GPU build minimum vCPUs (4 required; 16 recommended)",
+    )
+    parser.add_argument(
+        "--gpu-min-memory-gb",
+        type=int,
+        default=32,
+        help="GPU build minimum system RAM (32 GB required; 64 GB recommended)",
+    )
     parser.add_argument("--cloud-type", choices=("COMMUNITY", "SECURE"), default="COMMUNITY")
     parser.add_argument("--container-disk-gb", type=int, default=80)
     parser.add_argument(
@@ -1032,7 +1134,7 @@ def _parser() -> argparse.ArgumentParser:
         "--remote-dir",
         help=(
             "remote checkout directory; defaults to /work/sageattention-factory "
-            "for CPU and /workspace for GPU"
+            "for CPU/GPU builds and /workspace for GPU validation"
         ),
     )
     parser.add_argument(
@@ -1080,6 +1182,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             cloud_type=args.cloud_type,
             container_disk_gb=args.container_disk_gb,
             min_cuda_version=args.min_cuda_version,
+            gpu_workload=args.gpu_workload.upper(),
+            gpu_min_vcpu_count=args.gpu_min_vcpu_count,
+            gpu_min_memory_gb=args.gpu_min_memory_gb,
             registry_auth_id=args.registry_auth_id,
             data_center_ids=args.data_center_ids,
             cpu_flavor_ids=tuple(
@@ -1097,7 +1202,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             remote_dir=args.remote_dir
             or (
                 "/work/sageattention-factory"
-                if args.mode == "cpu"
+                if args.mode == "cpu" or args.gpu_workload == "build"
                 else "/workspace"
             ),
             commands=tuple(args.command),

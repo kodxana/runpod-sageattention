@@ -8,7 +8,7 @@ credentials and cannot create a paid Pod.
 
 Configure these GitHub environments before enabling the workflows:
 
-- `runpod-paid` protects every CPU-build and GPU-test job. Add required
+- `runpod-paid` protects every GPU-backed build and GPU-test job. Add required
   reviewers and restrict deployment branches/tags as appropriate.
 - `sageattention-release` is a second approval boundary around creation of the
   GitHub Release.
@@ -32,21 +32,26 @@ executable has its own mandatory `--allow-paid-pod` switch. Only `build.yml`
 passes it, and those jobs are protected by `runpod-paid`.
 `ci.yml` has no Runpod secrets, no `runpodctl`, and no paid-resource switch.
 
-The orchestration intentionally uses two provisioning APIs. GPU Pods use the
-checksum-pinned `runpodctl` v2.3.0 command. That version's CPU creation path
-does not expose `cpuFlavorIds` or `vcpuCount` and silently omits registry auth
-and `--terminate-after`, so CPU build Pods are created through the official
-`POST /v1/pods` REST endpoint instead. The same `RUNPOD_API_KEY` authenticates
-both paths; `runpodctl` remains the checked lifecycle client for readiness and
-deletion.
+The default builders and all validators use GPU Pods created by the
+checksum-pinned `runpodctl` v2.3.0 command. Every GPU request carries an exact
+`gpuId`, an immutable image, an 80 GB-or-larger container disk for builders,
+and an RFC3339 `--terminate-after` deadline. The same checked client handles
+readiness and deletion.
+
+`build_backend=CPU` remains an explicit capacity fallback. Because pinned
+`runpodctl` does not expose sized CPU creation, that path uses the official
+`POST /v1/pods` REST API with `cpuFlavorIds`, `vcpuCount`, and no persistent Pod
+volume. It is not the release default and retains the in-Pod self-delete
+watchdog because its platform termination field is not verified.
 
 ## Builder image bootstrap
 
 Builder images contain the full CUDA toolkit, pinned PyTorch stack, SSH server,
 the checksum-pinned Runpod client, a cgroup-aware resource helper, and an
-entrypoint self-delete watchdog. They do not contain a prebuilt SageAttention
-wheel. Building these Docker images on GitHub or a local Buildx host is allowed;
-the costly NVCC wheel compilation still happens on Runpod CPU Pods.
+optional entrypoint self-delete watchdog. They do not contain a prebuilt
+SageAttention wheel. Building these Docker images on GitHub or a local Buildx
+host is allowed; the costly NVCC wheel compilation happens on short-lived
+Runpod GPU-backed builder Pods.
 
 Authenticate to the chosen registry, then bootstrap both images:
 
@@ -76,29 +81,49 @@ ComfyUI image inputs are subject to the same release-time digest requirement.
 
 ## Exact GPU representatives
 
-The factory tests one explicitly configured Runpod GPU type for every required
-compute capability in `matrix.json`:
+The factory prefills one exact Runpod GPU type for building and one for every
+required runtime capability. These are `gpuId` strings from the
+[official Runpod GPU type table](https://docs.runpod.io/references/gpu-types),
+not fuzzy display names:
 
-| Capability | Example representative |
-|---|---|
-| SM 8.0 | A100 |
-| SM 8.6 | A40 or RTX 3090 |
-| SM 8.9 | L40S or RTX 4090 |
-| SM 9.0 | H100 or H200 |
-| SM 12.0 | RTX 5090 |
+| Role | Capability | Prefilled exact `gpuId` |
+|---|---|---|
+| Sequential builders | not used at runtime | `NVIDIA A100 80GB PCIe` |
+| Runtime representative | SM 8.0 | `NVIDIA A100 80GB PCIe` |
+| Runtime representative | SM 8.6 | `NVIDIA GeForce RTX 3090` |
+| Runtime representative | SM 8.9 | `NVIDIA GeForce RTX 4090` |
+| Runtime representative | SM 9.0 | `NVIDIA H100 PCIe` |
+| Runtime representative | SM 12.0 | `NVIDIA GeForce RTX 5090` |
 
-The workflow inputs are exact `gpuId` values, not fuzzy names. Resolve them at
-dispatch time from the live Runpod catalog, for example:
+The attached build GPU is deliberately hidden from the compiler and does not
+need to match a wheel target. A100 PCIe is a scheduling default, not a resource
+guarantee: build policy still requires at least 4 effective vCPUs, 32 GiB
+system RAM, and an 80 GB container disk; 16 vCPUs and 64 GiB system RAM are
+recommended.
+
+The same values are prefilled in `.env.example`. Confirm that each ID still
+exists and has capacity in the live catalog before a paid dispatch:
 
 ```bash
 runpodctl gpu list --include-unavailable -o json \
   | jq -r '.[] | [.displayName, .gpuId] | @tsv'
 ```
 
-The workflow does not enumerate every commercial GPU SKU. It forms a reviewed
-ten-job matrix: two wheel variants multiplied by the five required compute
-capabilities. `gpu_max_parallel` limits simultaneously billed validation Pods;
-the default is two.
+The workflow does not enumerate every commercial GPU SKU. B200 (SM100) and
+B300 (SM103) are intentionally absent; [NVIDIA's compute-capability
+table](https://developer.nvidia.com/cuda/gpus) lists them as 10.0 and 10.3
+respectively, while SageAttention 2.2.0 has no SM10x
+source/cubin or dispatcher path. The SM120 RTX 5090 result does not imply SM100
+or SM103 compatibility. Adding either data-center GPU requires upstream kernel
+and dispatcher support plus its own build target and representative validation.
+Either could technically be allocated as the deliberately unused build
+accelerator, but doing so would provide no runtime-compatibility evidence.
+
+The two CUDA wheel variants build sequentially so only one billed builder and
+one high-memory NVCC workload run at a time. Runtime validation remains a
+reviewed ten-job matrix: two wheel variants multiplied by five capabilities.
+`gpu_max_parallel` limits simultaneously billed validation Pods; the default is
+two.
 
 ## Build and validation flow
 
@@ -108,25 +133,26 @@ release workflow.
 1. A local planning job reads `matrix.json`. It refuses missing GPU ids,
    unexpected build/CUDA variants, or non-digest images when digest enforcement
    is enabled.
-2. Each build variant starts a CPU Pod from its exact builder image using the
-   official REST API. The request explicitly sets `cpuFlavorIds`, `vcpuCount`,
-   registry auth, port 22, and `supportPublicIp=true` on Community Cloud. The
-   defaults are `cpu3g` with 16 vCPUs, which targets the recommended 64 GB
-   configuration; assignment must still report at least 32 GB. Before upload,
-   the orchestrator re-reads the Pod and rejects any image, CPU-flavor, vCPU,
-   memory, container-disk, or zero-volume mismatch. The checked-out repository
-   is then archived without Git
-   metadata or links and uploaded to `/work/sageattention-factory`, on the
-   explicitly sized ephemeral container disk. No paid persistent/network
-   volume is provisioned for compilation: the CPU REST request explicitly sets
-   `volumeInGb: 0`, and the orchestrator rejects a CPU checkout outside a
-   directory below `/work`.
-3. `build-wheel.sh` performs the authoritative resource preflight and derives
-   safe concurrency without exceeding the cap in `matrix.json`, then executes
-   the pinned source build. The output, compiler work root, transfer archives,
-   and `TMPDIR` are all under `/work`, so the disk preflight and actual build
-   consume the same 80 GB-or-larger container filesystem. The workflow invokes
-   it as:
+2. The two build variants run sequentially. Each starts a one-GPU Pod from its
+   exact builder image with `gpuId=NVIDIA A100 80GB PCIe`, port 22, registry
+   authentication when needed, at least 80 GB
+   container disk, and an absolute `--terminate-after` deadline. The checked-out
+   repository is archived without Git metadata or links and uploaded below
+   `/work` on that explicitly sized ephemeral container filesystem; compilation
+   does not require a persistent/network volume.
+3. Runpod GPU placement attaches host-system CPU and RAM independently of GPU
+   VRAM. Before upload, orchestration re-reads the assignment and requires the
+   exact GPU type, at least 4 effective vCPUs, 32 GB system RAM, and the
+   requested 80 GB container disk. `build-wheel.sh` then reads the assigned
+   cgroup and requires 20 GiB currently free on both work and output
+   filesystems. A 16-vCPU/64-GB system assignment is recommended. Passing the
+   A100 `gpuId` alone does not prove these host resources.
+4. `build-wheel.sh` hides the attached accelerator with
+   `CUDA_VISIBLE_DEVICES=""`, derives safe compiler concurrency without
+   exceeding the matrix cap, and executes the pinned source build. The output,
+   compiler work root, transfer archives, and `TMPDIR` all stay below `/work`,
+   so disk preflight and compilation consume the same 80 GB-or-larger container
+   filesystem. The workflow invokes it as:
 
    ```bash
    TMPDIR=/work/tmp \
@@ -136,9 +162,12 @@ release workflow.
      --output-dir dist/BUILD_ID
    ```
 
-4. `dist/BUILD_ID/` is downloaded and its `SHA256SUMS` is checked before GitHub
+   When `build_backend=CPU` is deliberately selected, the same command and
+   preflight run on the sized CPU fallback. GPU remains the default backend.
+
+5. `dist/BUILD_ID/` is downloaded and its `SHA256SUMS` is checked before GitHub
    stores `wheel-BUILD_ID` as a workflow artifact.
-5. Each representative GPU job downloads that exact artifact, uploads it with
+6. Each representative GPU job downloads that exact artifact, uploads it with
    the same source checkout into the matching immutable ComfyUI-compatible
    runtime image, verifies that Runpod reports the exact selected image digest,
    installs the wheel without dependencies, and runs static plus numerical
@@ -156,14 +185,15 @@ release workflow.
      --runtime-report runtime-results/BUILD_ID/sm89.json
    ```
 
-6. Each GPU produces a separate `runtime-BUILD_ID-smNN` evidence artifact.
+7. Each GPU produces a separate `runtime-BUILD_ID-smNN` evidence artifact.
    Missing, skipped, wrong-capability, non-finite, or numerically failing tests
    fail the job.
 
 CUDA scheduler floors come from the matching build entry in `matrix.json`:
-CUDA 12.8 for the cu128 runtime and CUDA 13.0 for cu130. They are forwarded as
-`runpodctl pod create --min-cuda-version`, preventing placement on an
-incompatible host driver.
+CUDA 12.8 for cu128 and CUDA 13.0 for cu130. GPU-backed builders and runtime
+validators both forward them as `runpodctl pod create --min-cuda-version`,
+preventing placement on a host whose driver cannot start the matching CUDA
+container. The build still hides the accelerator after container startup.
 
 ## Release ordering
 
@@ -171,8 +201,9 @@ incompatible host driver.
 free preflight job fetches that exact tag, peels annotated tags to their commit,
 and emits the full 40-character commit SHA before any paid Pod can start. The
 complete build workflow receives that SHA rather than the tag name, and its
-plan, CPU-build, and GPU-test checkouts remain pinned to the resolved commit.
-Only after both CPU builds and all ten representative-GPU jobs pass does the
+plan, GPU-builder, and GPU-test checkouts remain pinned to the resolved commit.
+Only after both sequential GPU-backed builds and all ten representative-GPU
+jobs pass does the
 `publish` job become eligible for the separate `sageattention-release`
 approval.
 
@@ -202,27 +233,29 @@ release job from running.
 
 ## Pod lifetime and cleanup
 
-Every Pod combines the orchestrator bound with a mode-specific backstop:
+Every default GPU builder and validator Pod combines independent lifetime
+controls:
 
 - the Python orchestrator shares one monotonic hard deadline across Pod
   creation, SSH readiness, upload, commands, and artifact download;
-- GPU creation includes the RFC3339 `--terminate-after` datetime required by
-  the pinned `runpodctl` v2.3.0 binary; and
-- CPU creation passes `RUNPOD_SELF_TERMINATE_SECONDS` equal to the hard timeout
-  plus cleanup grace. The builder entrypoint validates the Pod-scoped
-  `RUNPOD_API_KEY` and `RUNPOD_POD_ID`, then starts an independent watchdog that
-  retries self-deletion through Runpod after that interval. This compensates
-  for v2.3.0 dropping its termination flag on the CPU REST path.
+- Pod creation includes an absolute RFC3339 `--terminate-after` datetime set to
+  the hard timeout plus cleanup grace; and
+- after a Pod id exists, deletion always runs from a `finally` path and is
+  retried three times.
 
-After a Pod id exists, deletion runs from a `finally` path and is retried three
-times. A deletion failure is a workflow failure rather than a warning. The GPU
-platform deadline or CPU in-Pod watchdog remains the final protection against
-runner loss, cancellation, or a workflow-side network partition.
+A deletion failure is a workflow failure rather than a warning. The absolute
+platform deadline remains the final protection against runner loss,
+cancellation, an image-start failure, or a workflow-side network partition.
 
-The CPU watchdog can arm only after the builder entrypoint starts. An image-pull
-or pre-entrypoint startup failure therefore still requires checking and deleting
-the Pod in the Runpod console; the current CPU REST path has no verified
-server-side termination field.
+The explicit CPU fallback has the same orchestrator deadline and mandatory
+`finally` deletion, but its REST provisioning path has no verified platform
+deadline. It therefore must pass `RUNPOD_SELF_TERMINATE_SECONDS` to the builder
+entrypoint, which arms the reviewed in-Pod deletion watchdog. That watchdog is
+specific to the fallback and is never a replacement for orchestrator cleanup.
+
+Cancellation handling must still verify deletion in the Runpod console. Never
+assume an in-Pod watchdog ran: it cannot arm before the builder entrypoint
+starts.
 
 When a remote command fails, the orchestrator attempts to retrieve any requested
 diagnostic artifact before deletion, provided the hard deadline still has time.
@@ -231,51 +264,57 @@ together.
 
 ## Direct operator use
 
-The same tool can run a reviewed command outside GitHub. This example uses a CPU
-builder and retrieves one build directory:
+The same tool can run a reviewed command outside GitHub. This example uses the
+prefilled GPU-backed builder type and retrieves one build directory:
 
 ```bash
 export RUNPOD_API_KEY=...
 export RUNPOD_SSH_PUBLIC_KEY='ssh-ed25519 AAAA... operator'
+export RUNPOD_BUILD_GPU_ID='NVIDIA A100 80GB PCIe'
 
 python3.12 tools/runpod_job.py \
   --allow-paid-pod \
-  --mode cpu \
+  --mode gpu \
+  --gpu-workload build \
+  --gpu-id "${RUNPOD_BUILD_GPU_ID}" \
+  --gpu-min-vcpu-count 16 \
+  --gpu-min-memory-gb 32 \
+  --min-cuda-version 12.8 \
   --image 'registry/repository@sha256:...' \
   --name sageattention-manual-build \
   --container-disk-gb 80 \
-  --cpu-flavor-ids cpu3g \
-  --cpu-vcpu-count 16 \
-  --cpu-min-memory-gb 32 \
   --ssh-key /secure/path/id_ed25519 \
   --repo . \
   --remote-dir /work/sageattention-factory \
   --timeout-seconds 14400 \
+  --terminate-grace-seconds 900 \
   --command 'install -d -m 0700 /work/tmp /work/sageattention-wheel-builds; TMPDIR=/work/tmp SAGEATTN_WORK_ROOT=/work/sageattention-wheel-builds bash scripts/build-wheel.sh --build-id cp312-torch2.10.0-cu128 --output-dir dist/cp312-torch2.10.0-cu128' \
   --artifact dist/cp312-torch2.10.0-cu128 \
   --artifact-output ./artifacts
 ```
 
-GPU mode additionally requires `--gpu-id` and should specify the matrix-derived
-`--min-cuda-version`. The tool never discovers or substitutes a cheaper GPU;
-the exact requested id is sent to Runpod.
+Run the cu130 command only after cu128 finishes, using its matching builder
+image and `--min-cuda-version 13.0`. The tool never discovers or substitutes a
+different GPU; the exact requested id is sent to Runpod. Builders and runtime
+validators both pass the CUDA scheduler floor from their matrix entry.
 
 ## Operational cautions
 
 - The minimum/default 80 GB container disk is intentional: CUDA toolkits, PyTorch,
   source trees, native objects, and fat wheels need substantial temporary
-  space. CPU factory work stays below `/work`; `/workspace` is retained only
-  for GPU runtime images whose ComfyUI layout expects it.
-- `cpu3g` provides 4 GB RAM per vCPU. The 16-vCPU default therefore targets
-  64 GB; 8 vCPUs is only the 32 GB hard minimum and leaves little headroom over
-  the measured 29.65 GB peak.
-- A CPU Pod must expose finite cgroup limits and satisfy the resource preflight.
-  Host-wide `/proc/meminfo` is not used to choose compilation parallelism.
+  space. Builder work stays below `/work`; `/workspace` is retained for GPU
+  runtime images whose ComfyUI layout expects it.
+- The accelerator is attached but unused during compilation. Select a GPU offer
+  with adequate host-system resources: 4 effective vCPUs and 32 GiB system RAM
+  are hard minimums, while 16 vCPUs and 64 GiB system RAM are recommended.
+- Every builder must expose finite cgroup limits and satisfy the resource
+  preflight. Host-wide `/proc/meminfo`, GPU VRAM, and GPU utilization are not
+  used to choose compilation parallelism.
 - Do not add `LD_PRELOAD` to workflows. Resource-reporting wrappers are scoped
   inside the builder image.
 - Keep CUDA 12.8 and CUDA 13.0 wheel assets distinguishable by their downstream
   version and manifest. Standard Python wheel tags do not encode CUDA or
   PyTorch compatibility.
-- If a run is cancelled, verify Pod deletion in the Runpod console. The GPU
-  platform deadline or CPU watchdog is a backstop, not a reason to ignore a
-  failed cleanup step.
+- If a run is cancelled, verify Pod deletion in the Runpod console. The
+  platform deadline on GPU Pods and in-Pod watchdog on the CPU fallback are
+  backstops, not reasons to ignore a failed cleanup step.

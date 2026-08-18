@@ -6,9 +6,10 @@ The system has three independent trust boundaries:
 
 1. **GitHub orchestration** resolves a pinned matrix, starts ephemeral Pods,
    moves source and artifacts, records evidence, and performs release gating.
-2. **CPU builder Pods** contain compilers, CUDA development libraries, and the
-   exact PyTorch stack. They produce wheels but never decide whether a wheel is
-   releasable.
+2. **Builder Pods** contain compilers, CUDA development libraries, and the
+   exact PyTorch stack. GPU-backed Pods are the default capacity backend and a
+   sized CPU Pod remains available as a fallback. The build hides any attached
+   GPU and never decides whether a wheel is releasable.
 3. **GPU validation Pods** use the actual ComfyUI-compatible runtime image.
    They install one exact wheel, import every compiled module, execute the
    architecture-selected kernel, and compare it with PyTorch SDPA.
@@ -27,6 +28,7 @@ Every build result consists of:
 - the applied patch checksums;
 - the requested and observed cubin matrix;
 - build duration, effective CPU count, memory limit, and peak memory;
+- proof that `CUDA_VISIBLE_DEVICES` was empty throughout the build;
 - the builder image reference and, in release jobs, immutable digest;
 - build and validation logs.
 

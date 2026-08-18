@@ -5,6 +5,12 @@ Linux containers normally share the host's `/proc/meminfo`. As a result,
 a much smaller cgroup limit. The kernel still enforces the cgroup limit; the
 misleading display does not grant the pod extra memory.
 
+SageAttention builders are GPU-backed, but the build hides the accelerator with
+`CUDA_VISIBLE_DEVICES=""`. Resource policy therefore concerns the Pod's
+host-system vCPU, system RAM, and container disk—not GPU utilization or VRAM.
+The attached GPU type is a scheduling choice and cannot substitute for a finite
+system-memory cgroup limit.
+
 This repository handles the problem in two layers:
 
 1. `/usr/local/bin/pod-resources` is the authoritative source for automation.
@@ -94,6 +100,14 @@ override selects one job. `limit_bytes` falls back to the host total when
 Warnings are diagnostic; a missing current-usage counter is handled
 conservatively as zero available headroom.
 
+Default GPU-backed release policy requires an assignment with at least 4
+effective vCPUs, 32 GB system RAM, and an 80 GB container disk before source
+upload; 16 vCPUs and 64 GB system RAM are recommended. The backend-neutral
+helper and build script then independently require a finite 32 GiB cgroup
+limit, at least one safe compiler job, and 20 GiB currently free on both work
+and output filesystems. Disk is checked by `build-wheel.sh`, not by the
+resource-reporting helper.
+
 The shell form exports `POD_MEMORY_LIMIT_BYTES`,
 `POD_MEMORY_CURRENT_BYTES`, `POD_MEMORY_WORKING_SET_BYTES`,
 `POD_MEMORY_AVAILABLE_BYTES`, `POD_CPU_COUNT`, `POD_BUILD_JOBS`, and the
@@ -140,6 +154,11 @@ hint.
 
 ## SageAttention build parallelism
 
+The cu128 and cu130 builders execute sequentially; GPU is the default backend
+and sized CPU is an explicit capacity fallback. Within one builder, compiler
+parallelism depends only on effective host-system CPU and RAM. GPU count,
+compute capability, and VRAM never increase the suggested job count.
+
 The defaults reflect observed SageAttention NVCC builds: a two-by-two parallel
 build peaked near 30 GiB in a container with roughly a 7 GiB baseline, while a
 serialized build peaked near 9.2 GiB total. The helper therefore assumes 8 GiB
@@ -163,11 +182,13 @@ With otherwise idle memory and ample CPU, the defaults produce:
 | 48 GiB | 48 GiB | 4 |
 | 64 GiB | 64 GiB | 4 |
 
-Those are standalone helper defaults. The reviewed release matrix currently
+Those are standalone helper calculations, not accepted release-builder sizes;
+the release hard minimum remains 32 GiB. The reviewed release matrix currently
 sets `default_max_jobs` to 2, and `scripts/build-wheel.sh` exports that value as
 `POD_BUILD_MAX_JOBS` before taking its snapshot. Consequently, normal release
-builds and the helper agree on a maximum of two jobs; reaching three or four
-requires an explicit, reviewed higher cap on a larger Pod.
+builds and the helper agree on a maximum of two jobs, with
+`EXT_PARALLEL=1`; reaching three or four requires explicit review and new peak
+evidence on a larger Pod.
 
 Operators can tune the assumptions with `POD_BUILD_MEMORY_PER_JOB_MIB`,
 `POD_BUILD_RESERVE_MIB`, and `POD_BUILD_MAX_JOBS`. An existing positive

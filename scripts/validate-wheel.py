@@ -318,6 +318,7 @@ def validate(
         require(isinstance(build_evidence, dict), "manifest is missing build evidence")
         required_evidence = {
             "builder_image",
+            "cuda_visible_devices",
             "cgroup_peak",
             "elapsed_seconds",
             "matrix_sha256",
@@ -329,6 +330,8 @@ def validate(
         }
         require(required_evidence <= set(build_evidence),
                 f"build evidence is incomplete: missing {sorted(required_evidence - set(build_evidence))}")
+        require(build_evidence["cuda_visible_devices"] == "",
+                "build evidence does not prove that the GPU was hidden")
         patch_path = (
             matrix_path.parent / "patches" / "sageattention"
             / package["upstream_version"] / "setup.py.patch"

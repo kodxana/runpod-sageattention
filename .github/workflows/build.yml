@@ -8,6 +8,19 @@ on:
         required: true
         default: main
         type: string
+      build_backend:
+        description: Builder backend (GPU default; 16 vCPU / 64 GB RAM recommended)
+        required: true
+        default: GPU
+        type: choice
+        options:
+          - GPU
+          - CPU
+      build_gpu_id:
+        description: Exact Runpod gpuId used only for GPU-backed compilation
+        required: true
+        default: "NVIDIA A100 80GB PCIe"
+        type: string
       builder_image_cu128:
         description: CUDA 12.8 builder image (immutable Docker Hub digest)
         required: true
@@ -19,32 +32,39 @@ on:
         default: "madiatorlabs/sageattention-wheel-builder@sha256:bed84f32bf76ba292728faf9fbe446d5d7f84d194444b2b6d006e663cccba906"
         type: string
       runtime_image_cu128:
-        description: ComfyUI-compatible cu128 test image (prefer @sha256:digest)
+        description: ComfyUI-compatible cu128 test image (immutable digest)
         required: true
+        default: "runpod/comfyui@sha256:ce5e842ca0c7233a983ff76a83739b445172259c77a43a117453ef7e6a64d0b7"
         type: string
       runtime_image_cu130:
-        description: ComfyUI-compatible cu130 test image (prefer @sha256:digest)
+        description: ComfyUI-compatible cu130 test image (immutable digest)
         required: true
+        default: "runpod/comfyui@sha256:0bf75436da591e0f26d299af3741e07cb8ce8ce36566d1a7d8d78aae458e5d67"
         type: string
       gpu_id_sm80:
         description: Exact Runpod gpuId for one SM 8.0 representative
         required: true
+        default: "NVIDIA A100 80GB PCIe"
         type: string
       gpu_id_sm86:
         description: Exact Runpod gpuId for one SM 8.6 representative
         required: true
+        default: "NVIDIA GeForce RTX 3090"
         type: string
       gpu_id_sm89:
         description: Exact Runpod gpuId for one SM 8.9 representative
         required: true
+        default: "NVIDIA GeForce RTX 4090"
         type: string
       gpu_id_sm90:
         description: Exact Runpod gpuId for one SM 9.0 representative
         required: true
+        default: "NVIDIA H100 PCIe"
         type: string
       gpu_id_sm120:
         description: Exact Runpod gpuId for one SM 12.0 representative
         required: true
+        default: "NVIDIA GeForce RTX 5090"
         type: string
       cloud_type:
         description: Runpod capacity pool
@@ -104,6 +124,15 @@ on:
       source_ref:
         required: true
         type: string
+      build_backend:
+        description: Builder backend (GPU default; 16 vCPU / 64 GB RAM recommended)
+        required: false
+        default: GPU
+        type: string
+      build_gpu_id:
+        required: false
+        default: "NVIDIA A100 80GB PCIe"
+        type: string
       builder_image_cu128:
         required: false
         default: "madiatorlabs/sageattention-wheel-builder@sha256:556979b41a98e5331ad38a1ae599161cb37a78cb09bec34e3f982978b84816d0"
@@ -113,25 +142,32 @@ on:
         default: "madiatorlabs/sageattention-wheel-builder@sha256:bed84f32bf76ba292728faf9fbe446d5d7f84d194444b2b6d006e663cccba906"
         type: string
       runtime_image_cu128:
-        required: true
+        required: false
+        default: "runpod/comfyui@sha256:ce5e842ca0c7233a983ff76a83739b445172259c77a43a117453ef7e6a64d0b7"
         type: string
       runtime_image_cu130:
-        required: true
+        required: false
+        default: "runpod/comfyui@sha256:0bf75436da591e0f26d299af3741e07cb8ce8ce36566d1a7d8d78aae458e5d67"
         type: string
       gpu_id_sm80:
-        required: true
+        required: false
+        default: "NVIDIA A100 80GB PCIe"
         type: string
       gpu_id_sm86:
-        required: true
+        required: false
+        default: "NVIDIA GeForce RTX 3090"
         type: string
       gpu_id_sm89:
-        required: true
+        required: false
+        default: "NVIDIA GeForce RTX 4090"
         type: string
       gpu_id_sm90:
-        required: true
+        required: false
+        default: "NVIDIA H100 PCIe"
         type: string
       gpu_id_sm120:
-        required: true
+        required: false
+        default: "NVIDIA GeForce RTX 5090"
         type: string
       cloud_type:
         required: false
@@ -214,6 +250,8 @@ jobs:
         env:
           BUILDER_CU128: ${{ inputs.builder_image_cu128 }}
           BUILDER_CU130: ${{ inputs.builder_image_cu130 }}
+          BUILD_BACKEND: ${{ inputs.build_backend }}
+          BUILD_GPU_ID: ${{ inputs.build_gpu_id }}
           RUNTIME_CU128: ${{ inputs.runtime_image_cu128 }}
           RUNTIME_CU130: ${{ inputs.runtime_image_cu130 }}
           GPU_SM80: ${{ inputs.gpu_id_sm80 }}
@@ -251,6 +289,19 @@ jobs:
                   "paid Pods were not confirmed; dispatch again with "
                   "confirm_paid_pods=true"
               )
+          build_backend = os.environ["BUILD_BACKEND"]
+          build_gpu_id = os.environ["BUILD_GPU_ID"]
+          if build_backend not in {"CPU", "GPU"}:
+              raise SystemExit(
+                  f"build_backend must be CPU or GPU, got {build_backend!r}"
+              )
+          if build_backend == "GPU" and (
+              not build_gpu_id.strip()
+              or build_gpu_id != build_gpu_id.strip()
+              or "\n" in build_gpu_id
+              or "\r" in build_gpu_id
+          ):
+              raise SystemExit("build_gpu_id must be one exact Runpod gpuId")
           disk = int(os.environ["CONTAINER_DISK_GB"])
           cpu_vcpus = int(os.environ["CPU_VCPU_COUNT"])
           cpu_min_memory = int(os.environ["CPU_MIN_MEMORY_GB"])
@@ -262,22 +313,34 @@ jobs:
           max_parallel = int(os.environ["GPU_MAX_PARALLEL"])
           if not 80 <= disk <= 200:
               raise SystemExit("container_disk_gb must be between 80 and 200")
-          allowed_cpu_flavors = {
-              "cpu3c", "cpu3g", "cpu3m", "cpu5c", "cpu5g", "cpu5m"
-          }
-          if not cpu_flavors or not set(cpu_flavors) <= allowed_cpu_flavors:
-              raise SystemExit(
-                  f"cpu_flavor_ids must use documented exact ids; got {cpu_flavors!r}"
-              )
           resources = source["resources"]
-          if not resources["minimum_cpus"] <= cpu_vcpus <= 64:
+          build_min_vcpus = int(resources["minimum_cpus"])
+          build_min_memory_gb = int(resources["minimum_memory_gib"])
+          if not 4 <= build_min_vcpus <= 64:
               raise SystemExit(
-                  f"cpu_vcpu_count must be {resources['minimum_cpus']}..64"
+                  "matrix resources.minimum_cpus must be between 4 and 64"
               )
-          if not resources["minimum_memory_gib"] <= cpu_min_memory <= 256:
+          if not 32 <= build_min_memory_gb <= 256:
               raise SystemExit(
-                  "cpu_min_memory_gb must meet the matrix minimum and be <=256"
+                  "matrix resources.minimum_memory_gib must be between 32 and 256"
               )
+          if build_backend == "CPU":
+              allowed_cpu_flavors = {
+                  "cpu3c", "cpu3g", "cpu3m", "cpu5c", "cpu5g", "cpu5m"
+              }
+              if not cpu_flavors or not set(cpu_flavors) <= allowed_cpu_flavors:
+                  raise SystemExit(
+                      "cpu_flavor_ids must use documented exact ids; "
+                      f"got {cpu_flavors!r}"
+                  )
+              if not resources["minimum_cpus"] <= cpu_vcpus <= 64:
+                  raise SystemExit(
+                      f"cpu_vcpu_count must be {resources['minimum_cpus']}..64"
+                  )
+              if not resources["minimum_memory_gib"] <= cpu_min_memory <= 256:
+                  raise SystemExit(
+                      "cpu_min_memory_gb must meet the matrix minimum and be <=256"
+                  )
           if not 600 <= timeout <= 14_400:
               raise SystemExit("timeout_seconds must be between 600 and 14400")
           if not 1 <= max_parallel <= 5:
@@ -336,6 +399,8 @@ jobs:
                   "builder_image": builder,
                   "runtime_image": runtime,
                   "min_cuda": build["minimum_cuda_scheduler_version"],
+                  "build_min_vcpu_count": build_min_vcpus,
+                  "build_min_memory_gb": build_min_memory_gb,
                   "artifact_name": f"wheel-{build['id']}",
               }
               builds.append(entry)
@@ -356,13 +421,14 @@ jobs:
           PY
 
   build:
-    name: CPU build / ${{ matrix.build_id }}
+    name: ${{ inputs.build_backend }} build / ${{ matrix.build_id }}
     needs: plan
     runs-on: ubuntu-24.04
     environment: runpod-paid
     timeout-minutes: 270
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix: ${{ fromJSON(needs.plan.outputs.builds) }}
     steps:
       - name: Check out requested source
@@ -396,12 +462,17 @@ jobs:
           echo "RUNPOD_SSH_PUBLIC_KEY=$(cat "${RUNNER_TEMP}/runpod-ssh/id.pub")" \
             >> "${GITHUB_ENV}"
 
-      - name: Compile wheel on CPU Pod
+      - name: Compile wheel on selected builder Pod
         shell: bash
         env:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
           BUILD_ID: ${{ matrix.build_id }}
           BUILDER_IMAGE: ${{ matrix.builder_image }}
+          MIN_CUDA: ${{ matrix.min_cuda }}
+          BUILD_BACKEND: ${{ inputs.build_backend }}
+          BUILD_GPU_ID: ${{ inputs.build_gpu_id }}
+          BUILD_MIN_VCPU_COUNT: ${{ matrix.build_min_vcpu_count }}
+          BUILD_MIN_MEMORY_GB: ${{ matrix.build_min_memory_gb }}
           CLOUD_TYPE: ${{ inputs.cloud_type }}
           REGISTRY_AUTH_ID: ${{ inputs.registry_auth_id }}
           DISK_GB: ${{ inputs.container_disk_gb }}
@@ -414,18 +485,39 @@ jobs:
           if [[ -n "${REGISTRY_AUTH_ID}" ]]; then
             registry_args+=(--registry-auth-id "${REGISTRY_AUTH_ID}")
           fi
+          case "${BUILD_BACKEND}" in
+            CPU)
+              backend_args=(
+                --mode cpu
+                --cpu-flavor-ids "${CPU_FLAVOR_IDS}"
+                --cpu-vcpu-count "${CPU_VCPU_COUNT}"
+                --cpu-min-memory-gb "${CPU_MIN_MEMORY_GB}"
+              )
+              ;;
+            GPU)
+              backend_args=(
+                --mode gpu
+                --gpu-workload build
+                --gpu-id "${BUILD_GPU_ID}"
+                --gpu-min-vcpu-count "${BUILD_MIN_VCPU_COUNT}"
+                --gpu-min-memory-gb "${BUILD_MIN_MEMORY_GB}"
+                --min-cuda-version "${MIN_CUDA}"
+              )
+              ;;
+            *)
+              echo "unsupported build backend: ${BUILD_BACKEND}" >&2
+              exit 64
+              ;;
+          esac
           printf -v builder_ref_q '%q' "${BUILDER_IMAGE}"
           remote_command="install -d -m 0700 /work/tmp /work/sageattention-wheel-builds; TMPDIR=/work/tmp SAGEATTN_WORK_ROOT=/work/sageattention-wheel-builds BUILDER_IMAGE_REF=${builder_ref_q} bash scripts/build-wheel.sh --build-id ${BUILD_ID} --output-dir dist/${BUILD_ID}"
           python3.12 tools/runpod_job.py \
             --allow-paid-pod \
-            --mode cpu \
+            "${backend_args[@]}" \
             --image "${BUILDER_IMAGE}" \
             --name "sage-build-${BUILD_ID}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             --cloud-type "${CLOUD_TYPE}" \
             --container-disk-gb "${DISK_GB}" \
-            --cpu-flavor-ids "${CPU_FLAVOR_IDS}" \
-            --cpu-vcpu-count "${CPU_VCPU_COUNT}" \
-            --cpu-min-memory-gb "${CPU_MIN_MEMORY_GB}" \
             --ssh-key "${RUNNER_TEMP}/runpod-ssh/id" \
             --repo "${GITHUB_WORKSPACE}" \
             --remote-dir /work/sageattention-factory \

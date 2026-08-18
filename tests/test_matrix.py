@@ -48,13 +48,13 @@ def test_exact_build_matrix_matches_comfyui_base() -> None:
         "cp312-torch2.10.0-cu128": (
             "12.8", "2.10.0+cu128", "12.8",
             "2.2.0+torch2.10.0.cu128",
-            "runpod/comfyui:cuda12.8",
+            "runpod/comfyui@sha256:ce5e842ca0c7233a983ff76a83739b445172259c77a43a117453ef7e6a64d0b7",
             "madiatorlabs/sageattention-wheel-builder@sha256:556979b41a98e5331ad38a1ae599161cb37a78cb09bec34e3f982978b84816d0",
         ),
         "cp312-torch2.10.0-cu130": (
             "13.0", "2.10.0+cu130", "13.0",
             "2.2.0+torch2.10.0.cu130",
-            "runpod/comfyui:cuda13.0",
+            "runpod/comfyui@sha256:0bf75436da591e0f26d299af3741e07cb8ce8ce36566d1a7d8d78aae458e5d67",
             "madiatorlabs/sageattention-wheel-builder@sha256:bed84f32bf76ba292728faf9fbe446d5d7f84d194444b2b6d006e663cccba906",
         ),
     }
@@ -281,16 +281,52 @@ def test_docker_bake_pins_both_toolchains() -> None:
     assert "RUNPOD_API_KEY" in entrypoint
 
 
-def test_workflows_default_to_published_builder_digests() -> None:
+def test_workflows_default_to_immutable_image_digests() -> None:
     build_workflow = (ROOT / ".github" / "workflows" / "build.yml").read_text(
         encoding="utf-8")
     release_workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
         encoding="utf-8")
     for build in MATRIX["builds"]:
-        image = build["builder_image"]
-        assert image.startswith("madiatorlabs/sageattention-wheel-builder@sha256:")
-        assert build_workflow.count(f'default: "{image}"') == 2
-        assert release_workflow.count(f'default: "{image}"') == 1
+        builder_image = build["builder_image"]
+        runtime_image = build["comfyui_runtime_image"]
+        assert builder_image.startswith(
+            "madiatorlabs/sageattention-wheel-builder@sha256:")
+        assert runtime_image.startswith("runpod/comfyui@sha256:")
+        for image in (builder_image, runtime_image):
+            assert build_workflow.count(f'default: "{image}"') == 2
+            assert release_workflow.count(f'default: "{image}"') == 1
+
+
+def test_workflows_prefill_reviewed_runpod_gpu_ids() -> None:
+    build_workflow = (ROOT / ".github" / "workflows" / "build.yml").read_text(
+        encoding="utf-8")
+    release_workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
+        encoding="utf-8")
+    defaults = {
+        "NVIDIA A100 80GB PCIe": (4, 2),
+        "NVIDIA GeForce RTX 3090": (2, 1),
+        "NVIDIA GeForce RTX 4090": (2, 1),
+        "NVIDIA H100 PCIe": (2, 1),
+        "NVIDIA GeForce RTX 5090": (2, 1),
+    }
+    for gpu_id, (build_count, release_count) in defaults.items():
+        default = f'default: "{gpu_id}"'
+        assert build_workflow.count(default) == build_count
+        assert release_workflow.count(default) == release_count
+    assert build_workflow.count("default: GPU") == 2
+    assert release_workflow.count("default: GPU") == 1
+    assert "max-parallel: 1" in build_workflow
+
+
+def test_build_hides_gpu_before_import_and_records_visibility() -> None:
+    build_script = (ROOT / "scripts" / "build-wheel.sh").read_text(
+        encoding="utf-8")
+    validator = (ROOT / "scripts" / "validate-wheel.py").read_text(
+        encoding="utf-8")
+    assert build_script.index('export CUDA_VISIBLE_DEVICES=""') < build_script.index(
+        "import torch")
+    assert '"cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES")' in build_script
+    assert 'build_evidence["cuda_visible_devices"] == ""' in validator
 
 
 class MatrixTests(unittest.TestCase):
@@ -319,8 +355,14 @@ class MatrixTests(unittest.TestCase):
     def test_docker_bake_pins_both_toolchains(self) -> None:
         test_docker_bake_pins_both_toolchains()
 
-    def test_workflows_default_to_published_builder_digests(self) -> None:
-        test_workflows_default_to_published_builder_digests()
+    def test_workflows_default_to_immutable_image_digests(self) -> None:
+        test_workflows_default_to_immutable_image_digests()
+
+    def test_workflows_prefill_reviewed_runpod_gpu_ids(self) -> None:
+        test_workflows_prefill_reviewed_runpod_gpu_ids()
+
+    def test_build_hides_gpu_before_import_and_records_visibility(self) -> None:
+        test_build_hides_gpu_before_import_and_records_visibility()
 
 
 if __name__ == "__main__":

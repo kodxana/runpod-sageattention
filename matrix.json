@@ -175,7 +175,7 @@
       "torch_index_url": "https://download.pytorch.org/whl/cu128",
       "wheel_version": "2.2.0+torch2.10.0.cu128",
       "wheel_filename": "sageattention-2.2.0+torch2.10.0.cu128-cp312-cp312-linux_x86_64.whl",
-      "comfyui_runtime_image": "runpod/comfyui:cuda12.8",
+      "comfyui_runtime_image": "runpod/comfyui@sha256:ce5e842ca0c7233a983ff76a83739b445172259c77a43a117453ef7e6a64d0b7",
       "minimum_cuda_scheduler_version": "12.8",
       "builder_image": "madiatorlabs/sageattention-wheel-builder@sha256:556979b41a98e5331ad38a1ae599161cb37a78cb09bec34e3f982978b84816d0",
       "builder_target": "builder-cu128"
@@ -189,7 +189,7 @@
       "torch_index_url": "https://download.pytorch.org/whl/cu130",
       "wheel_version": "2.2.0+torch2.10.0.cu130",
       "wheel_filename": "sageattention-2.2.0+torch2.10.0.cu130-cp312-cp312-linux_x86_64.whl",
-      "comfyui_runtime_image": "runpod/comfyui:cuda13.0",
+      "comfyui_runtime_image": "runpod/comfyui@sha256:0bf75436da591e0f26d299af3741e07cb8ce8ce36566d1a7d8d78aae458e5d67",
       "minimum_cuda_scheduler_version": "13.0",
       "builder_image": "madiatorlabs/sageattention-wheel-builder@sha256:bed84f32bf76ba292728faf9fbe446d5d7f84d194444b2b6d006e663cccba906",
       "builder_target": "builder-cu130"

@@ -8,11 +8,14 @@
 - [ ] Patch files apply cleanly to a pristine checkout.
 - [ ] Patch SHA-256 values are recorded in each build manifest.
 
-## CPU builds
+## Wheel builds
 
-- [ ] The `cu128` build starts on a CPU Pod with a finite cgroup limit.
-- [ ] The `cu130` build starts on a CPU Pod with a finite cgroup limit.
+- [ ] The `cu128` build starts on the selected backend with a finite cgroup limit.
+- [ ] The `cu130` build starts only after the `cu128` builder has finished.
+- [ ] GPU-backed builds record the exact requested build GPU and use an absolute
+      platform termination deadline; CPU fallback builds arm the in-Pod watchdog.
 - [ ] Resource preflight selects safe parallelism or refuses an undersized Pod.
+- [ ] Build evidence records an empty `CUDA_VISIBLE_DEVICES` value.
 - [ ] Each variant produces exactly one expected CPython 3.12 Linux x86-64 wheel.
 - [ ] Wheel metadata contains the downstream local version and exact PyTorch pin.
 - [ ] Wheel and build manifest checksums verify after GitHub artifact transfer.

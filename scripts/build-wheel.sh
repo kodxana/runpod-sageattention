@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Compilation is deliberately GPU-independent even when the container is
+# scheduled on a GPU-backed Pod. Set this before any Python or PyTorch process.
+export CUDA_VISIBLE_DEVICES=""
+
 usage() {
     cat <<'EOF'
 Usage: build-wheel.sh --build-id ID --output-dir DIRECTORY [options]
@@ -232,7 +236,7 @@ for label, free_gib in disk_free_gib.items():
 limit_text = "unknown" if limit is None else f"{limit / 1024 ** 3:.1f} GiB"
 available_text = "unknown" if available is None else f"{available / 1024 ** 3:.1f} GiB"
 print(
-    f"CPU-only preflight: cpus={cpu['effective_count']}, memory_limit={limit_text}, "
+    f"CPU-bound preflight: cpus={cpu['effective_count']}, memory_limit={limit_text}, "
     f"memory_headroom={available_text}, "
     f"output_free_disk={disk_free_gib['output']:.1f} GiB, "
     f"work_free_disk={disk_free_gib['work']:.1f} GiB, "
@@ -362,7 +366,6 @@ git -C "${CHECKOUT}" diff --check
 WHEEL_STAGE="${WORK_DIR}/release"
 mkdir -p "${WHEEL_STAGE}"
 
-export CUDA_VISIBLE_DEVICES=""
 export EXT_PARALLEL
 export MAX_JOBS
 export PYTHONHASHSEED=0
@@ -438,6 +441,7 @@ evidence = {
         "expected": os.environ["BUILDER_IMAGE_EXPECTED"],
         "ref": builder_ref,
     },
+    "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
     "cgroup_peak": {
         "end_bytes": int(peak_end) if peak_end else None,
         "start_bytes": int(peak_start) if peak_start else None,
