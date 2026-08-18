@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Runpod's SSH server supplies a system-only PATH for remote commands. Restore
+# the pinned virtual environment and CUDA toolkit paths from the builder image
+# before testing for or invoking any build command.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+source "${SCRIPT_DIR}/activate-builder.sh"
+
 # Compilation is deliberately GPU-independent even when the container is
 # scheduled on a GPU-backed Pod. Set this before any Python or PyTorch process.
 export CUDA_VISIBLE_DEVICES=""
@@ -16,7 +22,6 @@ Options:
 EOF
 }
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
 MATRIX_PATH="${REPO_ROOT}/matrix.json"
 BUILD_ID=""

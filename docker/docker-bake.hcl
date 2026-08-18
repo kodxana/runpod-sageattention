@@ -14,6 +14,10 @@ target "builder-common" {
   context    = "."
   dockerfile = "docker/Dockerfile.builder"
   platforms  = ["linux/amd64"]
+  args = {
+    PYTHON_VERSION = "3.12"
+    NVCC_TARGETS   = "sm_80;sm_86;sm_89;sm_90a;sm_120"
+  }
 }
 
 target "builder-cu128" {

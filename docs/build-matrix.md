@@ -44,6 +44,22 @@ docker buildx bake -f docker/docker-bake.hcl builder-cu128 builder-cu130
 
 The images install Ubuntu 24.04 build tools, Python 3.12 headers, CUDA compiler/runtime development packages, cuBLAS, cuSOLVER, cuSPARSE, `cuobjdump`, PyTorch, and the wheel inspection tools. The CUDA keyring package is verified against its pinned SHA-256 before installation. CUDA driver stubs are available through `LIBRARY_PATH` solely for linking the Hopper extension; they are neither placed on runtime `LD_LIBRARY_PATH` nor packaged in a wheel.
 
+Image construction finishes by running `validate-builder-image` without a GPU.
+The probe checks the exact Python, PyTorch, PyTorch-CUDA, and NVCC versions,
+required compiler commands, CUDA headers and development libraries, the driver
+link stub, and a real NVCC/ptxas/cuobjdump compile for every reviewed native
+target. The same command can be run on a CI host before provisioning a paid
+builder Pod; failure means the image digest must not be dispatched to Runpod.
+
+Runpod SSH commands start with OpenSSH's system-only `PATH`, so they do not
+automatically see the Docker image's CUDA or virtual-environment path entries.
+`build-wheel.sh` sources `activate-builder.sh` before its first command check;
+this restores `/usr/local/cuda/bin` and
+`/opt/sageattention-builder-venv/bin`, plus the scoped CUDA compile/link paths.
+Images built from the current Dockerfile also install the activation helper
+under `/etc/profile.d` for login shells. CUDA driver stubs remain confined to
+`LIBRARY_PATH` and are never added to `LD_LIBRARY_PATH`.
+
 The image is SSH-ready and accepts newline-separated public keys through `SSH_AUTHORIZED_KEYS` (or `PUBLIC_KEY`). Password login is disabled. Its default command is foreground `sshd`; an explicit container command runs normally. Setting `START_SSHD=1` starts SSH alongside that command. Factory builders launch this image on a GPU-backed Pod, although the build itself does not use the accelerator.
 
 Every default GPU-backed builder receives an absolute RFC3339 platform termination deadline and is deleted from a retried `finally` path. The explicit CPU fallback has no verified platform deadline, so it must enable `RUNPOD_SELF_TERMINATE_SECONDS` in addition to the same mandatory cleanup. When enabled, the entrypoint accepts only 600–21600 seconds, requires a valid `RUNPOD_POD_ID`, Pod-scoped `RUNPOD_API_KEY`, and the checksum-pinned `runpodctl` bundled in the image, then arms a detached deletion watchdog. Missing prerequisites fail startup, and credentials are never printed.

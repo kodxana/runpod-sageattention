@@ -729,9 +729,18 @@ class SSHTransport:
             timeout=deadline.timeout(),
         )
         if proc.stdout:
-            print(proc.stdout, end="" if proc.stdout.endswith("\n") else "\n")
+            print(
+                proc.stdout,
+                end="" if proc.stdout.endswith("\n") else "\n",
+                flush=True,
+            )
         if proc.stderr:
-            print(proc.stderr, file=sys.stderr, end="" if proc.stderr.endswith("\n") else "\n")
+            print(
+                proc.stderr,
+                file=sys.stderr,
+                end="" if proc.stderr.endswith("\n") else "\n",
+                flush=True,
+            )
 
     def download_artifacts(
         self,
@@ -862,13 +871,16 @@ def wait_for_ssh(
         details = ctl.pod_details(pod_id, timeout=deadline.timeout(30))
         status = _pod_status(details)
         if status != last_status:
-            print(f"Pod {pod_id}: status={status}")
+            print(f"Pod {pod_id}: status={status}", flush=True)
             last_status = status
         if status in _TERMINAL_STATES:
             raise JobError(f"Pod {pod_id} entered terminal state {status}")
         endpoint = _extract_ssh_endpoint(details)
         if endpoint and transport.probe(endpoint, timeout=deadline.timeout(15)):
-            print(f"Pod {pod_id}: SSH ready at {endpoint.host}:{endpoint.port}")
+            print(
+                f"Pod {pod_id}: SSH ready at {endpoint.host}:{endpoint.port}",
+                flush=True,
+            )
             return endpoint
         sleep(min(max(0.1, poll_seconds), deadline.timeout()))
 
@@ -936,7 +948,8 @@ def verify_pod_assignment(
         gpu_type_id = gpu_type_ids[0]
         if not request.is_gpu_build:
             print(
-                f"Pod {pod_id}: verified image and gpu_id={gpu_type_id}"
+                f"Pod {pod_id}: verified image and gpu_id={gpu_type_id}",
+                flush=True,
             )
             return
 
@@ -969,7 +982,8 @@ def verify_pod_assignment(
         print(
             f"Pod {pod_id}: verified image, gpu_id={gpu_type_id}, "
             f"vcpus={vcpus:g}, memory={memory:g} GB, "
-            f"container_disk={container_disk:g} GB, pod_volume=0 GB"
+            f"container_disk={container_disk:g} GB, pod_volume=0 GB",
+            flush=True,
         )
         return
 
@@ -1007,7 +1021,8 @@ def verify_pod_assignment(
     print(
         f"Pod {pod_id}: verified image, flavor={flavor}, "
         f"vcpus={vcpus:g}, memory={memory:g} GB, "
-        f"container_disk={container_disk:g} GB, pod_volume=0 GB"
+        f"container_disk={container_disk:g} GB, pod_volume=0 GB",
+        flush=True,
     )
 
 
@@ -1018,13 +1033,14 @@ def _terminate_strictly(ctl: Runpodctl, pod_id: str) -> Exception | None:
     for attempt in range(1, 4):
         try:
             ctl.terminate_pod(pod_id, timeout=20)
-            print(f"Pod {pod_id}: terminated")
+            print(f"Pod {pod_id}: terminated", flush=True)
             return None
         except Exception as exc:  # cleanup must retain and report every failure
             last_error = exc
             print(
                 f"Pod {pod_id}: cleanup attempt {attempt}/3 failed: {exc}",
                 file=sys.stderr,
+                flush=True,
             )
             if attempt < 3:
                 time.sleep(2)
@@ -1086,6 +1102,11 @@ def run_job(
         )
         terminate_after = _rfc3339_after(self_terminate_seconds)
         if spec.pod.compute_type.upper() == "CPU":
+            print(
+                "CPU placement attempt 1/1: requesting Pod "
+                f"{spec.pod.name!r}; terminate-after={terminate_after}",
+                flush=True,
+            )
             pod_id = ctl.create_pod(
                 spec.pod,
                 terminate_after=terminate_after,
@@ -1094,7 +1115,8 @@ def run_job(
             )
             print(
                 f"Created CPU Pod {pod_id}; in-Pod self-delete after "
-                f"{self_terminate_seconds}s"
+                f"{self_terminate_seconds}s",
+                flush=True,
             )
             endpoint = wait_fn(
                 ctl,
@@ -1112,7 +1134,8 @@ def run_job(
                     backoff = deadline.timeout(GPU_PLACEMENT_BACKOFF_SECONDS)
                     print(
                         "All GPU candidates rejected in placement round "
-                        f"{round_number - 1}; retrying once after {backoff:g}s"
+                        f"{round_number - 1}; retrying once after {backoff:g}s",
+                        flush=True,
                     )
                     time.sleep(backoff)
                 round_only_capacity_failures = True
@@ -1120,6 +1143,13 @@ def run_job(
                     candidate_request = replace(spec.pod, gpu_id=candidate)
                     pod_id = None
                     endpoint = None
+                    print(
+                        f"Trying GPU candidate {candidate_number}/{len(candidates)} "
+                        f"(round {round_number}/{GPU_PLACEMENT_ROUNDS}): "
+                        f"requesting exact gpuId {candidate!r}; "
+                        f"terminate-after={terminate_after}",
+                        flush=True,
+                    )
                     try:
                         pod_id = ctl.create_pod(
                             candidate_request,
@@ -1135,12 +1165,14 @@ def run_job(
                             f"GPU candidate {candidate_number}/{len(candidates)} "
                             f"{candidate!r} has no matching capacity",
                             file=sys.stderr,
+                            flush=True,
                         )
                         continue
 
                     print(
                         f"Created GPU Pod {pod_id} for candidate {candidate!r}; "
-                        f"terminate-after={terminate_after}"
+                        f"terminate-after={terminate_after}",
+                        flush=True,
                     )
                     endpoint = wait_fn(
                         ctl,
@@ -1165,6 +1197,7 @@ def run_job(
                             f"GPU candidate {candidate!r} was rejected "
                             f"before upload: {exc}",
                             file=sys.stderr,
+                            flush=True,
                         )
                         rejected_cleanup_error = _terminate_strictly(ctl, pod_id)
                         if rejected_cleanup_error is not None:
@@ -1180,7 +1213,8 @@ def run_job(
                     selected_gpu_id = candidate
                     print(
                         f"Selected GPU candidate {candidate!r} for Pod {pod_id} "
-                        f"(round {round_number})"
+                        f"(round {round_number})",
+                        flush=True,
                     )
                     break
                 if selected_gpu_id is not None:
@@ -1239,6 +1273,19 @@ def run_job(
         close_transport = getattr(transport, "close", None)
         if callable(close_transport):
             close_transport()
+
+    if (
+        primary_error is not None
+        and artifact_error is not None
+        and "missing requested artifact:" in str(artifact_error)
+    ):
+        print(
+            "WARNING: no requested debug artifact was produced after the job "
+            "failed; preserving the primary job error",
+            file=sys.stderr,
+            flush=True,
+        )
+        artifact_error = None
 
     failures = [
         ("job", primary_error),
@@ -1406,7 +1453,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         result = run_job(spec)
     except (JobError, OSError, ValueError) as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        print(f"ERROR: {exc}", file=sys.stderr, flush=True)
         return 1
     finally:
         for signum, handler in previous_handlers.items():
@@ -1419,7 +1466,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     }
     if result.selected_gpu_id is not None:
         result_payload["selected_gpu_id"] = result.selected_gpu_id
-    print(json.dumps(result_payload, sort_keys=True))
+    print(json.dumps(result_payload, sort_keys=True), flush=True)
     return 0
 
 

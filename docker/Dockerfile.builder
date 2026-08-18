@@ -7,6 +7,8 @@ ARG CUDA_VERSION_DASH
 ARG TORCH_VERSION
 ARG TORCH_CUDA_VERSION
 ARG TORCH_INDEX_SUFFIX
+ARG PYTHON_VERSION
+ARG NVCC_TARGETS
 ARG CUDA_KEYRING_SHA256=d2a6b11c096396d868758b86dab1823b25e14d70333f1dfa74da5ddaf6a06dba
 ARG RUNPODCTL_VERSION=v2.3.0
 ARG RUNPODCTL_SHA256=908f2210571e8a26a1cba6fb45f09556b34dcad3e1b20dd502df2adf7a57c169
@@ -29,7 +31,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     BUILDER_CUDA_VERSION=${CUDA_VERSION} \
     BUILDER_TORCH_VERSION=${TORCH_VERSION} \
     BUILDER_TORCH_CUDA_VERSION=${TORCH_CUDA_VERSION} \
-    BUILDER_TORCH_INDEX_SUFFIX=${TORCH_INDEX_SUFFIX}
+    BUILDER_TORCH_INDEX_SUFFIX=${TORCH_INDEX_SUFFIX} \
+    BUILDER_PYTHON_VERSION=${PYTHON_VERSION} \
+    BUILDER_NVCC_TARGETS=${NVCC_TARGETS}
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -37,7 +41,9 @@ RUN test -n "${CUDA_VERSION}" \
     && test -n "${CUDA_VERSION_DASH}" \
     && test -n "${TORCH_VERSION}" \
     && test -n "${TORCH_CUDA_VERSION}" \
-    && test -n "${TORCH_INDEX_SUFFIX}"
+    && test -n "${TORCH_INDEX_SUFFIX}" \
+    && test -n "${PYTHON_VERSION}" \
+    && test -n "${NVCC_TARGETS}"
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -107,6 +113,20 @@ RUN /usr/bin/python3.12 -m venv "${VIRTUAL_ENV}" \
         "torch==${TORCH_VERSION}" \
     && EXPECTED_TORCH="${TORCH_VERSION}" EXPECTED_CUDA="${TORCH_CUDA_VERSION}" \
         "${VIRTUAL_ENV}/bin/python" -c 'import os, torch; expected_torch = os.environ["EXPECTED_TORCH"]; expected_cuda = os.environ["EXPECTED_CUDA"]; assert torch.__version__ == expected_torch, f"torch mismatch: expected {expected_torch}, got {torch.__version__}"; assert torch.version.cuda == expected_cuda, f"torch CUDA mismatch: expected {expected_cuda}, got {torch.version.cuda}"'
+
+COPY scripts/activate-builder.sh /usr/local/lib/sageattention-builder/activate-builder.sh
+COPY scripts/validate-builder-image.sh /usr/local/bin/validate-builder-image
+RUN chmod 0755 \
+        /usr/local/lib/sageattention-builder/activate-builder.sh \
+        /usr/local/bin/validate-builder-image \
+    && ln -s /usr/local/lib/sageattention-builder/activate-builder.sh \
+        /etc/profile.d/sageattention-builder.sh \
+    && /usr/local/bin/validate-builder-image \
+        --cuda-version "${CUDA_VERSION}" \
+        --torch-version "${TORCH_VERSION}" \
+        --torch-cuda-version "${TORCH_CUDA_VERSION}" \
+        --python-version "${PYTHON_VERSION}" \
+        --nvcc-targets "${NVCC_TARGETS}"
 
 RUN install -d -m 0700 /root/.ssh \
     && install -d -m 0755 /run/sshd /workspace /work \

@@ -263,6 +263,14 @@ def test_docker_bake_pins_both_toolchains() -> None:
     bake = (ROOT / "docker" / "docker-bake.hcl").read_text(encoding="utf-8")
     dockerfile = (ROOT / "docker" / "Dockerfile.builder").read_text(encoding="utf-8")
     entrypoint = (ROOT / "docker" / "builder-entrypoint.sh").read_text(encoding="utf-8")
+    builder_validator = (
+        ROOT / "scripts" / "validate-builder-image.sh"
+    ).read_text(encoding="utf-8")
+    builder_activation = (
+        ROOT / "scripts" / "activate-builder.sh"
+    ).read_text(encoding="utf-8")
+    build_script = (ROOT / "scripts" / "build-wheel.sh").read_text(
+        encoding="utf-8")
     for build in MATRIX["builds"]:
         assert build["builder_target"] in bake
         assert build["torch_version"] in bake
@@ -275,6 +283,29 @@ def test_docker_bake_pins_both_toolchains() -> None:
     assert '/usr/bin/python3.12 -m venv "${VIRTUAL_ENV}"' in dockerfile
     assert '"${VIRTUAL_ENV}/bin/python" -m pip install --upgrade' in dockerfile
     assert "pod_resources.py /usr/local/bin/pod-resources" in dockerfile
+    assert "COPY scripts/validate-builder-image.sh" in dockerfile
+    assert "COPY scripts/activate-builder.sh" in dockerfile
+    assert "/usr/local/bin/validate-builder-image" in dockerfile
+    assert 'PYTHON_VERSION = "3.12"' in bake
+    expected_nvcc_targets = "sm_80;sm_86;sm_89;sm_90a;sm_120"
+    assert f'NVCC_TARGETS   = "{expected_nvcc_targets}"' in bake
+    expected_compile_targets = {
+        target
+        for targets in MATRIX["cuda_policy"]["extension_compile_targets"].values()
+        for target in targets
+    }
+    assert set(expected_nvcc_targets.split(";")) == expected_compile_targets
+    for required_command in ("nvcc", "ptxas", "cuobjdump", "python3.12"):
+        assert required_command in builder_validator
+    assert "torch.utils.cpp_extension" in builder_validator
+    assert "--generate-code=arch=compute_${architecture},code=${target}" in builder_validator
+    assert 'export CUDA_VISIBLE_DEVICES=""' in builder_validator
+    assert 'source "${VALIDATOR_DIR}/activate-builder.sh"' in builder_validator
+    assert 'VIRTUAL_ENV="${VIRTUAL_ENV:-/opt/sageattention-builder-venv}"' in builder_activation
+    assert 'PATH="${VIRTUAL_ENV}/bin:${CUDA_HOME}/bin:${CURRENT_PATH}"' in builder_activation
+    assert 'source "${SCRIPT_DIR}/activate-builder.sh"' in build_script
+    assert build_script.index('source "${SCRIPT_DIR}/activate-builder.sh"') < (
+        build_script.index("command -v"))
     assert "RUNPODCTL_SHA256=908f2210571e8a26a1cba6fb45f09556b34dcad3e1b20dd502df2adf7a57c169" in dockerfile
     assert "RUNPOD_SELF_TERMINATE_SECONDS" in entrypoint
     assert 'runpodctl pod delete "$2"' in entrypoint

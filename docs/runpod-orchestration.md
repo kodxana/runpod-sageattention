@@ -180,6 +180,12 @@ release workflow.
    cgroup and requires 20 GiB currently free on both work and output
    filesystems. A 16-vCPU/64-GB system assignment is recommended. Passing the
    selected `gpuId` alone does not prove these host resources.
+
+   The assignment read explicitly requests REST machine metadata with
+   `includeMachine=true`. Exact identity may be reported as `gpu.id`,
+   `machine.gpuTypeId`, `machine.gpuType.id`, or the legacy top-level
+   `gpuTypeId`; display names are not accepted, and conflicting populated IDs
+   fail closed. Machine metadata is otherwise omitted by default.
 4. `build-wheel.sh` hides the attached accelerator with
    `CUDA_VISIBLE_DEVICES=""`, derives safe compiler concurrency without
    exceeding the matrix cap, and executes the pinned source build. The output,
