@@ -488,7 +488,7 @@ class Runpodctl:
     ) -> dict[str, object]:
         payload = self._http_executor(
             "GET",
-            f"{self._rest_api_url}/pods/{pod_id}",
+            f"{self._rest_api_url}/pods/{pod_id}?includeMachine=true",
             None,
             self._rest_headers(),
             timeout,
@@ -886,18 +886,26 @@ def _number(details: Mapping[str, object], name: str) -> float | None:
         return None
 
 
-def _gpu_type_id(details: Mapping[str, object]) -> str | None:
-    """Read the exact requested GPU id from either documented response shape."""
+def _gpu_type_ids(details: Mapping[str, object]) -> tuple[str, ...]:
+    """Collect exact GPU ids from documented current and legacy shapes."""
 
-    direct = details.get("gpuTypeId")
-    if isinstance(direct, str) and direct:
-        return direct
+    found: list[str] = []
+
+    def add(value: object) -> None:
+        if isinstance(value, str) and value and value not in found:
+            found.append(value)
+
+    add(details.get("gpuTypeId"))
     gpu = details.get("gpu")
     if isinstance(gpu, Mapping):
-        nested = gpu.get("id")
-        if isinstance(nested, str) and nested:
-            return nested
-    return None
+        add(gpu.get("id"))
+    machine = details.get("machine")
+    if isinstance(machine, Mapping):
+        add(machine.get("gpuTypeId"))
+        machine_gpu = machine.get("gpuType")
+        if isinstance(machine_gpu, Mapping):
+            add(machine_gpu.get("id"))
+    return tuple(found)
 
 
 def verify_pod_assignment(
@@ -917,12 +925,15 @@ def verify_pod_assignment(
             f"Pod image mismatch: expected {request.image!r}, got {actual_image!r}"
         )
     if request.compute_type.upper() == "GPU":
-        gpu_type_id = _gpu_type_id(details)
-        if gpu_type_id != request.gpu_id:
+        gpu_type_ids = _gpu_type_ids(details)
+        if not gpu_type_ids or any(
+            gpu_type_id != request.gpu_id for gpu_type_id in gpu_type_ids
+        ):
             raise GpuPlacementError(
                 f"GPU type mismatch: expected exact gpuId {request.gpu_id!r}, "
-                f"got {gpu_type_id!r}"
+                f"got {gpu_type_ids or None!r}"
             )
+        gpu_type_id = gpu_type_ids[0]
         if not request.is_gpu_build:
             print(
                 f"Pod {pod_id}: verified image and gpu_id={gpu_type_id}"
