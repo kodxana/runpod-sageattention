@@ -637,7 +637,11 @@ jobs:
           )
           PY
           mapfile -t manifests < <(find downloaded-wheels -type f -name manifest.json | sort)
-          test "${#manifests[@]}" -eq 2
+          expected_manifests="$(jq '.builds | length' matrix.json)"
+          if [[ "${#manifests[@]}" -ne "${expected_manifests}" ]]; then
+            echo "::error::expected ${expected_manifests} wheel manifests (one per matrix.json build), found ${#manifests[@]}: ${manifests[*]}" >&2
+            exit 1
+          fi
           python3.12 scripts/merge-manifests.py \
             --output release-assets/manifest.json \
             --checksums release-assets/SHA256SUMS \

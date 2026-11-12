@@ -179,6 +179,16 @@ def test_resource_and_runtime_release_thresholds_are_conservative() -> None:
     assert "runtime output tensor mismatch" in release_workflow
 
 
+def test_release_expects_one_manifest_per_matrix_build() -> None:
+    # 0.2.0 failed after every GPU test passed because the release step still
+    # required exactly 2 manifests once cu132 made it 3.
+    release_workflow = (
+        ROOT / ".github" / "workflows" / "release.yml"
+    ).read_text(encoding="utf-8")
+    assert "jq '.builds | length' matrix.json" in release_workflow
+    assert re.search(r'manifests\[@\]\}" -eq [0-9]', release_workflow) is None
+
+
 def test_downstream_patch_scopes_gencodes_and_exact_torch_metadata() -> None:
     patch = (
         ROOT / "patches" / "sageattention" / "2.2.0" / "setup.py.patch"
