@@ -53,6 +53,7 @@ jobs:
           expected = {
               "cp312-torch2.10.0-cu128",
               "cp312-torch2.10.0-cu130",
+              "cp312-torch2.13.0-cu132",
           }
           if set(ids) != expected or len(ids) != len(set(ids)):
               raise SystemExit(f"unexpected or duplicate build ids: {ids}")

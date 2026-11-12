@@ -6,6 +6,7 @@ This repository produces two deliberately separate SageAttention 2.2.0 wheels fo
 | --- | --- | --- | --- | --- |
 | `cp312-torch2.10.0-cu128` | CUDA 12.8 | `2.10.0+cu128` | `2.2.0+torch2.10.0.cu128.sm90fix1` | `runpod/comfyui:cuda12.8` |
 | `cp312-torch2.10.0-cu130` | CUDA 13.0 | `2.10.0+cu130` | `2.2.0+torch2.10.0.cu130.sm90fix1` | `runpod/comfyui:cuda13.0` |
+| `cp312-torch2.13.0-cu132` | CUDA 13.2 | `2.13.0+cu132` | `2.2.0+torch2.13.0.cu132.sm90fix1` | `runpod/comfyui:cuda13.2` |
 
 The table shows the human-readable ComfyUI release lines. `matrix.json` and the
 workflow defaults pin the currently reviewed OCI index digests so a mutable tag
@@ -42,10 +43,10 @@ data-center architecture.
 
 ## Builder images
 
-Build both images with:
+Build the images with:
 
 ```bash
-docker buildx bake -f docker/docker-bake.hcl builder-cu128 builder-cu130
+docker buildx bake -f docker/docker-bake.hcl builder-cu128 builder-cu130 builder-cu132
 ```
 
 The images install Ubuntu 24.04 build tools, Python 3.12 headers, CUDA compiler/runtime development packages, cuBLAS, cuSOLVER, cuSPARSE, `cuobjdump`, PyTorch, and the wheel inspection tools. The CUDA keyring package is verified against its pinned SHA-256 before installation. CUDA driver stubs are available through `LIBRARY_PATH` solely for linking the Hopper extension; they are neither placed on runtime `LD_LIBRARY_PATH` nor packaged in a wheel.
@@ -81,7 +82,7 @@ under `/etc/profile.d` for login shells. CUDA driver stubs remain confined to
 
 The image is SSH-ready and accepts newline-separated public keys through `SSH_AUTHORIZED_KEYS` (or `PUBLIC_KEY`). Password login is disabled. Its default command is foreground `sshd`; an explicit container command runs normally. Setting `START_SSHD=1` starts SSH alongside that command. Factory builders launch this image on a GPU-backed Pod, although the build itself does not use the accelerator.
 
-Every default GPU-backed builder receives an absolute RFC3339 platform termination deadline and is deleted from a retried `finally` path. The explicit CPU fallback has no verified platform deadline, so it must enable `RUNPOD_SELF_TERMINATE_SECONDS` in addition to the same mandatory cleanup. When enabled, the entrypoint accepts only 600–21600 seconds, requires a valid `RUNPOD_POD_ID`, Pod-scoped `RUNPOD_API_KEY`, and the checksum-pinned `runpodctl` bundled in the image, then arms a detached deletion watchdog. Missing prerequisites fail startup, and credentials are never printed.
+Every builder Pod, GPU or CPU, is deleted from a retried `finally` path and also enables `RUNPOD_SELF_TERMINATE_SECONDS`, because the Runpod REST API v2 has no platform-side termination deadline. When enabled, the entrypoint accepts only 600–21600 seconds, requires a valid `RUNPOD_POD_ID`, the Pod-scoped `RUNPOD_API_KEY`, and `curl`, then arms a detached watchdog that calls REST v2 `DELETE /pods/{id}` (on `RUNPOD_API_URL`, default `https://api.runpod.io/v2`). The key is passed to `curl` on stdin, so it never appears in the process list. Missing prerequisites fail startup, and credentials are never printed.
 
 The uploaded `tools/pod_resources.py` provides the authoritative cgroup-aware CPU and memory view, with the image-installed `pod-resources` retained as a fallback. Scoped wrappers make `free`, `top`, and `htop` report Pod resources without setting `LD_PRELOAD` globally.
 

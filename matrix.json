@@ -189,9 +189,9 @@
       "torch_index_url": "https://download.pytorch.org/whl/cu128",
       "wheel_version": "2.2.0+torch2.10.0.cu128.sm90fix1",
       "wheel_filename": "sageattention-2.2.0+torch2.10.0.cu128.sm90fix1-cp312-cp312-linux_x86_64.whl",
-      "comfyui_runtime_image": "runpod/comfyui@sha256:ce5e842ca0c7233a983ff76a83739b445172259c77a43a117453ef7e6a64d0b7",
+      "comfyui_runtime_image": "runpod/comfyui@sha256:26cd753a3929eb7a59eb1f87ac483226e4cc9e61add40214a5dc21419c26f915",
       "minimum_cuda_scheduler_version": "12.8",
-      "builder_image": "madiatorlabs/sageattention-wheel-builder@sha256:556979b41a98e5331ad38a1ae599161cb37a78cb09bec34e3f982978b84816d0",
+      "builder_image": "runpod/sageattention-wheel-builder@sha256:304c806d607bedcd1c743344796ba4bd0f9fb4bd2cedeb5044d9b6446bbcdc06",
       "builder_target": "builder-cu128"
     },
     {
@@ -203,10 +203,24 @@
       "torch_index_url": "https://download.pytorch.org/whl/cu130",
       "wheel_version": "2.2.0+torch2.10.0.cu130.sm90fix1",
       "wheel_filename": "sageattention-2.2.0+torch2.10.0.cu130.sm90fix1-cp312-cp312-linux_x86_64.whl",
-      "comfyui_runtime_image": "runpod/comfyui@sha256:0bf75436da591e0f26d299af3741e07cb8ce8ce36566d1a7d8d78aae458e5d67",
+      "comfyui_runtime_image": "runpod/comfyui@sha256:631e0eb04550e675f3a148ed65ad4378e4d1ba248156a9941cb11884e3fa552c",
       "minimum_cuda_scheduler_version": "13.0",
-      "builder_image": "madiatorlabs/sageattention-wheel-builder@sha256:bed84f32bf76ba292728faf9fbe446d5d7f84d194444b2b6d006e663cccba906",
+      "builder_image": "runpod/sageattention-wheel-builder@sha256:d80e828634a67c449e9e9663a4a29cb08aefff95ef4a9ce71d0313d336b92b42",
       "builder_target": "builder-cu130"
+    },
+    {
+      "id": "cp312-torch2.13.0-cu132",
+      "cuda_version": "13.2",
+      "cuda_package_suffix": "13-2",
+      "torch_version": "2.13.0+cu132",
+      "torch_cuda_version": "13.2",
+      "torch_index_url": "https://download.pytorch.org/whl/cu132",
+      "wheel_version": "2.2.0+torch2.13.0.cu132.sm90fix1",
+      "wheel_filename": "sageattention-2.2.0+torch2.13.0.cu132.sm90fix1-cp312-cp312-linux_x86_64.whl",
+      "comfyui_runtime_image": "runpod/comfyui@sha256:0d9b67c84316f70417c27b300740e35254b508234c348502261189ecbbc4024e",
+      "minimum_cuda_scheduler_version": "13.2",
+      "builder_image": "runpod/sageattention-wheel-builder@sha256:910ee07719dc28dc0cc094739d0818c76ac3f7f7e81592992008e7a8339ea7b2",
+      "builder_target": "builder-cu132"
     }
   ]
 }

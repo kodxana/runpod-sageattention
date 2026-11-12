@@ -14,12 +14,10 @@ ARG PACKAGING_VERSION
 ARG SETUPTOOLS_VERSION
 ARG WHEEL_VERSION
 ARG CUDA_KEYRING_SHA256=d2a6b11c096396d868758b86dab1823b25e14d70333f1dfa74da5ddaf6a06dba
-ARG RUNPODCTL_VERSION=v2.3.0
-ARG RUNPODCTL_SHA256=908f2210571e8a26a1cba6fb45f09556b34dcad3e1b20dd502df2adf7a57c169
 
 LABEL org.opencontainers.image.title="SageAttention wheel builder" \
       org.opencontainers.image.description="GPU-independent, SSH-ready SageAttention wheel builder" \
-      org.opencontainers.image.source="https://github.com/kodxana/runpod-sageattention" \
+      org.opencontainers.image.source="https://github.com/runpod/sageattention" \
       io.runpod.sageattention.cuda="${CUDA_VERSION}" \
       io.runpod.sageattention.torch="${TORCH_VERSION}"
 
@@ -100,14 +98,6 @@ RUN apt-get update \
         "libcusparse-dev-${CUDA_VERSION_DASH}" \
     && rm -f /usr/lib/python3.12/EXTERNALLY-MANAGED \
     && rm -rf /var/lib/apt/lists/*
-
-RUN curl -fsSLo /tmp/runpodctl.tar.gz \
-        "https://github.com/runpod/runpodctl/releases/download/${RUNPODCTL_VERSION}/runpodctl-linux-amd64.tar.gz" \
-    && printf '%s  %s\n' "${RUNPODCTL_SHA256}" /tmp/runpodctl.tar.gz | sha256sum -c - \
-    && tar -xzf /tmp/runpodctl.tar.gz -C /usr/local/bin runpodctl \
-    && chmod 0755 /usr/local/bin/runpodctl \
-    && rm -f /tmp/runpodctl.tar.gz \
-    && runpodctl version
 
 ENV VIRTUAL_ENV=/opt/sageattention-builder-venv \
     PATH=/opt/sageattention-builder-venv/bin:${PATH}

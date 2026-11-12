@@ -20,10 +20,12 @@ SageAttention source + Python ABI + PyTorch version + CUDA variant + GPU cubins
 |---|---|---|---|---|
 | `cu128` | CPython 3.12 | `2.10.0+cu128` | CUDA 12.8 | SM 80, 86, 89, 90a, 120 |
 | `cu130` | CPython 3.12 | `2.10.0+cu130` | CUDA 13.0 | SM 80, 86, 89, 90a, 120 |
+| `cu132` | CPython 3.12 | `2.13.0+cu132` | CUDA 13.2 | SM 80, 86, 89, 90a, 120 |
 
-Both variants carry the downstream `sm90fix1` revision. Their exact local
-versions are `2.2.0+torch2.10.0.cu128.sm90fix1` and
-`2.2.0+torch2.10.0.cu130.sm90fix1`; this prevents the corrected wheels from
+Every variant carries the downstream `sm90fix1` revision. Their exact local
+versions are `2.2.0+torch2.10.0.cu128.sm90fix1`,
+`2.2.0+torch2.10.0.cu130.sm90fix1` and `2.2.0+torch2.13.0.cu132.sm90fix1`;
+this prevents the corrected wheels from
 colliding with previously built v2.2.0 artifacts.
 
 SageAttention 2.2.0 does not implement the SM10x paths used by B200 (SM100) and
@@ -124,10 +126,10 @@ fit above the sampled peak.
 - The exact PyTorch dependency is present in wheel metadata.
 - The installer refuses a CUDA/PyTorch mismatch or an ambiguous wheelhouse.
 - CUDA driver stubs are link-time-only builder inputs.
-- Every default GPU builder and validator receives an RFC3339 platform
-  termination deadline, and every job also has retried `finally` cleanup. An
-  in-Pod builder watchdog protects the explicit CPU fallback, whose
-  provisioning path has no verified platform deadline.
+- Every job has retried `finally` cleanup, builder Pods arm an in-Pod
+  self-delete watchdog, and an hourly reaper (`reap-pods.yml`) deletes any
+  factory Pod whose GitHub run is over. REST v2 has no platform-side
+  termination deadline.
 - GPU-backed manifests record the exact selected builder candidate; CPU
   fallback manifests use a stable `null` GPU-identity field.
 - Paid Pod workflows require an explicit dispatch/release gate.

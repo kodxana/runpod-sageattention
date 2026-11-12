@@ -72,8 +72,10 @@ class WorkflowSecretContractTests(unittest.TestCase):
             "build_gpu_id",
             "builder_image_cu128",
             "builder_image_cu130",
+            "builder_image_cu132",
             "runtime_image_cu128",
             "runtime_image_cu130",
+            "runtime_image_cu132",
             "gpu_id_sm80",
             "gpu_id_sm86",
             "gpu_id_sm89",
@@ -122,8 +124,10 @@ class WorkflowSecretContractTests(unittest.TestCase):
             with self.subTest(job=job.splitlines()[0] if job else "unknown"):
                 self.assertLess(
                     job.index("- name: Verify protected Runpod credentials"),
-                    job.index("- name: Install checksum-pinned runpodctl"),
+                    job.index("python3.12 tools/runpod_job.py"),
                 )
+                # Every Runpod call goes through tools/runpod_job.py on REST v2.
+                self.assertNotIn("runpodctl", job)
 
     def test_gpu_validation_uses_a_fixed_short_budget(self) -> None:
         build_job = self.build.split("  build:\n", 1)[1].split(
@@ -131,7 +135,7 @@ class WorkflowSecretContractTests(unittest.TestCase):
         )[0]
         gpu_test_job = self.build.split("  gpu-test:\n", 1)[1]
 
-        self.assertIn("timeout-minutes: 30", gpu_test_job)
+        self.assertIn("timeout-minutes: 60", gpu_test_job)
         self.assertIn("GPU_VALIDATION_TIMEOUT_SECONDS: 900", gpu_test_job)
         self.assertIn("GPU_VALIDATION_TERMINATE_GRACE_SECONDS: 300", gpu_test_job)
         self.assertIn(

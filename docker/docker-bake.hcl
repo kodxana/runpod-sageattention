@@ -1,5 +1,5 @@
 variable "IMAGE_REPOSITORY" {
-  default = "madiatorlabs/sageattention-wheel-builder"
+  default = "runpod/sageattention-wheel-builder"
 }
 
 variable "IMAGE_TAG" {
@@ -7,7 +7,7 @@ variable "IMAGE_TAG" {
 }
 
 group "default" {
-  targets = ["builder-cu128", "builder-cu130"]
+  targets = ["builder-cu128", "builder-cu130", "builder-cu132"]
 }
 
 target "builder-common" {
@@ -45,5 +45,17 @@ target "builder-cu130" {
     TORCH_VERSION        = "2.10.0+cu130"
     TORCH_CUDA_VERSION   = "13.0"
     TORCH_INDEX_SUFFIX   = "cu130"
+  }
+}
+
+target "builder-cu132" {
+  inherits = ["builder-common"]
+  tags = ["${IMAGE_REPOSITORY}:${IMAGE_TAG}-cu132"]
+  args = {
+    CUDA_VERSION         = "13.2"
+    CUDA_VERSION_DASH    = "13-2"
+    TORCH_VERSION        = "2.13.0+cu132"
+    TORCH_CUDA_VERSION   = "13.2"
+    TORCH_INDEX_SUFFIX   = "cu132"
   }
 }

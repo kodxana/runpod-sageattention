@@ -37,19 +37,28 @@ disables host-key checking globally.
 The dispatch form also requires `confirm_paid_pods=true`. The orchestration
 executable has its own mandatory `--allow-paid-pod` switch. Only `build.yml`
 passes it, and those jobs are protected by `runpod-paid`.
-`ci.yml` has no Runpod secrets, no `runpodctl`, and no paid-resource switch.
+`ci.yml` has no Runpod secrets and no paid-resource switch.
 
-The default builders and all validators use GPU Pods created by the
-checksum-pinned `runpodctl` v2.3.0 command. Every GPU request carries an exact
-`gpuId`, an immutable image, an 80 GB-or-larger container disk for builders,
-and an RFC3339 `--terminate-after` deadline. The same checked client handles
-readiness and deletion.
+Every Pod is created, read and deleted by `tools/runpod_job.py` through the
+Runpod REST API v2 (`https://api.runpod.io/v2`); no CLI is installed. The API
+key therefore needs only **REST API → Pods: Read and Write**, and no GraphQL
+access. REST v1 and GraphQL are deprecated (v1 stops serving on November 15,
+2026; GraphQL in early 2027), so nothing here depends on either. Setting the
+`RUNPOD_API_URL` repository variable (for example to
+`https://api.runpod.dev/v2`) targets another environment; unset means
+production.
 
-`build_backend=CPU` remains an explicit capacity fallback. Because pinned
-`runpodctl` does not expose sized CPU creation, that path uses the official
-`POST /v1/pods` REST API with `cpuFlavorIds`, `vcpuCount`, and no persistent Pod
-volume. It is not the release default and retains the in-Pod self-delete
-watchdog because its platform termination field is not verified.
+The default builders and all validators use GPU Pods. Every GPU request carries
+an exact `gpuId`, an immutable image, the CUDA floor as `gpu.minCudaVersion`,
+and for builders an 80 GB-or-larger container disk plus `minVcpuCountPerGpu`
+and `minRamPerGpu` placement filters. REST v2 has no platform-side termination
+deadline, so builder Pods (GPU and CPU) arm the image's in-Pod self-delete
+watchdog in addition to the retried `finally` deletion. Validation Pods run the
+ComfyUI runtime image, which has no watchdog, and rely on that deletion alone.
+
+`build_backend=CPU` remains an explicit capacity fallback. It creates one
+`cpu` Pod per ordered flavor id with `vcpuCount`, and no persistent Pod volume.
+It is not the release default.
 
 ## Builder image bootstrap
 
@@ -60,18 +69,19 @@ SageAttention wheel. Building these Docker images on GitHub or a local Buildx
 host is allowed; the costly NVCC wheel compilation happens on short-lived
 Runpod GPU-backed builder Pods.
 
-Authenticate to the chosen registry, then bootstrap both images:
+Authenticate to the chosen registry, then bootstrap the images:
 
 ```bash
-export IMAGE_REPOSITORY=madiatorlabs/sageattention-wheel-builder
+export IMAGE_REPOSITORY=runpod/sageattention-wheel-builder
 export IMAGE_TAG=bootstrap-$(git rev-parse --short=12 HEAD)
 
 docker buildx bake -f docker/docker-bake.hcl \
-  builder-cu128 builder-cu130 --push
+  builder-cu128 builder-cu130 builder-cu132 --push
 ```
 
-The resulting tags are `${IMAGE_REPOSITORY}:${IMAGE_TAG}-cu128` and
-`${IMAGE_REPOSITORY}:${IMAGE_TAG}-cu130`. Inspect each registry manifest and
+The resulting tags are `${IMAGE_REPOSITORY}:${IMAGE_TAG}-cu128`,
+`${IMAGE_REPOSITORY}:${IMAGE_TAG}-cu130` and
+`${IMAGE_REPOSITORY}:${IMAGE_TAG}-cu132`. Inspect each registry manifest and
 record its digest:
 
 ```bash
@@ -79,6 +89,8 @@ docker buildx imagetools inspect \
   "${IMAGE_REPOSITORY}:${IMAGE_TAG}-cu128"
 docker buildx imagetools inspect \
   "${IMAGE_REPOSITORY}:${IMAGE_TAG}-cu130"
+docker buildx imagetools inspect \
+  "${IMAGE_REPOSITORY}:${IMAGE_TAG}-cu132"
 ```
 
 Pass `repository@sha256:<64 hex>` references to release workflows. Manual
@@ -114,11 +126,21 @@ Max-Q Workstation Edition are intentionally absent from these defaults.
 L40S remains in the reviewed SM 8.9 allowlist for an explicit operator override,
 but is excluded from routine release defaults after observed assignment hangs.
 
-Fallback is deliberately narrow. The orchestrator makes at most two ordered
-placement rounds, with a five-second backoff before round two only when every
-create in round one returned Runpod's explicit no-capacity response. A
-pre-upload assignment mismatch is deleted before the next candidate is tried
-and prevents another full round. Authentication, configuration, SSH, upload,
+Fallback is deliberately narrow. The orchestrator makes up to five placement
+rounds (`--placement-rounds`, 1–10), waiting 300 seconds
+(`--placement-backoff-seconds`, 0–900) before each retry, and retries only
+when every create in the previous round was refused for capacity: a REST v2
+`400` whose message says no host can take the Pod ("no longer any instances
+available", "Insufficient resources", ...). Any other `400` is a malformed
+request and a `403` a key or account that may not do this; both fail on the
+first candidate. CPU builds walk their ordered flavor list in each round the
+same way. Waiting costs nothing because no Pod exists yet, so each round
+starts the `--timeout-seconds` budget afresh; the GitHub job timeouts include
+the worst-case waits. A pre-upload assignment mismatch is deleted before the next candidate is tried
+and prevents another full round. Before any create, `check_auth` reads
+`/pods` and then stops a Pod id that cannot exist: an authorized key gets
+`400`/`404` and nothing changes, while a read-only key gets `401`/`403` and
+the job stops there instead of failing every create. Authentication, configuration, SSH, upload,
 build, and test failures are never treated as capacity and are not retried
 against another GPU. If deletion of a rejected Pod fails, fallback stops
 immediately instead of risking a second billed Pod.
@@ -144,13 +166,9 @@ builds do not export a selected GPU and record this field as JSON `null`.
 The same ordered values are recorded in `.env.example`. Confirm exact IDs and
 current capacity in the live available-only catalog before a paid dispatch;
 use `--include-unavailable` only to diagnose a missing type, not to claim it has
-capacity. This behavior is defined by the
-[official `runpodctl gpu` reference](https://docs.runpod.io/runpodctl/reference/runpodctl-gpu):
-
-```bash
-runpodctl gpu list -o json \
-  | jq -r '.[] | [.displayName, .gpuId] | @tsv'
-```
+capacity. List the current GPU types and their pod stock with the REST v2
+catalog (`GET /v2/catalog/gpus?include=AVAILABILITY&product=POD`, documented
+in the [REST API v2 reference](https://docs.runpod.io/api-reference-v2/overview)).
 
 The workflow does not enumerate every commercial GPU SKU. B200 (SM100) and
 B300 (SM103) are intentionally absent; NVIDIA lists them as 10.0 and 10.3
@@ -182,7 +200,7 @@ release workflow.
 2. The two build variants run sequentially. Each starts a one-GPU Pod from its
    exact builder image using the ordered builder candidates, port 22, registry
    authentication when needed, at least 80 GB
-   container disk, and an absolute `--terminate-after` deadline. The checked-out
+   container disk, and the in-Pod self-delete watchdog. The checked-out
    repository is archived without Git metadata or links and uploaded below
    `/work` on that explicitly sized ephemeral container filesystem; compilation
    does not require a persistent/network volume.
@@ -250,7 +268,7 @@ release workflow.
 
 CUDA scheduler floors come from the matching build entry in `matrix.json`:
 CUDA 12.8 for cu128 and CUDA 13.0 for cu130. GPU-backed builders and runtime
-validators both forward them as `runpodctl pod create --min-cuda-version`,
+validators both forward them as the REST v2 `gpu.minCudaVersion` field,
 preventing placement on a host whose driver cannot start the matching CUDA
 container. The build still hides the accelerator after container startup.
 
@@ -292,25 +310,26 @@ release job from running.
 
 ## Pod lifetime and cleanup
 
-Every default GPU builder and validator Pod combines independent lifetime
-controls:
+Every builder and validator Pod combines independent lifetime controls:
 
 - the Python orchestrator shares one monotonic hard deadline across Pod
   creation, SSH readiness, upload, commands, and artifact download;
-- Pod creation includes an absolute RFC3339 `--terminate-after` datetime set to
-  the hard timeout plus cleanup grace; and
 - after a Pod id exists, deletion always runs from a `finally` path and is
-  retried three times.
+  retried three times;
+- builder Pods (GPU and CPU) pass `RUNPOD_SELF_TERMINATE_SECONDS` to the
+  builder entrypoint, which arms the in-Pod deletion watchdog; and
+- `.github/workflows/reap-pods.yml` runs `tools/reap_pods.py` hourly. It deletes
+  every `sage-build-*` / `sage-test-*` Pod whose GitHub run attempt (named in
+  the Pod) has completed or no longer exists, or has been running for more than
+  360 minutes, and never touches any other Pod. Manual runs default to a dry
+  run.
 
-A deletion failure is a workflow failure rather than a warning. The absolute
-platform deadline remains the final protection against runner loss,
-cancellation, an image-start failure, or a workflow-side network partition.
-
-The explicit CPU fallback has the same orchestrator deadline and mandatory
-`finally` deletion, but its REST provisioning path has no verified platform
-deadline. It therefore must pass `RUNPOD_SELF_TERMINATE_SECONDS` to the builder
-entrypoint, which arms the reviewed in-Pod deletion watchdog. That watchdog is
-specific to the fallback and is never a replacement for orchestrator cleanup.
+A deletion failure is a workflow failure rather than a warning. REST v2 has no
+platform-side termination deadline (`--terminate-after` never took effect), so
+the `finally` path dies with the runner: a SIGKILLed, cancelled or lost runner
+leaves its Pod billing. Validation Pods run the ComfyUI runtime image, which has
+no watchdog, so the reaper is their only backstop; for builders it is the second
+one. The worst case is a leaked Pod billing until the next hourly sweep.
 
 Cancellation handling must still verify deletion in the Runpod console. Never
 assume an in-Pod watchdog ran: it cannot arm before the builder entrypoint

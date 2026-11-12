@@ -3,7 +3,6 @@ from __future__ import annotations
 import ast
 import io
 from dataclasses import FrozenInstanceError, replace
-from datetime import datetime, timezone
 import json
 import subprocess
 import sys
@@ -14,8 +13,10 @@ import threading
 import unittest
 from unittest import mock
 from pathlib import Path
+from urllib import error as urllib_error
 
 from tools.runpod_job import (
+    AUTH_PROBE_POD_ID,
     CapacityUnavailableError,
     CommandError,
     Deadline,
@@ -23,15 +24,16 @@ from tools.runpod_job import (
     JobError,
     JobSpec,
     PodRequest,
-    Runpodctl,
+    RestApiError,
+    RunpodApi,
     SSHTransport,
     VerifiedBuildAssignment,
     _extract_ssh_endpoint,
     _http_json,
     _make_repo_archive,
     _parser,
-    _rfc3339_after,
     _safe_extract,
+    _start_placement_round,
     run_job,
     verify_pod_assignment,
     wait_for_ssh,
@@ -51,25 +53,77 @@ class RecordingExecutor:
 
 
 class RecordingHttp:
-    def __init__(self, response: object) -> None:
-        self.response = response
+    """Fake REST transport: returns (or raises) queued responses in order."""
+
+    def __init__(self, *responses: object) -> None:
+        self.responses = list(responses)
         self.calls: list[
             tuple[str, str, dict[str, object] | None, dict[str, str], float]
         ] = []
 
     def __call__(self, method, url, payload, headers, timeout):
         self.calls.append(
-            (method, url, dict(payload) if payload is not None else None, dict(headers), timeout)
+            (method, url, json.loads(json.dumps(payload)) if payload is not None else None, dict(headers), timeout)
         )
-        return self.response
+        if not self.responses:
+            raise AssertionError(f"unexpected REST call: {method} {url}")
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+
+NO_CAPACITY = (
+    "There are no longer any instances available with the requested "
+    "specifications. Please refresh and try again."
+)
+# What an authorized key gets from check_auth's write probe.
+NOT_FOUND = RestApiError("POST", 404, "pod not found")
 
 
 def completed(stdout: str = "", stderr: str = "", code: int = 0):
     return subprocess.CompletedProcess([], code, stdout, stderr)
 
 
-class RunpodctlTests(unittest.TestCase):
-    def test_http_get_uses_no_json_body(self) -> None:
+def api(*responses: object, **env: str) -> tuple[RunpodApi, RecordingHttp]:
+    http = RecordingHttp(*responses)
+    return (
+        RunpodApi(http_executor=http, env={"RUNPOD_API_KEY": "test-secret", **env}),
+        http,
+    )
+
+
+CPU_REQUEST = PodRequest(
+    image="registry.invalid/builder@sha256:" + "a" * 64,
+    name="cpu-build",
+    public_key="ssh-ed25519 AAAA test",
+    compute_type="CPU",
+)
+GPU_VALIDATION_REQUEST = PodRequest(
+    image="registry.invalid/test@sha256:" + "b" * 64,
+    name="gpu-test",
+    public_key="ssh-ed25519 AAAA test",
+    compute_type="GPU",
+    gpu_id="NVIDIA GeForce RTX 4090",
+    min_cuda_version="12.8",
+)
+GPU_BUILD_REQUEST = PodRequest(
+    image="registry.invalid/builder@sha256:" + "e" * 64,
+    name="gpu-build",
+    public_key="ssh-ed25519 AAAA test",
+    compute_type="GPU",
+    gpu_id="NVIDIA A100 80GB PCIe",
+    min_cuda_version="12.8",
+    gpu_workload="BUILD",
+    gpu_min_vcpu_count=16,
+    gpu_min_memory_gb=64,
+    container_disk_gb=80,
+)
+
+
+class HttpTests(unittest.TestCase):
+    @staticmethod
+    def _response(body: bytes):
         class Response:
             def __enter__(self):
                 return self
@@ -78,62 +132,284 @@ class RunpodctlTests(unittest.TestCase):
                 return False
 
             def read(self):
-                return b'{"ok":true}'
+                return body
 
+        return Response()
+
+    def test_http_get_uses_no_json_body(self) -> None:
         with mock.patch(
             "tools.runpod_job.urllib_request.urlopen",
-            return_value=Response(),
+            return_value=self._response(b'{"ok":true}'),
         ) as urlopen:
             self.assertEqual(
                 _http_json("GET", "https://example.invalid/pod", None, {}, 5),
                 {"ok": True},
             )
-        request = urlopen.call_args.args[0]
-        self.assertIsNone(request.data)
+        self.assertIsNone(urlopen.call_args.args[0].data)
 
-    def test_cpu_create_sets_public_key_and_never_adds_gpu_flags(self) -> None:
-        executor = RecordingExecutor()
-        http = RecordingHttp({"id": "pod-cpu"})
-        ctl = Runpodctl(
-            executor=executor,
-            http_executor=http,
-            env={"RUNPOD_API_KEY": "test-secret"},
-        )
-        pod_id = ctl.create_pod(
-            PodRequest(
-                image="registry.invalid/builder@sha256:" + "a" * 64,
-                name="cpu-build",
-                public_key="ssh-ed25519 AAAA test",
-                compute_type="CPU",
-            ),
-            terminate_after="2026-08-18T05:00:00Z",
-            self_terminate_seconds=15_300,
-        )
+    def test_empty_body_is_no_content(self) -> None:
+        # REST v2 answers a successful DELETE with 204 and no body.
+        with mock.patch(
+            "tools.runpod_job.urllib_request.urlopen",
+            return_value=self._response(b""),
+        ):
+            self.assertIsNone(
+                _http_json("DELETE", "https://example.invalid/pod", None, {}, 5)
+            )
 
-        self.assertEqual(pod_id, "pod-cpu")
-        self.assertEqual(executor.calls, [])
+    def test_http_error_keeps_status_and_detail(self) -> None:
+        error = urllib_error.HTTPError(
+            "https://example.invalid/pods",
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(b'{"detail":"no instances"}'),
+        )
+        with mock.patch(
+            "tools.runpod_job.urllib_request.urlopen", side_effect=error
+        ), self.assertRaises(RestApiError) as raised:
+            _http_json("POST", "https://example.invalid/pods", {}, {}, 5)
+        self.assertEqual(raised.exception.status, 400)
+        self.assertIn("no instances", raised.exception.detail)
+
+    def test_invalid_json_is_an_error(self) -> None:
+        with mock.patch(
+            "tools.runpod_job.urllib_request.urlopen",
+            return_value=self._response(b"not-json"),
+        ), self.assertRaisesRegex(CommandError, "invalid JSON"):
+            _http_json("GET", "https://example.invalid/pod", None, {}, 5)
+
+
+class RunpodApiTests(unittest.TestCase):
+    def test_requests_use_v2_bearer_auth_and_explicit_agent(self) -> None:
+        ctl, http = api({"items": []}, NOT_FOUND)
+        ctl.check_auth()
         method, url, payload, headers, _ = http.calls[0]
-        assert payload is not None
-        self.assertEqual(method, "POST")
-        self.assertEqual(url, "https://rest.runpod.io/v1/pods")
+        self.assertEqual((method, url), ("GET", "https://api.runpod.io/v2/pods?limit=1"))
+        self.assertIsNone(payload)
         self.assertEqual(headers["Authorization"], "Bearer test-secret")
-        self.assertEqual(payload["computeType"], "CPU")
-        self.assertEqual(payload["containerDiskInGb"], 80)
-        self.assertEqual(payload["volumeInGb"], 0)
-        self.assertEqual(payload["volumeMountPath"], "/workspace")
-        self.assertEqual(payload["cpuFlavorIds"], ["cpu3g"])
-        self.assertEqual(payload["vcpuCount"], 16)
-        self.assertTrue(payload["supportPublicIp"])
-        self.assertEqual(payload["ports"], ["22/tcp"])
+        # Cloudflare answers urllib's default agent with 403 error code 1010.
+        self.assertNotIn("Python-urllib", headers.get("User-Agent", "Python-urllib"))
+
+    def test_rejected_key_fails_the_auth_check(self) -> None:
+        ctl, _ = api(RestApiError("GET", 401, "missing bearer token"))
+        with self.assertRaisesRegex(CommandError, "HTTP 401"):
+            ctl.check_auth()
+
+    def test_auth_check_proves_write_access_without_side_effects(self) -> None:
+        for answer in (
+            RestApiError("POST", 404, "resource not found"),  # the v2 spec's body
+            NOT_FOUND,
+            RestApiError("POST", 400, "invalid pod id"),
+        ):
+            with self.subTest(status=answer.status, detail=answer.detail):
+                ctl, http = api({"items": []}, answer)
+                ctl.check_auth()
+                method, url, payload, _, _ = http.calls[1]
+                self.assertEqual(method, "POST")
+                # v2 replaced v1's POST /pods/{id}/stop with /action.
+                self.assertEqual(
+                    url,
+                    "https://api.runpod.io/v2/pods/"
+                    f"{AUTH_PROBE_POD_ID}/action",
+                )
+                self.assertEqual(payload, {"action": "stop"})
+
+    def test_read_only_key_fails_the_auth_check(self) -> None:
+        for status in (401, 403):
+            with self.subTest(status=status):
+                ctl, _ = api({"items": []}, RestApiError("POST", status, "denied"))
+                with self.assertRaisesRegex(CommandError, "read/write Pod access"):
+                    ctl.check_auth()
+
+    def test_unexplained_probe_answer_fails_the_auth_check(self) -> None:
+        # A 404 from an unknown route (or any other status) says nothing about
+        # the key, so it must not pass as proof of write access.
+        for answer in (
+            RestApiError("POST", 404, "404 page not found"),
+            RestApiError("POST", 405, "method not allowed"),
+            RestApiError("POST", 409, "conflict"),
+        ):
+            with self.subTest(status=answer.status, detail=answer.detail):
+                ctl, _ = api({"items": []}, answer)
+                with self.assertRaisesRegex(CommandError, "cannot confirm"):
+                    ctl.check_auth()
+
+    def test_list_pods_accepts_a_bare_or_wrapped_list(self) -> None:
+        pods = [{"id": "a", "name": "sage-test-x"}]
+        for payload in (pods, {"items": pods}):
+            with self.subTest(payload=type(payload).__name__):
+                ctl, http = api(payload)
+                self.assertEqual(ctl.list_pods(), pods)
+                self.assertEqual(http.calls[0][:2], ("GET", "https://api.runpod.io/v2/pods"))
+        ctl, _ = api({"error": "x"})
+        with self.assertRaisesRegex(CommandError, "no list of Pods"):
+            ctl.list_pods()
+
+    def test_cpu_create_uses_v2_shape_and_arms_the_watchdog(self) -> None:
+        ctl, http = api({"id": "pod-cpu"})
         self.assertEqual(
-            payload["env"],
+            ctl.create_pod(CPU_REQUEST, self_terminate_seconds=15_300), "pod-cpu"
+        )
+        method, url, payload, _, _ = http.calls[0]
+        assert payload is not None
+        self.assertEqual((method, url), ("POST", "https://api.runpod.io/v2/pods"))
+        self.assertEqual(
+            payload,
             {
-                "PUBLIC_KEY": "ssh-ed25519 AAAA test",
-                "RUNPOD_SELF_TERMINATE_SECONDS": "15300",
+                "name": "cpu-build",
+                "image": CPU_REQUEST.image,
+                "cloud": "COMMUNITY",
+                "disk": 80,
+                "ports": ["22/tcp"],
+                "env": {
+                    "PUBLIC_KEY": "ssh-ed25519 AAAA test",
+                    "RUNPOD_SELF_TERMINATE_SECONDS": "15300",
+                },
+                "cpu": {"id": "cpu3g", "vcpuCount": 16},
             },
         )
-        self.assertNotIn("gpuTypeIds", payload)
 
+    def test_cpu_create_walks_flavors_in_order_on_capacity(self) -> None:
+        ctl, http = api(
+            RestApiError("POST", 400, NO_CAPACITY),
+            {"id": "pod-cpu"},
+        )
+        request = replace(CPU_REQUEST, cpu_flavor_ids=("cpu3g", "cpu5c"))
+        self.assertEqual(
+            ctl.create_pod(request, self_terminate_seconds=15_300), "pod-cpu"
+        )
+        self.assertEqual(
+            [call[2]["cpu"]["id"] for call in http.calls], ["cpu3g", "cpu5c"]
+        )
+
+    def test_cpu_create_raises_capacity_when_every_flavor_is_full(self) -> None:
+        ctl, _ = api(
+            RestApiError("POST", 400, "first: " + NO_CAPACITY),
+            RestApiError("POST", 400, "last: " + NO_CAPACITY),
+        )
+        request = replace(CPU_REQUEST, cpu_flavor_ids=("cpu3g", "cpu5c"))
+        with self.assertRaisesRegex(CapacityUnavailableError, "last"):
+            ctl.create_pod(request, self_terminate_seconds=15_300)
+
+    def test_gpu_validation_create_carries_cuda_floor_without_build_extras(self) -> None:
+        ctl, http = api({"id": "pod-gpu"})
+        self.assertEqual(
+            ctl.create_pod(GPU_VALIDATION_REQUEST, self_terminate_seconds=1_200),
+            "pod-gpu",
+        )
+        payload = http.calls[0][2]
+        assert payload is not None
+        self.assertEqual(
+            payload["gpu"],
+            {"id": "NVIDIA GeForce RTX 4090", "count": 1, "minCudaVersion": "12.8"},
+        )
+        self.assertNotIn("cpu", payload)
+        self.assertNotIn("mounts", payload)
+        # The ComfyUI validation image has no watchdog to arm.
+        self.assertEqual(payload["env"], {"PUBLIC_KEY": "ssh-ed25519 AAAA test"})
+
+    def test_gpu_build_create_filters_placement_and_arms_the_watchdog(self) -> None:
+        ctl, http = api({"id": "pod-gpu-build"})
+        ctl.create_pod(GPU_BUILD_REQUEST, self_terminate_seconds=15_300)
+        payload = http.calls[0][2]
+        assert payload is not None
+        self.assertEqual(
+            payload["gpu"],
+            {
+                "id": "NVIDIA A100 80GB PCIe",
+                "count": 1,
+                "minCudaVersion": "12.8",
+                "minVcpuCountPerGpu": 16,
+                "minRamPerGpu": 64,
+            },
+        )
+        self.assertEqual(payload["disk"], 80)
+        self.assertNotIn("mounts", payload)
+        self.assertEqual(payload["env"]["RUNPOD_SELF_TERMINATE_SECONDS"], "15300")
+
+    def test_create_forwards_registry_data_centers_and_cloud(self) -> None:
+        ctl, http = api({"id": "pod-cpu"})
+        ctl.create_pod(
+            replace(
+                CPU_REQUEST,
+                cloud_type="SECURE",
+                registry_auth_id="registry-auth",
+                data_center_ids="EU-RO-1, CA-MTL-1",
+            ),
+            self_terminate_seconds=15_300,
+        )
+        payload = http.calls[0][2]
+        assert payload is not None
+        self.assertEqual(payload["registry"], "registry-auth")
+        self.assertEqual(payload["dataCenterIds"], ["EU-RO-1", "CA-MTL-1"])
+        self.assertEqual(payload["cloud"], "SECURE")
+
+    def test_non_production_api_url_reaches_requests_and_watchdog(self) -> None:
+        ctl, http = api({"id": "pod-cpu"}, RUNPOD_API_URL="https://api.runpod.dev/v2/")
+        ctl.create_pod(CPU_REQUEST, self_terminate_seconds=15_300)
+        _, url, payload, _, _ = http.calls[0]
+        assert payload is not None
+        self.assertEqual(url, "https://api.runpod.dev/v2/pods")
+        self.assertEqual(payload["env"]["RUNPOD_API_URL"], "https://api.runpod.dev/v2")
+
+    def test_empty_api_url_variable_means_production(self) -> None:
+        ctl, http = api({"items": []}, NOT_FOUND, RUNPOD_API_URL="")
+        ctl.check_auth()
+        self.assertTrue(http.calls[0][1].startswith("https://api.runpod.io/v2/"))
+
+    def test_create_classifies_only_documented_placement_failures(self) -> None:
+        for detail in (NO_CAPACITY, "Insufficient resources"):
+            with self.subTest(detail=detail):
+                ctl, _ = api(RestApiError("POST", 400, detail))
+                with self.assertRaises(CapacityUnavailableError):
+                    ctl.create_pod(GPU_BUILD_REQUEST, self_terminate_seconds=15_300)
+        # A malformed request and a key that may not create Pods fail on the
+        # first candidate instead of sitting through every placement round.
+        failures = [(400, "invalid gpu id"), (403, NO_CAPACITY)]
+        failures += [(status, "x") for status in (401, 402, 403, 422, 500)]
+        for status, detail in failures:
+            with self.subTest(status=status, detail=detail):
+                ctl, _ = api(RestApiError("POST", status, detail))
+                with self.assertRaises(CommandError) as raised:
+                    ctl.create_pod(GPU_BUILD_REQUEST, self_terminate_seconds=15_300)
+                self.assertNotIsInstance(raised.exception, CapacityUnavailableError)
+
+    def test_create_requires_a_pod_id(self) -> None:
+        ctl, _ = api({"name": "no-id"})
+        with self.assertRaisesRegex(CommandError, "did not contain a Pod id"):
+            ctl.create_pod(CPU_REQUEST, self_terminate_seconds=15_300)
+
+    def test_pod_reads_are_single_pod_gets_without_a_body(self) -> None:
+        ctl, http = api({"id": "pod-1"}, {"id": "pod-1"})
+        self.assertEqual(ctl.pod_details("pod-1")["id"], "pod-1")
+        self.assertEqual(ctl.assignment_details("pod-1")["id"], "pod-1")
+        for method, url, payload, _, _ in http.calls:
+            self.assertEqual((method, url), ("GET", "https://api.runpod.io/v2/pods/pod-1"))
+            self.assertIsNone(payload)
+
+    def test_terminate_deletes_and_treats_missing_pod_as_done(self) -> None:
+        ctl, http = api(None, RestApiError("DELETE", 404, "pod not found"))
+        ctl.terminate_pod("pod-1")
+        ctl.terminate_pod("pod-1")
+        self.assertEqual(
+            [(c[0], c[1]) for c in http.calls],
+            [("DELETE", "https://api.runpod.io/v2/pods/pod-1")] * 2,
+        )
+
+    def test_terminate_surfaces_other_failures(self) -> None:
+        ctl, _ = api(RestApiError("DELETE", 500, "boom"))
+        with self.assertRaisesRegex(CommandError, "HTTP 500"):
+            ctl.terminate_pod("pod-1")
+
+    def test_self_terminate_deadline_is_bounded(self) -> None:
+        ctl, _ = api()
+        for seconds in (599, 21_601):
+            with self.subTest(seconds=seconds), self.assertRaises(ValueError):
+                ctl.create_pod(CPU_REQUEST, self_terminate_seconds=seconds)
+
+
+class PodRequestTests(unittest.TestCase):
     def test_cpu_request_requires_measured_container_disk_minimum(self) -> None:
         with self.assertRaisesRegex(ValueError, "at least 80 GB container disk"):
             PodRequest(
@@ -142,116 +418,6 @@ class RunpodctlTests(unittest.TestCase):
                 public_key="ssh-ed25519 AAAA test",
                 container_disk_gb=79,
             ).validate()
-
-    def test_gpu_create_requires_exact_id_and_forwards_cuda_floor(self) -> None:
-        executor = RecordingExecutor(completed('{"pod":{"id":"pod-gpu"}}'))
-        ctl = Runpodctl(executor=executor)
-        pod_id = ctl.create_pod(
-            PodRequest(
-                image="registry.invalid/test@sha256:" + "b" * 64,
-                name="gpu-test",
-                public_key="ssh-ed25519 AAAA test",
-                compute_type="GPU",
-                gpu_id="NVIDIA RTX 4090",
-                min_cuda_version="12.8",
-            ),
-            terminate_after="2026-08-18T05:00:00Z",
-            self_terminate_seconds=15_300,
-        )
-
-        self.assertEqual(pod_id, "pod-gpu")
-        argv = executor.calls[0][0]
-        self.assertEqual(argv[argv.index("--gpu-id") + 1], "NVIDIA RTX 4090")
-        self.assertEqual(argv[argv.index("--gpu-count") + 1], "1")
-        self.assertEqual(argv[argv.index("--min-cuda-version") + 1], "12.8")
-        self.assertNotIn("--compute-type", argv)
-        self.assertNotIn("--volume-in-gb", argv)
-        self.assertIn("--public-ip", argv)
-        self.assertEqual(
-            argv[argv.index("--terminate-after") + 1],
-            "2026-08-18T05:00:00Z",
-        )
-
-    def test_gpu_build_create_preserves_deadline_and_disables_volume(self) -> None:
-        executor = RecordingExecutor(completed('{"id":"pod-gpu-build"}'))
-        ctl = Runpodctl(executor=executor)
-        pod_id = ctl.create_pod(
-            PodRequest(
-                image="registry.invalid/builder@sha256:" + "e" * 64,
-                name="gpu-build",
-                public_key="ssh-ed25519 AAAA test",
-                compute_type="GPU",
-                gpu_id="NVIDIA A100 80GB PCIe",
-                min_cuda_version="12.8",
-                gpu_workload="BUILD",
-                gpu_min_vcpu_count=4,
-                gpu_min_memory_gb=32,
-                container_disk_gb=80,
-            ),
-            terminate_after="2026-08-18T05:00:00Z",
-            self_terminate_seconds=15_300,
-        )
-
-        self.assertEqual(pod_id, "pod-gpu-build")
-        argv = executor.calls[0][0]
-        self.assertEqual(
-            argv[argv.index("--gpu-id") + 1], "NVIDIA A100 80GB PCIe"
-        )
-        self.assertEqual(argv[argv.index("--container-disk-in-gb") + 1], "80")
-        self.assertEqual(argv[argv.index("--volume-in-gb") + 1], "0")
-        self.assertEqual(
-            argv[argv.index("--terminate-after") + 1],
-            "2026-08-18T05:00:00Z",
-        )
-
-    def test_gpu_create_classifies_only_explicit_capacity_failure(self) -> None:
-        request = PodRequest(
-            image="registry.invalid/builder@sha256:" + "e" * 64,
-            name="gpu-build",
-            public_key="ssh-ed25519 AAAA test",
-            compute_type="GPU",
-            gpu_id="NVIDIA A100 80GB PCIe",
-            gpu_workload="BUILD",
-        )
-        capacity_messages = (
-            "Error: There are no longer any instances available with the "
-            "requested specifications.",
-            "Error: This machine does not have the resources to deploy your pod. "
-            "Please try a different machine",
-        )
-        for message in capacity_messages:
-            with self.subTest(message=message):
-                capacity = completed(stderr=message, code=1)
-                with self.assertRaises(CapacityUnavailableError):
-                    Runpodctl(executor=RecordingExecutor(capacity)).create_pod(
-                        request,
-                        terminate_after="2026-08-18T05:00:00Z",
-                        self_terminate_seconds=15_300,
-                    )
-
-        near_match = completed(
-            stderr=(
-                "Error: This machine does not have permission to deploy your pod. "
-                "Please try a different machine"
-            ),
-            code=1,
-        )
-        with self.assertRaises(CommandError) as raised:
-            Runpodctl(executor=RecordingExecutor(near_match)).create_pod(
-                request,
-                terminate_after="2026-08-18T05:00:00Z",
-                self_terminate_seconds=15_300,
-            )
-        self.assertNotIsInstance(raised.exception, CapacityUnavailableError)
-
-        unauthorized = completed(stderr="Error: unauthorized", code=1)
-        with self.assertRaises(CommandError) as raised:
-            Runpodctl(executor=RecordingExecutor(unauthorized)).create_pod(
-                request,
-                terminate_after="2026-08-18T05:00:00Z",
-                self_terminate_seconds=15_300,
-            )
-        self.assertNotIsInstance(raised.exception, CapacityUnavailableError)
 
     def test_gpu_build_request_enforces_compilation_minima(self) -> None:
         request = PodRequest(
@@ -310,416 +476,242 @@ class RunpodctlTests(unittest.TestCase):
         self.assertIn("4 required; 16 recommended", help_text)
         self.assertIn("32 GB required; 64 GB recommended", help_text)
 
-    def test_nonzero_runpodctl_result_is_an_error(self) -> None:
-        ctl = Runpodctl(executor=RecordingExecutor(completed(stderr="denied", code=1)))
-        with self.assertRaisesRegex(CommandError, "denied"):
-            ctl.check_auth()
-
-    def test_invalid_json_is_an_error(self) -> None:
-        ctl = Runpodctl(executor=RecordingExecutor(completed("not-json")))
-        with self.assertRaisesRegex(CommandError, "invalid JSON"):
-            ctl.pod_details("pod-1")
-
-    def test_pinned_cli_termination_backstop_uses_rfc3339_datetime(self) -> None:
-        now = datetime(2026, 8, 18, 0, 45, tzinfo=timezone.utc)
-        self.assertEqual(
-            _rfc3339_after(14_400 + 900, now=now),
-            "2026-08-18T05:00:00Z",
-        )
-        with self.assertRaises(ValueError):
-            _rfc3339_after(0, now=now)
-
-    def test_cpu_rest_forwards_registry_and_exact_placement_inputs(self) -> None:
-        http = RecordingHttp({"id": "pod-cpu"})
-        ctl = Runpodctl(
-            executor=RecordingExecutor(),
-            http_executor=http,
-            env={"RUNPOD_API_KEY": "secret"},
-        )
-        ctl.create_pod(
-            PodRequest(
-                image="registry.invalid/builder@sha256:" + "d" * 64,
-                name="cpu-build",
-                public_key="ssh-ed25519 AAAA test",
-                compute_type="CPU",
-                cloud_type="SECURE",
-                registry_auth_id="registry-auth",
-                data_center_ids="EU-RO-1, CA-MTL-1",
-                cpu_flavor_ids=("cpu3g", "cpu5g"),
-                cpu_vcpu_count=16,
-            ),
-            terminate_after="2026-08-18T05:00:00Z",
-            self_terminate_seconds=15_300,
-        )
-        payload = http.calls[0][2]
-        assert payload is not None
-        self.assertEqual(payload["containerRegistryAuthId"], "registry-auth")
-        self.assertEqual(payload["dataCenterIds"], ["EU-RO-1", "CA-MTL-1"])
-        self.assertEqual(payload["cpuFlavorIds"], ["cpu3g", "cpu5g"])
-        self.assertFalse(payload["supportPublicIp"])
-
-    def test_assignment_get_has_no_request_body(self) -> None:
-        http = RecordingHttp({"id": "pod-1", "image": "example/image:tag"})
-        ctl = Runpodctl(
-            executor=RecordingExecutor(),
-            http_executor=http,
-            env={"RUNPOD_API_KEY": "secret"},
-        )
-        self.assertEqual(ctl.assignment_details("pod-1")["id"], "pod-1")
-        method, url, payload, _, _ = http.calls[0]
-        self.assertEqual(method, "GET")
-        self.assertEqual(
-            url,
-            "https://rest.runpod.io/v1/pods/pod-1?includeMachine=true",
-        )
-        self.assertIsNone(payload)
 
 
 class EndpointTests(unittest.TestCase):
-    def test_extracts_current_ssh_shape(self) -> None:
-        endpoint = _extract_ssh_endpoint({"ssh": {"ip": "203.0.113.1", "port": 22001}})
+    def test_extracts_v2_direct_ssh(self) -> None:
+        endpoint = _extract_ssh_endpoint(
+            {"ssh": {"direct": {"host": "203.0.113.1", "port": 22001, "username": "root"}}}
+        )
         self.assertEqual(endpoint, Endpoint("203.0.113.1", 22001))
 
-    def test_extracts_runtime_port_shape(self) -> None:
-        endpoint = _extract_ssh_endpoint(
-            {
-                "runtime": {
-                    "ports": [
-                        {"privatePort": 8888, "publicPort": 1234, "ip": "bad"},
-                        {"privatePort": 22, "publicPort": 22002, "ip": "198.51.100.8"},
-                    ]
-                }
-            }
-        )
-        self.assertEqual(endpoint, Endpoint("198.51.100.8", 22002))
+    def test_ignores_proxy_only_or_incomplete_ssh(self) -> None:
+        # The SSH proxy cannot carry the SCP upload and artifact download.
+        for payload in (
+            {"ssh": {"proxy": {"host": "ssh.runpod.io", "port": 22}, "direct": None}},
+            {"ssh": {"direct": {"host": "203.0.113.1"}}},
+            {"ssh": {"direct": {"host": "203.0.113.1", "port": "not-a-port"}}},
+            {"ssh": None},
+            {},
+        ):
+            with self.subTest(payload=payload):
+                self.assertIsNone(_extract_ssh_endpoint(payload))
 
-    def test_extracts_official_rest_public_ip_shape(self) -> None:
-        endpoint = _extract_ssh_endpoint(
-            {"publicIp": "192.0.2.9", "portMappings": {"22": 22123}}
-        )
-        self.assertEqual(endpoint, Endpoint("192.0.2.9", 22123))
-
-    def test_waits_for_endpoint_and_requires_successful_probe(self) -> None:
+    def test_waits_for_running_direct_ssh_and_a_successful_probe(self) -> None:
         class FakeCtl:
             def __init__(self):
                 self.responses = [
-                    {"status": "RUNNING", "ssh": {}},
-                    {"status": "RUNNING", "ssh": {"ip": "host", "port": 22}},
+                    {"status": "PROVISIONING", "ssh": {"direct": None}},
+                    # v2 can report a mapping before RUNNING; do not probe it.
+                    {"status": "STARTING", "ssh": {"direct": {"host": "early", "port": 1}}},
+                    {"status": "RUNNING", "ssh": {"direct": {"host": "host", "port": 22}}},
                 ]
 
             def pod_details(self, pod_id, timeout):
                 return self.responses.pop(0)
 
         class FakeTransport:
+            def __init__(self):
+                self.probed: list[Endpoint] = []
+
             def probe(self, endpoint, timeout):
+                self.probed.append(endpoint)
                 return True
 
+        transport = FakeTransport()
         endpoint = wait_for_ssh(
             FakeCtl(),  # type: ignore[arg-type]
-            FakeTransport(),  # type: ignore[arg-type]
+            transport,  # type: ignore[arg-type]
             "pod-1",
             Deadline(10),
             poll_seconds=0.01,
             sleep=lambda _: None,
         )
         self.assertEqual(endpoint, Endpoint("host", 22))
+        self.assertEqual(transport.probed, [Endpoint("host", 22)])
 
     def test_terminal_state_stops_waiting(self) -> None:
-        class FakeCtl:
-            def pod_details(self, pod_id, timeout):
-                return {"desiredStatus": "FAILED"}
+        for status in ("ERROR", "EXITED", "TERMINATED"):
+            class FakeCtl:
+                def pod_details(self, pod_id, timeout, status=status):
+                    return {"status": status}
 
-        with self.assertRaisesRegex(JobError, "terminal state FAILED"):
-            wait_for_ssh(
-                FakeCtl(),  # type: ignore[arg-type]
-                object(),  # type: ignore[arg-type]
-                "pod-1",
-                Deadline(10),
-                sleep=lambda _: None,
-            )
+            with self.subTest(status=status), self.assertRaisesRegex(
+                JobError, f"terminal state {status}"
+            ):
+                wait_for_ssh(
+                    FakeCtl(),  # type: ignore[arg-type]
+                    object(),  # type: ignore[arg-type]
+                    "pod-1",
+                    Deadline(10),
+                    sleep=lambda _: None,
+                )
+
+
+class FakeAssignmentCtl:
+    def __init__(self, details):
+        self.details = details
+
+    def assignment_details(self, pod_id, timeout):
+        return self.details
+
+
+CPU_BUILD_IMAGE = "registry.invalid/builder@sha256:" + "a" * 64
+GPU_BUILD_IMAGE = "registry.invalid/builder@sha256:" + "e" * 64
+RUNTIME_IMAGE = "registry.invalid/runtime@sha256:" + "b" * 64
+CPU_POD = {
+    "image": CPU_BUILD_IMAGE,
+    "cpu": {"id": "cpu3g", "vcpuCount": 16, "memory": 62},
+    "disk": 80,
+    "mounts": {"persistent": None, "network": [], "global": []},
+}
+GPU_BUILD_POD = {
+    "image": GPU_BUILD_IMAGE,
+    "gpu": {"id": "NVIDIA A100 80GB PCIe", "count": 1, "vcpuCount": 4, "memory": 32},
+    "disk": 80,
+}
+
+
+def without(mapping, key):
+    return {k: v for k, v in mapping.items() if k != key}
 
 
 class AssignmentTests(unittest.TestCase):
-    def test_cpu_assignment_is_bound_to_image_and_minimum_resources(self) -> None:
-        class FakeCtl:
-            def assignment_details(self, pod_id, timeout):
-                return {
-                    "image": "registry.invalid/builder@sha256:" + "a" * 64,
-                    "cpuFlavorId": "cpu3g",
-                    "vcpuCount": 16,
-                    "memoryInGb": 62,
-                    "containerDiskInGb": 80,
-                    "volumeInGb": 0,
-                }
+    cpu_request = PodRequest(
+        image=CPU_BUILD_IMAGE,
+        name="cpu-build",
+        public_key="ssh-ed25519 AAAA test",
+        compute_type="CPU",
+    )
+    gpu_build_request = PodRequest(
+        image=GPU_BUILD_IMAGE,
+        name="gpu-build",
+        public_key="ssh-ed25519 AAAA test",
+        compute_type="GPU",
+        gpu_id="NVIDIA A100 80GB PCIe",
+        gpu_workload="BUILD",
+    )
+    validation_request = PodRequest(
+        image=RUNTIME_IMAGE,
+        name="gpu-validation",
+        public_key="ssh-ed25519 AAAA test",
+        compute_type="GPU",
+        gpu_id="NVIDIA RTX 4090",
+    )
 
-        assignment = verify_pod_assignment(
-            FakeCtl(),  # type: ignore[arg-type]
+    def verify(self, details, request):
+        return verify_pod_assignment(
+            FakeAssignmentCtl(details),  # type: ignore[arg-type]
             "pod-1",
-            PodRequest(
-                image="registry.invalid/builder@sha256:" + "a" * 64,
-                name="cpu-build",
-                public_key="ssh-ed25519 AAAA test",
-                compute_type="CPU",
-            ),
+            request,
             Deadline(10),
         )
+
+    def test_cpu_assignment_is_bound_to_image_and_minimum_resources(self) -> None:
+        assignment = self.verify(CPU_POD, self.cpu_request)
         self.assertEqual(
             assignment,
-            VerifiedBuildAssignment(
-                vcpu_count=16,
-                assigned_memory_bytes=62_000_000_000,
-            ),
+            VerifiedBuildAssignment(vcpu_count=16, assigned_memory_bytes=62_000_000_000),
         )
         assert assignment is not None
         with self.assertRaises(FrozenInstanceError):
             assignment.vcpu_count = 32  # type: ignore[misc]
 
+    def test_cpu_assignment_without_mounts_has_no_volume(self) -> None:
+        # REST v2 attaches no persistent volume unless one was requested.
+        self.assertIsNotNone(self.verify(without(CPU_POD, "mounts"), self.cpu_request))
+
     def test_cpu_assignment_rejects_service_drift(self) -> None:
-        class FakeCtl:
-            def assignment_details(self, pod_id, timeout):
-                return {
-                    "imageName": "wrong/image:latest",
-                    "cpuFlavorId": "cpu3c",
-                    "vcpuCount": 2,
-                    "memoryInGb": 4,
-                }
-
-        with self.assertRaisesRegex(JobError, "Pod image mismatch"):
-            verify_pod_assignment(
-                FakeCtl(),  # type: ignore[arg-type]
-                "pod-1",
-                PodRequest(
-                    image="registry.invalid/builder@sha256:" + "a" * 64,
-                    name="cpu-build",
-                    public_key="ssh-ed25519 AAAA test",
-                    compute_type="CPU",
-                ),
-                Deadline(10),
-            )
-
-    def test_cpu_assignment_rejects_disk_or_volume_drift(self) -> None:
-        base = {
-            "imageName": "registry.invalid/builder@sha256:" + "a" * 64,
-            "cpuFlavorId": "cpu3g",
-            "vcpuCount": 16,
-            "memoryInGb": 62,
-            "containerDiskInGb": 80,
-            "volumeInGb": 0,
-        }
-
-        class FakeCtl:
-            def __init__(self, details):
-                self.details = details
-
-            def assignment_details(self, pod_id, timeout):
-                return self.details
-
-        request = PodRequest(
-            image=base["imageName"],
-            name="cpu-build",
-            public_key="ssh-ed25519 AAAA test",
-        )
-        for field, value, message in (
-            ("containerDiskInGb", 79, "container disk mismatch"),
-            ("volumeInGb", 20, "unexpected paid Pod volume"),
+        cpu = CPU_POD["cpu"]
+        for details, message in (
+            ({**CPU_POD, "image": "wrong/image:latest"}, "Pod image mismatch"),
+            ({**CPU_POD, "cpu": {**cpu, "id": "cpu3c"}}, "CPU flavor mismatch"),
+            ({**CPU_POD, "cpu": {**cpu, "vcpuCount": 2}}, "CPU count mismatch"),
+            ({**CPU_POD, "cpu": {**cpu, "memory": 4}}, "memory mismatch"),
+            ({**CPU_POD, "disk": 79}, "container disk mismatch"),
+            (
+                {**CPU_POD, "mounts": {"persistent": {"size": 20, "path": "/workspace"}}},
+                "unexpected paid Pod volume",
+            ),
         ):
-            with self.subTest(field=field), self.assertRaisesRegex(JobError, message):
-                verify_pod_assignment(
-                    FakeCtl({**base, field: value}),  # type: ignore[arg-type]
-                    "pod-1",
-                    request,
-                    Deadline(10),
-                )
+            with self.subTest(message=message), self.assertRaisesRegex(
+                JobError, message
+            ):
+                self.verify(details, self.cpu_request)
 
     def test_gpu_validation_assignment_retains_light_contract(self) -> None:
-        class FakeCtl:
-            def assignment_details(self, pod_id, timeout):
-                return {
-                    "image": "registry.invalid/runtime@sha256:" + "b" * 64,
-                    "gpu": {"id": "NVIDIA RTX 4090"},
-                }
-
-        assignment = verify_pod_assignment(
-            FakeCtl(),  # type: ignore[arg-type]
-            "pod-validation",
-            PodRequest(
-                image="registry.invalid/runtime@sha256:" + "b" * 64,
-                name="gpu-validation",
-                public_key="ssh-ed25519 AAAA test",
-                compute_type="GPU",
-                gpu_id="NVIDIA RTX 4090",
-            ),
-            Deadline(10),
-        )
-        self.assertIsNone(assignment)
+        details = {"image": RUNTIME_IMAGE, "gpu": {"id": "NVIDIA RTX 4090"}}
+        self.assertIsNone(self.verify(details, self.validation_request))
 
     def test_gpu_validation_assignment_requires_exact_gpu_id(self) -> None:
-        class FakeCtl:
-            def assignment_details(self, pod_id, timeout):
-                return {
-                    "image": "registry.invalid/runtime@sha256:" + "b" * 64,
-                    "gpuTypeId": "NVIDIA L40S",
-                }
-
-        request = PodRequest(
-            image="registry.invalid/runtime@sha256:" + "b" * 64,
-            name="gpu-validation",
-            public_key="ssh-ed25519 AAAA test",
-            compute_type="GPU",
-            gpu_id="NVIDIA RTX 4090",
-        )
-        with self.assertRaisesRegex(JobError, "GPU type mismatch"):
-            verify_pod_assignment(
-                FakeCtl(),  # type: ignore[arg-type]
-                "pod-validation",
-                request,
-                Deadline(10),
-            )
-
-    def test_gpu_assignment_rejects_conflicting_documented_ids(self) -> None:
-        class FakeCtl:
-            def assignment_details(self, pod_id, timeout):
-                return {
-                    "image": "registry.invalid/runtime@sha256:" + "b" * 64,
-                    "gpu": {"id": "NVIDIA A100 80GB PCIe"},
-                    "machine": {"gpuTypeId": "NVIDIA H100 PCIe"},
-                }
-
-        request = PodRequest(
-            image="registry.invalid/runtime@sha256:" + "b" * 64,
-            name="gpu-validation",
-            public_key="ssh-ed25519 AAAA test",
-            compute_type="GPU",
-            gpu_id="NVIDIA A100 80GB PCIe",
-        )
-        with self.assertRaisesRegex(JobError, "GPU type mismatch"):
-            verify_pod_assignment(
-                FakeCtl(),  # type: ignore[arg-type]
-                "pod-validation",
-                request,
-                Deadline(10),
-            )
-
-    def test_gpu_build_assignment_accepts_documented_gpu_id_shapes(self) -> None:
-        base = {
-            "image": "registry.invalid/builder@sha256:" + "e" * 64,
-            "vcpuCount": 4,
-            "memoryInGb": 32,
-            "containerDiskInGb": 80,
-            "volumeInGb": 0,
-        }
-        request = PodRequest(
-            image=base["image"],
-            name="gpu-build",
-            public_key="ssh-ed25519 AAAA test",
-            compute_type="GPU",
-            gpu_id="NVIDIA A100 80GB PCIe",
-            gpu_workload="BUILD",
-        )
-
-        class FakeCtl:
-            def __init__(self, details):
-                self.details = details
-
-            def assignment_details(self, pod_id, timeout):
-                return self.details
-
-        for gpu_fields in (
-            {"gpuTypeId": "NVIDIA A100 80GB PCIe"},
-            {"gpu": {"id": "NVIDIA A100 80GB PCIe"}},
-            {"machine": {"gpuTypeId": "NVIDIA A100 80GB PCIe"}},
-            {
-                "machine": {
-                    "gpuType": {"id": "NVIDIA A100 80GB PCIe"},
-                }
-            },
+        for details in (
+            {"image": RUNTIME_IMAGE, "gpu": {"id": "NVIDIA L40S"}},
+            {"image": RUNTIME_IMAGE},
         ):
-            with self.subTest(gpu_fields=gpu_fields):
-                assignment = verify_pod_assignment(
-                    FakeCtl({**base, **gpu_fields}),  # type: ignore[arg-type]
-                    "pod-gpu-build",
-                    request,
-                    Deadline(10),
-                )
-                self.assertEqual(
-                    assignment,
-                    VerifiedBuildAssignment(4, 32_000_000_000),
-                )
+            with self.subTest(details=details), self.assertRaisesRegex(
+                JobError, "GPU type mismatch"
+            ):
+                self.verify(details, self.validation_request)
+
+    def test_gpu_build_assignment_returns_verified_resources(self) -> None:
+        self.assertEqual(
+            self.verify(GPU_BUILD_POD, self.gpu_build_request),
+            VerifiedBuildAssignment(4, 32_000_000_000),
+        )
 
     def test_gpu_build_assignment_fails_closed_on_resource_drift(self) -> None:
-        base = {
-            "imageName": "registry.invalid/builder@sha256:" + "e" * 64,
-            "gpuTypeId": "NVIDIA A100 80GB PCIe",
-            "vcpuCount": 4,
-            "memoryInGb": 32,
-            "containerDiskInGb": 80,
-            "volumeInGb": 0,
-        }
-        request = PodRequest(
-            image=base["imageName"],
-            name="gpu-build",
-            public_key="ssh-ed25519 AAAA test",
-            compute_type="GPU",
-            gpu_id="NVIDIA A100 80GB PCIe",
-            gpu_workload="BUILD",
-        )
-
-        class FakeCtl:
-            def __init__(self, details):
-                self.details = details
-
-            def assignment_details(self, pod_id, timeout):
-                return self.details
-
+        gpu = GPU_BUILD_POD["gpu"]
         cases = (
-            ({**base, "imageName": "wrong-image"}, "Pod image mismatch"),
-            ({**base, "gpuTypeId": "NVIDIA A100-SXM4-80GB"}, "GPU type mismatch"),
+            ({**GPU_BUILD_POD, "image": "wrong-image"}, "Pod image mismatch"),
             (
-                {key: value for key, value in base.items() if key != "gpuTypeId"},
+                {**GPU_BUILD_POD, "gpu": {**gpu, "id": "NVIDIA A100-SXM4-80GB"}},
                 "GPU type mismatch",
             ),
-            ({**base, "vcpuCount": 3}, "GPU build CPU count mismatch"),
-            ({**base, "vcpuCount": 4.5}, "GPU build CPU count mismatch"),
-            ({**base, "vcpuCount": float("nan")}, "GPU build CPU count mismatch"),
-            ({**base, "vcpuCount": float("inf")}, "GPU build CPU count mismatch"),
+            (without(GPU_BUILD_POD, "gpu"), "GPU type mismatch"),
+            ({**GPU_BUILD_POD, "gpu": {**gpu, "vcpuCount": 3}}, "GPU build CPU count mismatch"),
+            ({**GPU_BUILD_POD, "gpu": {**gpu, "vcpuCount": 4.5}}, "GPU build CPU count mismatch"),
             (
-                {key: value for key, value in base.items() if key != "vcpuCount"},
+                {**GPU_BUILD_POD, "gpu": {**gpu, "vcpuCount": float("nan")}},
                 "GPU build CPU count mismatch",
             ),
-            ({**base, "memoryInGb": 31}, "GPU build memory mismatch"),
-            ({**base, "memoryInGb": float("nan")}, "GPU build memory mismatch"),
-            ({**base, "memoryInGb": float("inf")}, "GPU build memory mismatch"),
             (
-                {key: value for key, value in base.items() if key != "memoryInGb"},
+                {**GPU_BUILD_POD, "gpu": {**gpu, "vcpuCount": float("inf")}},
+                "GPU build CPU count mismatch",
+            ),
+            (
+                {**GPU_BUILD_POD, "gpu": without(gpu, "vcpuCount")},
+                "GPU build CPU count mismatch",
+            ),
+            ({**GPU_BUILD_POD, "gpu": {**gpu, "memory": 31}}, "GPU build memory mismatch"),
+            (
+                {**GPU_BUILD_POD, "gpu": {**gpu, "memory": float("nan")}},
                 "GPU build memory mismatch",
             ),
-            ({**base, "containerDiskInGb": 79}, "container disk mismatch"),
-            ({**base, "containerDiskInGb": 80.5}, "container disk mismatch"),
             (
-                {
-                    key: value
-                    for key, value in base.items()
-                    if key != "containerDiskInGb"
-                },
-                "container disk mismatch",
+                {**GPU_BUILD_POD, "gpu": {**gpu, "memory": float("inf")}},
+                "GPU build memory mismatch",
             ),
-            ({**base, "volumeInGb": 20}, "unexpected paid Pod volume"),
-            ({**base, "volumeInGb": 0.5}, "unexpected paid Pod volume"),
             (
-                {key: value for key, value in base.items() if key != "volumeInGb"},
+                {**GPU_BUILD_POD, "gpu": without(gpu, "memory")},
+                "GPU build memory mismatch",
+            ),
+            ({**GPU_BUILD_POD, "disk": 79}, "container disk mismatch"),
+            ({**GPU_BUILD_POD, "disk": 80.5}, "container disk mismatch"),
+            (without(GPU_BUILD_POD, "disk"), "container disk mismatch"),
+            (
+                {**GPU_BUILD_POD, "mounts": {"persistent": {"size": 20, "path": "/workspace"}}},
+                "unexpected paid Pod volume",
+            ),
+            (
+                {**GPU_BUILD_POD, "mounts": {"persistent": {"path": "/workspace"}}},
                 "unexpected paid Pod volume",
             ),
         )
         for details, message in cases:
-            with self.subTest(message=message), self.assertRaisesRegex(
+            with self.subTest(message=message, details=details), self.assertRaisesRegex(
                 JobError, message
             ):
-                verify_pod_assignment(
-                    FakeCtl(details),  # type: ignore[arg-type]
-                    "pod-gpu-build",
-                    request,
-                    Deadline(10),
-                )
+                self.verify(details, self.gpu_build_request)
 
 
 class ArtifactSafetyTests(unittest.TestCase):
@@ -1031,21 +1023,14 @@ class RunJobCleanupTests(unittest.TestCase):
             def check_auth(self, timeout):
                 return None
 
-            def create_pod(
-                self, request, terminate_after, self_terminate_seconds, timeout
-            ):
+            def create_pod(self, request, self_terminate_seconds, timeout):
                 return "pod-cpu-build"
 
             def assignment_details(self, pod_id, timeout):
                 return {
-                    "pod": {
-                        "imageName": "registry.invalid/builder@sha256:" + "c" * 64,
-                        "cpuFlavorId": "cpu3g",
-                        "vcpuCount": "16.0",
-                        "memoryInGb": "62.5",
-                        "containerDiskInGb": "80",
-                        "volumeInGb": "0",
-                    }
+                    "image": "registry.invalid/builder@sha256:" + "c" * 64,
+                    "cpu": {"id": "cpu3g", "vcpuCount": "16.0", "memory": "62.5"},
+                    "disk": "80",
                 }
 
             def terminate_pod(self, pod_id, timeout):
@@ -1108,20 +1093,15 @@ class RunJobCleanupTests(unittest.TestCase):
             def check_auth(self, timeout):
                 return None
 
-            def create_pod(
-                self, request, terminate_after, self_terminate_seconds, timeout
-            ):
-                self.terminate_after = terminate_after
+            def create_pod(self, request, self_terminate_seconds, timeout):
+                self.self_terminate_seconds = self_terminate_seconds
                 return "pod-gpu-build"
 
             def assignment_details(self, pod_id, timeout):
                 return {
                     "image": "registry.invalid/builder@sha256:" + "e" * 64,
-                    "gpu": {"id": "NVIDIA A100 80GB PCIe"},
-                    "vcpuCount": 3,
-                    "memoryInGb": 64,
-                    "containerDiskInGb": 80,
-                    "volumeInGb": 0,
+                    "gpu": {"id": "NVIDIA A100 80GB PCIe", "vcpuCount": 3, "memory": 64},
+                    "disk": 80,
                 }
 
             def terminate_pod(self, pod_id, timeout):
@@ -1150,7 +1130,7 @@ class RunJobCleanupTests(unittest.TestCase):
                     transport=NoUploadTransport(),  # type: ignore[arg-type]
                     wait_fn=lambda *args, **kwargs: Endpoint("host", 2200),
                 )
-            self.assertRegex(ctl.terminate_after, r"Z$")
+            self.assertGreaterEqual(ctl.self_terminate_seconds, 600)
             self.assertEqual(ctl.terminated, ["pod-gpu-build"])
 
     def test_gpu_build_rejects_and_deletes_before_next_candidate(self) -> None:
@@ -1160,27 +1140,26 @@ class RunJobCleanupTests(unittest.TestCase):
 
         class FakeCtl:
             def __init__(self):
-                self.deadlines: list[str] = []
+                self.deadlines: list[int] = []
 
             def check_auth(self, timeout):
                 return None
 
-            def create_pod(
-                self, request, terminate_after, self_terminate_seconds, timeout
-            ):
-                self.deadlines.append(terminate_after)
+            def create_pod(self, request, self_terminate_seconds, timeout):
+                self.deadlines.append(self_terminate_seconds)
                 events.append(("create", request.gpu_id))
                 return "pod-first" if request.gpu_id == first else "pod-second"
 
             def assignment_details(self, pod_id, timeout):
                 gpu_id = first if pod_id == "pod-first" else second
                 return {
-                    "imageName": "registry.invalid/builder@sha256:" + "e" * 64,
-                    "gpuTypeId": gpu_id,
-                    "vcpuCount": 3 if pod_id == "pod-first" else 4,
-                    "memoryInGb": 48 if pod_id == "pod-first" else 64,
-                    "containerDiskInGb": 80,
-                    "volumeInGb": 0,
+                    "image": "registry.invalid/builder@sha256:" + "e" * 64,
+                    "gpu": {
+                        "id": gpu_id,
+                        "vcpuCount": 3 if pod_id == "pod-first" else 4,
+                        "memory": 48 if pod_id == "pod-first" else 64,
+                    },
+                    "disk": 80,
                 }
 
             def terminate_pod(self, pod_id, timeout):
@@ -1213,7 +1192,7 @@ class RunJobCleanupTests(unittest.TestCase):
 
         self.assertEqual(result.selected_gpu_id, second)
         self.assertEqual(ctl.deadlines[0], ctl.deadlines[1])
-        self.assertRegex(ctl.deadlines[0], r"Z$")
+        self.assertGreaterEqual(ctl.deadlines[0], 600)
         self.assertLess(
             events.index(("delete", "pod-first")),
             events.index(("create", second)),
@@ -1246,16 +1225,14 @@ class RunJobCleanupTests(unittest.TestCase):
             def check_auth(self, timeout):
                 return None
 
-            def create_pod(
-                self, request, terminate_after, self_terminate_seconds, timeout
-            ):
+            def create_pod(self, request, self_terminate_seconds, timeout):
                 self.candidates.append(request.gpu_id)
                 return f"pod-{len(self.candidates)}"
 
             def assignment_details(self, pod_id, timeout):
                 return {
                     "image": "registry.invalid/runtime@sha256:" + "f" * 64,
-                    "gpuTypeId": "unexpected" if pod_id == "pod-1" else second,
+                    "gpu": {"id": "unexpected" if pod_id == "pod-1" else second},
                 }
 
             def terminate_pod(self, pod_id, timeout):
@@ -1316,17 +1293,15 @@ class RunJobCleanupTests(unittest.TestCase):
         class FakeCtl:
             def __init__(self):
                 self.candidates: list[str] = []
-                self.deadlines: list[str] = []
+                self.deadlines: list[int] = []
                 self.terminated: list[str] = []
 
             def check_auth(self, timeout):
                 return None
 
-            def create_pod(
-                self, request, terminate_after, self_terminate_seconds, timeout
-            ):
+            def create_pod(self, request, self_terminate_seconds, timeout):
                 self.candidates.append(request.gpu_id)
-                self.deadlines.append(terminate_after)
+                self.deadlines.append(self_terminate_seconds)
                 if len(self.candidates) <= 2:
                     raise CapacityUnavailableError(
                         "There are no longer any instances available with the "
@@ -1337,11 +1312,8 @@ class RunJobCleanupTests(unittest.TestCase):
             def assignment_details(self, pod_id, timeout):
                 return {
                     "image": "registry.invalid/builder@sha256:" + "e" * 64,
-                    "gpu": {"id": first},
-                    "vcpuCount": 4,
-                    "memoryInGb": 32,
-                    "containerDiskInGb": 80,
-                    "volumeInGb": 0,
+                    "gpu": {"id": first, "vcpuCount": 4, "memory": 32},
+                    "disk": 80,
                 }
 
             def terminate_pod(self, pod_id, timeout):
@@ -1370,9 +1342,9 @@ class RunJobCleanupTests(unittest.TestCase):
 
         self.assertEqual(ctl.candidates, [first, second, first])
         self.assertEqual(len(set(ctl.deadlines)), 1)
-        self.assertRegex(ctl.deadlines[0], r"Z$")
+        self.assertGreaterEqual(ctl.deadlines[0], 600)
         sleep.assert_called_once()
-        self.assertAlmostEqual(sleep.call_args.args[0], 5.0)
+        self.assertAlmostEqual(sleep.call_args.args[0], 300.0)
         self.assertEqual(result.selected_gpu_id, first)
         self.assertEqual(ctl.terminated, ["pod-selected"])
 
@@ -1385,9 +1357,7 @@ class RunJobCleanupTests(unittest.TestCase):
             def check_auth(self, timeout):
                 return None
 
-            def create_pod(
-                self, request, terminate_after, self_terminate_seconds, timeout
-            ):
+            def create_pod(self, request, self_terminate_seconds, timeout):
                 events.append(("create", request.gpu_id, None))
                 if request.gpu_id == first:
                     raise CapacityUnavailableError("no matching capacity")
@@ -1396,11 +1366,8 @@ class RunJobCleanupTests(unittest.TestCase):
             def assignment_details(self, pod_id, timeout):
                 return {
                     "image": "registry.invalid/builder@sha256:" + "e" * 64,
-                    "gpu": {"id": second},
-                    "vcpuCount": 4,
-                    "memoryInGb": 32,
-                    "containerDiskInGb": 80,
-                    "volumeInGb": 0,
+                    "gpu": {"id": second, "vcpuCount": 4, "memory": 32},
+                    "disk": 80,
                 }
 
             def terminate_pod(self, pod_id, timeout):
@@ -1446,8 +1413,8 @@ class RunJobCleanupTests(unittest.TestCase):
             for event in events
             if event[0] == "print" and "Trying GPU candidate" in str(event[1])
         ]
-        self.assertIn("Trying GPU candidate 1/2 (round 1/2)", attempt_messages[0])
-        self.assertIn("Trying GPU candidate 2/2 (round 1/2)", attempt_messages[1])
+        self.assertIn("Trying GPU candidate 1/2 (round 1/5)", attempt_messages[0])
+        self.assertIn("Trying GPU candidate 2/2 (round 1/5)", attempt_messages[1])
 
     def test_gpu_candidate_fallback_does_not_retry_configuration_error(self) -> None:
         class FakeCtl:
@@ -1457,11 +1424,9 @@ class RunJobCleanupTests(unittest.TestCase):
             def check_auth(self, timeout):
                 return None
 
-            def create_pod(
-                self, request, terminate_after, self_terminate_seconds, timeout
-            ):
+            def create_pod(self, request, self_terminate_seconds, timeout):
                 self.candidates.append(request.gpu_id)
-                raise CommandError("runpodctl pod create failed: unauthorized")
+                raise CommandError("Runpod REST POST failed with HTTP 401: unauthorized")
 
         with tempfile.TemporaryDirectory() as temp:
             ctl = FakeCtl()
@@ -1484,20 +1449,15 @@ class RunJobCleanupTests(unittest.TestCase):
             def check_auth(self, timeout):
                 return None
 
-            def create_pod(
-                self, request, terminate_after, self_terminate_seconds, timeout
-            ):
+            def create_pod(self, request, self_terminate_seconds, timeout):
                 self.candidates.append(request.gpu_id)
                 return "pod-first"
 
             def assignment_details(self, pod_id, timeout):
                 return {
                     "image": "registry.invalid/builder@sha256:" + "e" * 64,
-                    "gpuTypeId": first,
-                    "vcpuCount": 4,
-                    "memoryInGb": 32,
-                    "containerDiskInGb": 80,
-                    "volumeInGb": 0,
+                    "gpu": {"id": first, "vcpuCount": 4, "memory": 32},
+                    "disk": 80,
                 }
 
             def terminate_pod(self, pod_id, timeout):
@@ -1527,20 +1487,15 @@ class RunJobCleanupTests(unittest.TestCase):
             def check_auth(self, timeout):
                 return None
 
-            def create_pod(
-                self, request, terminate_after, self_terminate_seconds, timeout
-            ):
-                self.terminate_after = terminate_after
+            def create_pod(self, request, self_terminate_seconds, timeout):
+                self.self_terminate_seconds = self_terminate_seconds
                 return "pod-created"
 
             def assignment_details(self, pod_id, timeout):
                 return {
-                    "imageName": "registry.invalid/builder@sha256:" + "c" * 64,
-                    "cpuFlavorId": "cpu3g",
-                    "vcpuCount": 16,
-                    "memoryInGb": 62,
-                    "containerDiskInGb": 80,
-                    "volumeInGb": 0,
+                    "image": "registry.invalid/builder@sha256:" + "c" * 64,
+                    "cpu": {"id": "cpu3g", "vcpuCount": 16, "memory": 62},
+                    "disk": 80,
                 }
 
             def terminate_pod(self, pod_id, timeout):
@@ -1579,19 +1534,14 @@ class RunJobCleanupTests(unittest.TestCase):
             def check_auth(self, timeout):
                 return None
 
-            def create_pod(
-                self, request, terminate_after, self_terminate_seconds, timeout
-            ):
+            def create_pod(self, request, self_terminate_seconds, timeout):
                 return "pod-created"
 
             def assignment_details(self, pod_id, timeout):
                 return {
-                    "imageName": "registry.invalid/builder@sha256:" + "c" * 64,
-                    "cpuFlavorId": "cpu3g",
-                    "vcpuCount": 16,
-                    "memoryInGb": 62,
-                    "containerDiskInGb": 80,
-                    "volumeInGb": 0,
+                    "image": "registry.invalid/builder@sha256:" + "c" * 64,
+                    "cpu": {"id": "cpu3g", "vcpuCount": 16, "memory": 62},
+                    "disk": 80,
                 }
 
             def terminate_pod(self, pod_id, timeout):
@@ -1633,19 +1583,14 @@ class RunJobCleanupTests(unittest.TestCase):
             def check_auth(self, timeout):
                 pass
 
-            def create_pod(
-                self, request, terminate_after, self_terminate_seconds, timeout
-            ):
+            def create_pod(self, request, self_terminate_seconds, timeout):
                 return "pod-ok"
 
             def assignment_details(self, pod_id, timeout):
                 return {
-                    "imageName": "registry.invalid/builder@sha256:" + "c" * 64,
-                    "cpuFlavorId": "cpu3g",
-                    "vcpuCount": 16,
-                    "memoryInGb": 62,
-                    "containerDiskInGb": 80,
-                    "volumeInGb": 0,
+                    "image": "registry.invalid/builder@sha256:" + "c" * 64,
+                    "cpu": {"id": "cpu3g", "vcpuCount": 16, "memory": 62},
+                    "disk": 80,
                 }
 
             def terminate_pod(self, pod_id, timeout):
@@ -1685,6 +1630,177 @@ class RunJobCleanupTests(unittest.TestCase):
             self.assertIn("Pod pod-ok: downloading requested artifacts", messages)
             self.assertIn("Pod pod-ok: artifact download complete", messages)
             self.assertIn("Pod pod-ok: terminated", messages)
+
+
+
+class PlacementRetryTests(unittest.TestCase):
+    """Capacity retries: bounded rounds, a backoff between them, fresh budgets."""
+
+    CPU_POD = {
+        "image": "registry.invalid/builder@sha256:" + "c" * 64,
+        "cpu": {"id": "cpu3g", "vcpuCount": 16, "memory": 64},
+        "disk": 80,
+    }
+
+    def _spec(self, root: Path, **overrides) -> JobSpec:
+        return replace(RunJobCleanupTests._spec(self, root), **overrides)  # type: ignore[arg-type]
+
+    @staticmethod
+    def _transport():
+        class FakeTransport:
+            def upload_repo(self, *args):
+                return None
+
+            def run_script(self, *args):
+                return None
+
+            def download_artifacts(self, *args):
+                return None
+
+        return FakeTransport()
+
+    def test_cpu_placement_retries_capacity_until_a_round_succeeds(self) -> None:
+        pod = self.CPU_POD
+
+        class FakeCtl:
+            def __init__(self):
+                self.creates = 0
+                self.terminated: list[str] = []
+
+            def check_auth(self, timeout):
+                return None
+
+            def create_pod(self, request, self_terminate_seconds, timeout):
+                self.creates += 1
+                if self.creates < 3:
+                    raise CapacityUnavailableError("no instances available")
+                return "pod-cpu"
+
+            def assignment_details(self, pod_id, timeout):
+                return pod
+
+            def terminate_pod(self, pod_id, timeout):
+                self.terminated.append(pod_id)
+
+        with tempfile.TemporaryDirectory() as temp, mock.patch(
+            "tools.runpod_job.time.sleep"
+        ) as sleep:
+            ctl = FakeCtl()
+            result = run_job(
+                self._spec(Path(temp)),
+                ctl=ctl,  # type: ignore[arg-type]
+                transport=self._transport(),  # type: ignore[arg-type]
+                wait_fn=lambda *args, **kwargs: Endpoint("host", 2200),
+            )
+        self.assertEqual(result.pod_id, "pod-cpu")
+        self.assertEqual(ctl.creates, 3)
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [300.0, 300.0])
+        self.assertEqual(ctl.terminated, ["pod-cpu"])
+
+    def test_cpu_placement_gives_up_after_the_configured_rounds(self) -> None:
+        class FakeCtl:
+            creates = 0
+
+            def check_auth(self, timeout):
+                return None
+
+            def create_pod(self, request, self_terminate_seconds, timeout):
+                FakeCtl.creates += 1
+                raise CapacityUnavailableError(f"full #{FakeCtl.creates}")
+
+        with tempfile.TemporaryDirectory() as temp, mock.patch(
+            "tools.runpod_job.time.sleep"
+        ) as sleep:
+            with self.assertRaisesRegex(
+                JobError, r"CPU placement exhausted 3 rounds.*full #1.*full #3"
+            ):
+                run_job(
+                    self._spec(
+                        Path(temp), placement_rounds=3, placement_backoff_seconds=60
+                    ),
+                    ctl=FakeCtl(),  # type: ignore[arg-type]
+                    transport=object(),  # type: ignore[arg-type]
+                )
+        self.assertEqual(FakeCtl.creates, 3)
+        # A wait between rounds, none after the last one.
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [60, 60])
+
+    def test_gpu_placement_gives_up_after_the_configured_rounds(self) -> None:
+        class FakeCtl:
+            candidates: list[str] = []
+
+            def check_auth(self, timeout):
+                return None
+
+            def create_pod(self, request, self_terminate_seconds, timeout):
+                FakeCtl.candidates.append(request.gpu_id)
+                raise CapacityUnavailableError("no instances available")
+
+        with tempfile.TemporaryDirectory() as temp, mock.patch(
+            "tools.runpod_job.time.sleep"
+        ) as sleep:
+            spec = replace(
+                RunJobCleanupTests._gpu_spec(self, Path(temp)),  # type: ignore[arg-type]
+                placement_rounds=4,
+            )
+            with self.assertRaisesRegex(JobError, "exhausted 4 ordered rounds"):
+                run_job(
+                    spec,
+                    ctl=FakeCtl(),  # type: ignore[arg-type]
+                    transport=object(),  # type: ignore[arg-type]
+                )
+        self.assertEqual(len(FakeCtl.candidates), 4 * 2)
+        self.assertEqual(sleep.call_count, 3)
+
+    def test_non_capacity_failure_is_not_retried(self) -> None:
+        class FakeCtl:
+            creates = 0
+
+            def check_auth(self, timeout):
+                return None
+
+            def create_pod(self, request, self_terminate_seconds, timeout):
+                FakeCtl.creates += 1
+                raise CommandError("Runpod REST POST failed with HTTP 422: bad body")
+
+        with tempfile.TemporaryDirectory() as temp, mock.patch(
+            "tools.runpod_job.time.sleep"
+        ) as sleep:
+            with self.assertRaisesRegex(JobError, "HTTP 422"):
+                run_job(
+                    self._spec(Path(temp)),
+                    ctl=FakeCtl(),  # type: ignore[arg-type]
+                    transport=object(),  # type: ignore[arg-type]
+                )
+        self.assertEqual(FakeCtl.creates, 1)
+        sleep.assert_not_called()
+
+    def test_each_round_gets_a_fresh_hard_budget_after_its_backoff(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            spec = self._spec(Path(temp), hard_timeout_seconds=900)
+            with mock.patch("tools.runpod_job.time.sleep") as sleep:
+                first = _start_placement_round(spec, 1, "GPU")
+                second = _start_placement_round(spec, 2, "GPU")
+        sleep.assert_called_once_with(300.0)
+        self.assertIsNot(first, second)
+        # The wait is not charged to the budget the next round works with.
+        self.assertGreater(second.seconds_left(), 899)
+
+    def test_retry_policy_is_bounded_and_exposed_by_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            for overrides, message in (
+                ({"placement_rounds": 0}, "between 1 and 10"),
+                ({"placement_rounds": 11}, "between 1 and 10"),
+                ({"placement_backoff_seconds": -1}, "between 0 and 900"),
+                ({"placement_backoff_seconds": 901}, "between 0 and 900"),
+            ):
+                with self.subTest(overrides=overrides), self.assertRaisesRegex(
+                    ValueError, message
+                ):
+                    self._spec(Path(temp), **overrides).validate()
+        parser = _parser()
+        self.assertEqual(parser.get_default("placement_rounds"), 5)
+        self.assertEqual(parser.get_default("placement_backoff_seconds"), 300.0)
 
 
 if __name__ == "__main__":

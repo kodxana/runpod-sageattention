@@ -24,22 +24,32 @@ on:
       builder_image_cu128:
         description: CUDA 12.8 builder image (immutable Docker Hub digest)
         required: true
-        default: "madiatorlabs/sageattention-wheel-builder@sha256:556979b41a98e5331ad38a1ae599161cb37a78cb09bec34e3f982978b84816d0"
+        default: "runpod/sageattention-wheel-builder@sha256:304c806d607bedcd1c743344796ba4bd0f9fb4bd2cedeb5044d9b6446bbcdc06"
         type: string
       builder_image_cu130:
         description: CUDA 13.0 builder image (immutable Docker Hub digest)
         required: true
-        default: "madiatorlabs/sageattention-wheel-builder@sha256:bed84f32bf76ba292728faf9fbe446d5d7f84d194444b2b6d006e663cccba906"
+        default: "runpod/sageattention-wheel-builder@sha256:d80e828634a67c449e9e9663a4a29cb08aefff95ef4a9ce71d0313d336b92b42"
+        type: string
+      builder_image_cu132:
+        description: CUDA 13.2 builder image (immutable Docker Hub digest)
+        required: true
+        default: "runpod/sageattention-wheel-builder@sha256:910ee07719dc28dc0cc094739d0818c76ac3f7f7e81592992008e7a8339ea7b2"
         type: string
       runtime_image_cu128:
         description: ComfyUI-compatible cu128 test image (immutable digest)
         required: true
-        default: "runpod/comfyui@sha256:ce5e842ca0c7233a983ff76a83739b445172259c77a43a117453ef7e6a64d0b7"
+        default: "runpod/comfyui@sha256:26cd753a3929eb7a59eb1f87ac483226e4cc9e61add40214a5dc21419c26f915"
         type: string
       runtime_image_cu130:
         description: ComfyUI-compatible cu130 test image (immutable digest)
         required: true
-        default: "runpod/comfyui@sha256:0bf75436da591e0f26d299af3741e07cb8ce8ce36566d1a7d8d78aae458e5d67"
+        default: "runpod/comfyui@sha256:631e0eb04550e675f3a148ed65ad4378e4d1ba248156a9941cb11884e3fa552c"
+        type: string
+      runtime_image_cu132:
+        description: ComfyUI-compatible cu132 test image (immutable digest)
+        required: true
+        default: "runpod/comfyui@sha256:0d9b67c84316f70417c27b300740e35254b508234c348502261189ecbbc4024e"
         type: string
       gpu_id_sm80:
         description: Ordered SM 8.0-only Runpod gpuId candidates
@@ -67,13 +77,13 @@ on:
         default: "NVIDIA GeForce RTX 5090,NVIDIA RTX PRO 6000 Blackwell Server Edition,NVIDIA RTX PRO 6000 Blackwell Workstation Edition,NVIDIA RTX PRO 4500 Blackwell Server Edition,NVIDIA RTX PRO 4500 Blackwell"
         type: string
       cloud_type:
-        description: Runpod capacity pool
+        description: Runpod capacity pool (Community has had no CUDA 13 hosts for the cu130/cu132 builds and tests)
         required: true
-        default: COMMUNITY
+        default: SECURE
         type: choice
         options:
-          - COMMUNITY
           - SECURE
+          - COMMUNITY
       registry_auth_id:
         description: Optional Runpod registry-auth id for private/rate-limited images
         required: false
@@ -136,19 +146,27 @@ on:
         type: string
       builder_image_cu128:
         required: false
-        default: "madiatorlabs/sageattention-wheel-builder@sha256:556979b41a98e5331ad38a1ae599161cb37a78cb09bec34e3f982978b84816d0"
+        default: "runpod/sageattention-wheel-builder@sha256:304c806d607bedcd1c743344796ba4bd0f9fb4bd2cedeb5044d9b6446bbcdc06"
         type: string
       builder_image_cu130:
         required: false
-        default: "madiatorlabs/sageattention-wheel-builder@sha256:bed84f32bf76ba292728faf9fbe446d5d7f84d194444b2b6d006e663cccba906"
+        default: "runpod/sageattention-wheel-builder@sha256:d80e828634a67c449e9e9663a4a29cb08aefff95ef4a9ce71d0313d336b92b42"
+        type: string
+      builder_image_cu132:
+        required: false
+        default: "runpod/sageattention-wheel-builder@sha256:910ee07719dc28dc0cc094739d0818c76ac3f7f7e81592992008e7a8339ea7b2"
         type: string
       runtime_image_cu128:
         required: false
-        default: "runpod/comfyui@sha256:ce5e842ca0c7233a983ff76a83739b445172259c77a43a117453ef7e6a64d0b7"
+        default: "runpod/comfyui@sha256:26cd753a3929eb7a59eb1f87ac483226e4cc9e61add40214a5dc21419c26f915"
         type: string
       runtime_image_cu130:
         required: false
-        default: "runpod/comfyui@sha256:0bf75436da591e0f26d299af3741e07cb8ce8ce36566d1a7d8d78aae458e5d67"
+        default: "runpod/comfyui@sha256:631e0eb04550e675f3a148ed65ad4378e4d1ba248156a9941cb11884e3fa552c"
+        type: string
+      runtime_image_cu132:
+        required: false
+        default: "runpod/comfyui@sha256:0d9b67c84316f70417c27b300740e35254b508234c348502261189ecbbc4024e"
         type: string
       gpu_id_sm80:
         required: false
@@ -172,7 +190,7 @@ on:
         type: string
       cloud_type:
         required: false
-        default: COMMUNITY
+        default: SECURE
         type: string
       registry_auth_id:
         required: false
@@ -221,6 +239,13 @@ on:
 permissions:
   contents: read
 
+# Runpod REST API v2 base URL. An unset repository variable leaves this empty
+# and tools/runpod_job.py uses production (https://api.runpod.io/v2); set the
+# RUNPOD_API_URL variable to target another environment, such as
+# https://api.runpod.dev/v2.
+env:
+  RUNPOD_API_URL: ${{ vars.RUNPOD_API_URL }}
+
 concurrency:
   group: wheel-factory-${{ inputs.source_ref }}
   cancel-in-progress: false
@@ -255,10 +280,12 @@ jobs:
         env:
           BUILDER_CU128: ${{ inputs.builder_image_cu128 }}
           BUILDER_CU130: ${{ inputs.builder_image_cu130 }}
+          BUILDER_CU132: ${{ inputs.builder_image_cu132 }}
           BUILD_BACKEND: ${{ inputs.build_backend }}
           BUILD_GPU_ID: ${{ inputs.build_gpu_id }}
           RUNTIME_CU128: ${{ inputs.runtime_image_cu128 }}
           RUNTIME_CU130: ${{ inputs.runtime_image_cu130 }}
+          RUNTIME_CU132: ${{ inputs.runtime_image_cu132 }}
           GPU_SM80: ${{ inputs.gpu_id_sm80 }}
           GPU_SM86: ${{ inputs.gpu_id_sm86 }}
           GPU_SM89: ${{ inputs.gpu_id_sm89 }}
@@ -283,9 +310,10 @@ jobs:
           expected_build_ids = {
               "cp312-torch2.10.0-cu128",
               "cp312-torch2.10.0-cu130",
+              "cp312-torch2.13.0-cu132",
           }
           actual_build_ids = [build.get("id") for build in source.get("builds", [])]
-          if set(actual_build_ids) != expected_build_ids or len(actual_build_ids) != 2:
+          if set(actual_build_ids) != expected_build_ids or len(actual_build_ids) != 3:
               raise SystemExit(f"unexpected build matrix: {actual_build_ids!r}")
           if source.get("platform", {}).get("architecture") != "x86_64":
               raise SystemExit("only the reviewed Linux x86-64 wheel platform is allowed")
@@ -379,6 +407,7 @@ jobs:
           image_by_cuda = {
               "12.8": (os.environ["BUILDER_CU128"], os.environ["RUNTIME_CU128"]),
               "13.0": (os.environ["BUILDER_CU130"], os.environ["RUNTIME_CU130"]),
+              "13.2": (os.environ["BUILDER_CU132"], os.environ["RUNTIME_CU132"]),
           }
           gpu_candidates = {
               "8.0": candidates(os.environ["GPU_SM80"], "gpu_id_sm80"),
@@ -498,7 +527,9 @@ jobs:
     needs: plan
     runs-on: ubuntu-24.04
     environment: runpod-paid
-    timeout-minutes: 270
+    # 240 min hard budget + up to 4 x 5 min placement backoff, which tools/runpod_job.py
+    # does not count against --timeout-seconds.
+    timeout-minutes: 300
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -523,19 +554,6 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.plan.outputs.source_sha }}
-
-      - name: Install checksum-pinned runpodctl
-        shell: bash
-        env:
-          RUNPODCTL_VERSION: v2.3.0
-          RUNPODCTL_SHA256: 908f2210571e8a26a1cba6fb45f09556b34dcad3e1b20dd502df2adf7a57c169
-        run: |
-          curl -fsSL --proto '=https' --tlsv1.2 \
-            "https://github.com/runpod/runpodctl/releases/download/${RUNPODCTL_VERSION}/runpodctl-linux-amd64.tar.gz" \
-            -o "${RUNNER_TEMP}/runpodctl.tar.gz"
-          echo "${RUNPODCTL_SHA256}  ${RUNNER_TEMP}/runpodctl.tar.gz" | sha256sum -c -
-          sudo tar -xzf "${RUNNER_TEMP}/runpodctl.tar.gz" -C /usr/local/bin runpodctl
-          runpodctl version
 
       - name: Materialize ephemeral SSH identity
         shell: bash
@@ -659,7 +677,8 @@ jobs:
     environment: runpod-paid
     # Validation only installs a finished wheel and launches the reviewed
     # runtime cases. Keep its billed Pod budget independent from compilation.
-    timeout-minutes: 30
+    # 15 min validation + 5 min grace + up to 4 x 5 min placement backoff.
+    timeout-minutes: 60
     env:
       GPU_VALIDATION_TIMEOUT_SECONDS: 900
       GPU_VALIDATION_TERMINATE_GRACE_SECONDS: 300
@@ -699,19 +718,6 @@ jobs:
         env:
           BUILD_ID: ${{ matrix.build_id }}
         run: (cd "dist/${BUILD_ID}" && sha256sum -c SHA256SUMS)
-
-      - name: Install checksum-pinned runpodctl
-        shell: bash
-        env:
-          RUNPODCTL_VERSION: v2.3.0
-          RUNPODCTL_SHA256: 908f2210571e8a26a1cba6fb45f09556b34dcad3e1b20dd502df2adf7a57c169
-        run: |
-          curl -fsSL --proto '=https' --tlsv1.2 \
-            "https://github.com/runpod/runpodctl/releases/download/${RUNPODCTL_VERSION}/runpodctl-linux-amd64.tar.gz" \
-            -o "${RUNNER_TEMP}/runpodctl.tar.gz"
-          echo "${RUNPODCTL_SHA256}  ${RUNNER_TEMP}/runpodctl.tar.gz" | sha256sum -c -
-          sudo tar -xzf "${RUNNER_TEMP}/runpodctl.tar.gz" -C /usr/local/bin runpodctl
-          runpodctl version
 
       - name: Materialize ephemeral SSH identity
         shell: bash

@@ -23,22 +23,32 @@ on:
       builder_image_cu128:
         description: Immutable CUDA 12.8 builder image (@sha256 required)
         required: true
-        default: "madiatorlabs/sageattention-wheel-builder@sha256:556979b41a98e5331ad38a1ae599161cb37a78cb09bec34e3f982978b84816d0"
+        default: "runpod/sageattention-wheel-builder@sha256:304c806d607bedcd1c743344796ba4bd0f9fb4bd2cedeb5044d9b6446bbcdc06"
         type: string
       builder_image_cu130:
         description: Immutable CUDA 13.0 builder image (@sha256 required)
         required: true
-        default: "madiatorlabs/sageattention-wheel-builder@sha256:bed84f32bf76ba292728faf9fbe446d5d7f84d194444b2b6d006e663cccba906"
+        default: "runpod/sageattention-wheel-builder@sha256:d80e828634a67c449e9e9663a4a29cb08aefff95ef4a9ce71d0313d336b92b42"
+        type: string
+      builder_image_cu132:
+        description: Immutable CUDA 13.2 builder image (@sha256 required)
+        required: true
+        default: "runpod/sageattention-wheel-builder@sha256:910ee07719dc28dc0cc094739d0818c76ac3f7f7e81592992008e7a8339ea7b2"
         type: string
       runtime_image_cu128:
         description: Immutable ComfyUI-compatible cu128 image (@sha256 required)
         required: true
-        default: "runpod/comfyui@sha256:ce5e842ca0c7233a983ff76a83739b445172259c77a43a117453ef7e6a64d0b7"
+        default: "runpod/comfyui@sha256:26cd753a3929eb7a59eb1f87ac483226e4cc9e61add40214a5dc21419c26f915"
         type: string
       runtime_image_cu130:
         description: Immutable ComfyUI-compatible cu130 image (@sha256 required)
         required: true
-        default: "runpod/comfyui@sha256:0bf75436da591e0f26d299af3741e07cb8ce8ce36566d1a7d8d78aae458e5d67"
+        default: "runpod/comfyui@sha256:631e0eb04550e675f3a148ed65ad4378e4d1ba248156a9941cb11884e3fa552c"
+        type: string
+      runtime_image_cu132:
+        description: Immutable ComfyUI-compatible cu132 image (@sha256 required)
+        required: true
+        default: "runpod/comfyui@sha256:0d9b67c84316f70417c27b300740e35254b508234c348502261189ecbbc4024e"
         type: string
       gpu_id_sm80:
         description: Ordered SM 8.0-only Runpod gpuId candidates
@@ -66,13 +76,13 @@ on:
         default: "NVIDIA GeForce RTX 5090,NVIDIA RTX PRO 6000 Blackwell Server Edition,NVIDIA RTX PRO 6000 Blackwell Workstation Edition,NVIDIA RTX PRO 4500 Blackwell Server Edition,NVIDIA RTX PRO 4500 Blackwell"
         type: string
       cloud_type:
-        description: Runpod capacity pool
+        description: Runpod capacity pool (Community has had no CUDA 13 hosts for the cu130/cu132 builds and tests)
         required: true
-        default: COMMUNITY
+        default: SECURE
         type: choice
         options:
-          - COMMUNITY
           - SECURE
+          - COMMUNITY
       registry_auth_id:
         description: Optional Runpod registry-auth id
         required: false
@@ -164,8 +174,10 @@ jobs:
       build_gpu_id: ${{ github.event.inputs.build_gpu_id }}
       builder_image_cu128: ${{ github.event.inputs.builder_image_cu128 }}
       builder_image_cu130: ${{ github.event.inputs.builder_image_cu130 }}
+      builder_image_cu132: ${{ github.event.inputs.builder_image_cu132 }}
       runtime_image_cu128: ${{ github.event.inputs.runtime_image_cu128 }}
       runtime_image_cu130: ${{ github.event.inputs.runtime_image_cu130 }}
+      runtime_image_cu132: ${{ github.event.inputs.runtime_image_cu132 }}
       gpu_id_sm80: ${{ github.event.inputs.gpu_id_sm80 }}
       gpu_id_sm86: ${{ github.event.inputs.gpu_id_sm86 }}
       gpu_id_sm89: ${{ github.event.inputs.gpu_id_sm89 }}
@@ -205,8 +217,10 @@ jobs:
           RESOLVED_SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
           BUILDER_CU128: ${{ inputs.builder_image_cu128 }}
           BUILDER_CU130: ${{ inputs.builder_image_cu130 }}
+          BUILDER_CU132: ${{ inputs.builder_image_cu132 }}
           RUNTIME_CU128: ${{ inputs.runtime_image_cu128 }}
           RUNTIME_CU130: ${{ inputs.runtime_image_cu130 }}
+          RUNTIME_CU132: ${{ inputs.runtime_image_cu132 }}
         run: |
           test "$(git rev-parse --verify HEAD^{commit})" = "${RESOLVED_SOURCE_SHA}"
           python3.12 - <<'PY'
@@ -214,7 +228,7 @@ jobs:
           import re
 
           pattern = re.compile(r"^\S+@sha256:[0-9a-fA-F]{64}$")
-          for name in ("BUILDER_CU128", "BUILDER_CU130", "RUNTIME_CU128", "RUNTIME_CU130"):
+          for name in ("BUILDER_CU128", "BUILDER_CU130", "RUNTIME_CU128", "RUNTIME_CU130", "BUILDER_CU132", "RUNTIME_CU132"):
               value = os.environ[name]
               if not pattern.fullmatch(value):
                   raise SystemExit(f"release image {name} is not immutable: {value!r}")
@@ -240,8 +254,10 @@ jobs:
           BUILD_GPU_ID: ${{ inputs.build_gpu_id }}
           BUILDER_CU128: ${{ inputs.builder_image_cu128 }}
           BUILDER_CU130: ${{ inputs.builder_image_cu130 }}
+          BUILDER_CU132: ${{ inputs.builder_image_cu132 }}
           RUNTIME_CU128: ${{ inputs.runtime_image_cu128 }}
           RUNTIME_CU130: ${{ inputs.runtime_image_cu130 }}
+          RUNTIME_CU132: ${{ inputs.runtime_image_cu132 }}
           GPU_SM80: ${{ inputs.gpu_id_sm80 }}
           GPU_SM86: ${{ inputs.gpu_id_sm86 }}
           GPU_SM89: ${{ inputs.gpu_id_sm89 }}
@@ -463,10 +479,12 @@ jobs:
           runtime_by_cuda = {
               "12.8": os.environ["RUNTIME_CU128"],
               "13.0": os.environ["RUNTIME_CU130"],
+              "13.2": os.environ["RUNTIME_CU132"],
           }
           builder_by_cuda = {
               "12.8": os.environ["BUILDER_CU128"],
               "13.0": os.environ["BUILDER_CU130"],
+              "13.2": os.environ["BUILDER_CU132"],
           }
           wheel_by_build = {}
           for build in matrix["builds"]:
@@ -585,10 +603,12 @@ jobs:
               "builder_images": {
                   "cu128": os.environ["BUILDER_CU128"],
                   "cu130": os.environ["BUILDER_CU130"],
+                  "cu132": os.environ["BUILDER_CU132"],
               },
               "runtime_images": {
                   "cu128": os.environ["RUNTIME_CU128"],
                   "cu130": os.environ["RUNTIME_CU130"],
+                  "cu132": os.environ["RUNTIME_CU132"],
               },
               "representative_gpu_candidates": {
                   "8.0": candidates("GPU_SM80"),

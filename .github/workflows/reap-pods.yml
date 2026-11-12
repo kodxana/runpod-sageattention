@@ -1,0 +1,77 @@
+name: Reap leaked factory Pods
+
+# Backstop for Pods that build.yml leaks. runpod_job.py deletes its Pod from a
+# finally path, but that dies with the runner: a SIGKILLed, cancelled or lost
+# runner leaves an A100/H100 billing. REST v2 has no platform-side
+# termination deadline, and only builder Pods arm the in-Pod watchdog, so
+# validation Pods have no other protection.
+#
+# Only Pods named sage-build-* / sage-test-* by build.yml are touched; one is
+# deleted once the GitHub run attempt in its name has completed or no longer
+# exists, or has been running for more than max_age_minutes. See
+# tools/reap_pods.py.
+
+on:
+  schedule:
+    - cron: "17 * * * *" # hourly
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: List what would be deleted without deleting
+        type: boolean
+        default: true
+      max_age_minutes:
+        description: Delete Pods whose run attempt is still going after this long
+        type: string
+        default: "360"
+
+permissions:
+  contents: read
+  actions: read # run status for the run id in each Pod name
+
+# Never cancel a sweep mid-way, and don't let two overlap.
+concurrency:
+  group: reap-pods
+  cancel-in-progress: false
+
+jobs:
+  reap:
+    name: Reap leaked factory Pods
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: runpod-paid
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Reap
+        shell: bash
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          RUNPOD_API_URL: ${{ vars.RUNPOD_API_URL }}
+          GITHUB_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+          INPUT_MAX_AGE: ${{ inputs.max_age_minutes }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${RUNPOD_API_KEY}" ]]; then
+            echo "::error::RUNPOD_API_KEY is missing from the runpod-paid environment"
+            exit 1
+          fi
+          # Scheduled runs delete; manual runs default to a dry run.
+          if [[ "${EVENT}" == "schedule" ]]; then
+            DRY_RUN="false"
+          else
+            DRY_RUN="${INPUT_DRY_RUN:-true}"
+          fi
+          MAX_AGE="${INPUT_MAX_AGE:-360}"
+          if [[ ! "${MAX_AGE}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::max_age_minutes must be a positive integer, got '${MAX_AGE}'"
+            exit 1
+          fi
+          ARGS=(--max-age-minutes "${MAX_AGE}")
+          if [[ "${DRY_RUN}" == "false" ]]; then
+            ARGS+=(--delete)
+          fi
+          python3.12 tools/reap_pods.py "${ARGS[@]}"

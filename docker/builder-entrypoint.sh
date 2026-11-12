@@ -43,21 +43,29 @@ start_self_termination_watchdog() {
         echo "RUNPOD_SELF_TERMINATE_SECONDS requires the Pod-scoped RUNPOD_API_KEY" >&2
         exit 64
     fi
-    if ! command -v runpodctl >/dev/null 2>&1; then
-        echo "RUNPOD_SELF_TERMINATE_SECONDS requires runpodctl in PATH" >&2
+    if ! command -v curl >/dev/null 2>&1; then
+        echo "RUNPOD_SELF_TERMINATE_SECONDS requires curl in PATH" >&2
         exit 69
     fi
+    local api_url="${RUNPOD_API_URL:-https://api.runpod.io/v2}"
 
+    # REST v2 DELETE /pods/{id}: 204 deletes, 404 means already gone. The key
+    # goes in on stdin so it never shows up in the process list.
     nohup bash -c '
         sleep "$1"
         for attempt in 1 2 3; do
-            if runpodctl pod delete "$2"; then
+            status=$(printf "Authorization: Bearer %s\n" "${RUNPOD_API_KEY}" \
+                | curl -sS -o /dev/null -w "%{http_code}" --max-time 30 \
+                    -X DELETE -H @- -A runpod-sageattention-factory/1 \
+                    "$3/pods/$2") || status=000
+            if [[ "${status}" == 204 || "${status}" == 404 ]]; then
                 exit 0
             fi
+            echo "self-delete attempt ${attempt} returned HTTP ${status}" >&2
             sleep 30
         done
         exit 1
-    ' runpod-self-terminate "${seconds}" "${pod_id}" \
+    ' runpod-self-terminate "${seconds}" "${pod_id}" "${api_url%/}" \
         >/var/log/runpod-self-terminate.log 2>&1 &
     echo "Runpod self-termination watchdog armed for ${seconds} seconds"
 }

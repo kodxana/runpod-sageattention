@@ -37,10 +37,12 @@ class WorkflowStrategyTests(unittest.TestCase):
             **os.environ,
             "BUILDER_CU128": "builder/cu128@sha256:" + "1" * 64,
             "BUILDER_CU130": "builder/cu130@sha256:" + "2" * 64,
+            "BUILDER_CU132": "builder/cu132@sha256:" + "5" * 64,
             "BUILD_BACKEND": "GPU",
             "BUILD_GPU_ID": "NVIDIA A100 80GB PCIe",
             "RUNTIME_CU128": "runtime/cu128@sha256:" + "3" * 64,
             "RUNTIME_CU130": "runtime/cu130@sha256:" + "4" * 64,
+            "RUNTIME_CU132": "runtime/cu132@sha256:" + "6" * 64,
             "GPU_SM80": "NVIDIA A100 80GB PCIe",
             "GPU_SM86": "NVIDIA A40",
             "GPU_SM89": "NVIDIA L40S",
@@ -77,8 +79,8 @@ class WorkflowStrategyTests(unittest.TestCase):
         max_parallel = json.loads(outputs["gpu_max_parallel"])
         self.assertEqual(set(builds), {"include"})
         self.assertEqual(set(gpu_tests), {"include"})
-        self.assertEqual(len(builds["include"]), 2)
-        self.assertEqual(len(gpu_tests["include"]), 10)
+        self.assertEqual(len(builds["include"]), 3)
+        self.assertEqual(len(gpu_tests["include"]), 15)
         self.assertIs(type(max_parallel), int)
         self.assertEqual(max_parallel, 2)
 
